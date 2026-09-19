@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, stdout};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -28,12 +29,13 @@ use crate::dsp::MixMode;
 use crate::engine::{load_track, Player, Snapshot};
 use crate::eq::Equalizer;
 use crate::fetch::{self, looks_like_media_url};
-use crate::library::{scan_library, track_from_path, Track};
+use crate::library::{scan_library, sort_indices, track_from_path, Track};
 use crate::meta::{
-    apply_peek, load_meta, lyric_fill, lyric_progress, lyric_window, peek_tags, TrackMeta,
+    apply_peek, load_meta, lyric_fill, lyric_progress, lyric_window, needs_fetch, peek_tags,
+    TrackMeta,
 };
 use crate::mpris::{MediaCmd, Mpris};
-use crate::prefs::{Palette, Prefs};
+use crate::prefs::{Palette, Prefs, ShuffleMode};
 use crate::progress::{self, TransferBar};
 use crate::remix::{apply_remix, RemixMode};
 use crate::session_store::SessionState;
@@ -59,6 +61,9 @@ struct RemoteMetaJob {
     index: usize,
     lyrics: Option<String>,
     cover: Option<Vec<u8>>,
+    artist: Option<String>,
+    title: Option<String>,
+    album: Option<String>,
     path: PathBuf,
 }
 
@@ -110,6 +115,9 @@ pub struct App {
     artist_pages: Vec<browse::ArtistPage>,
     cava: Option<CavaFeed>,
     pending_seek: Option<f32>,
+    library_idx: usize,
+    meta_queue: VecDeque<usize>,
+    meta_inflight: HashSet<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +126,7 @@ enum Overlay {
     Settings,
     Help,
     Eq,
+    Library,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,10 +217,14 @@ impl App {
             artist_pages: Vec::new(),
             cava: CavaFeed::start(24),
             pending_seek: None,
+            library_idx: 0,
+            meta_queue: VecDeque::new(),
+            meta_inflight: HashSet::new(),
         };
         app.push_taste();
         if let Ok(mut mixer) = app.player.mixer.lock() {
             mixer.set_eq_db(app.prefs.eq_db);
+            mixer.set_shuffle_mode(app.prefs.shuffle_mode);
         }
         app.spawn_peek();
         app.resume_if_needed();
@@ -219,7 +232,8 @@ impl App {
     }
 
     fn selected(&self) -> usize {
-        self.list_state.selected().unwrap_or(0)
+        let row = self.list_state.selected().unwrap_or(0);
+        self.visible_tracks().get(row).copied().unwrap_or(row)
     }
 
     fn move_local(&mut self, delta: i32) {
@@ -232,11 +246,13 @@ impl App {
     }
 
     fn select_delta(&mut self, delta: i32) {
-        if self.tracks.is_empty() {
+        let visible = self.visible_tracks();
+        if visible.is_empty() {
             return;
         }
-        let len = self.tracks.len() as i32;
-        let next = (self.selected() as i32 + delta).rem_euclid(len) as usize;
+        let len = visible.len() as i32;
+        let next =
+            (self.list_state.selected().unwrap_or(0) as i32 + delta).rem_euclid(len) as usize;
         self.list_state.select(Some(next));
     }
 
@@ -248,12 +264,13 @@ impl App {
     }
 
     fn sync_list_cursor(&mut self, track_index: usize) {
-        if !self.local_filter.is_empty() {
-            if let Some(row) = visible_row(&self.local_hits, track_index) {
+        let visible = self.visible_tracks();
+        if let Some(row) = visible_row(&visible, track_index) {
+            if !self.local_filter.is_empty() {
                 self.local_idx = row;
-                self.list_state.select(Some(row));
-                return;
             }
+            self.list_state.select(Some(row));
+            return;
         }
         self.list_state.select(Some(track_index));
     }
@@ -403,13 +420,12 @@ impl App {
         if job.index >= self.metas.len() {
             self.metas.resize(job.index + 1, None);
         }
-        let need_lyrics = meta.lyrics.is_empty() && self.prefs.lyrics_fetch;
-        let need_cover = meta.cover.is_none() && self.prefs.cover_fetch;
         self.metas[job.index] = Some(meta.clone());
-        if need_lyrics || need_cover {
-            self.spawn_remote_meta(job.index, job.path.clone(), meta);
-        }
+        let queue_remote = self.wants_remote(&meta);
         drop(mixer);
+        if queue_remote {
+            self.queue_meta(job.index);
+        }
         self.refresh_artists();
         self.push_taste();
         let mut mixer = self.player.mixer.lock().expect("mixer");
@@ -437,18 +453,51 @@ impl App {
         self.prefetch_attempt = None;
     }
 
+    fn wants_remote(&self, meta: &TrackMeta) -> bool {
+        needs_fetch(meta, self.prefs.lyrics_fetch, self.prefs.cover_fetch)
+    }
+
+    fn queue_meta(&mut self, index: usize) {
+        if self.meta_inflight.contains(&index) || self.meta_queue.contains(&index) {
+            return;
+        }
+        self.meta_queue.push_back(index);
+    }
+
     fn spawn_remote_meta(&self, index: usize, path: PathBuf, meta: TrackMeta) {
         let tx = self.remote_tx.clone();
         let lyrics_on = meta.lyrics.is_empty() && self.prefs.lyrics_fetch;
-        let cover_on = meta.cover.is_none() && self.prefs.cover_fetch;
+        let need_tags = meta.artist.trim().is_empty() || meta.album.trim().is_empty();
+        let cover_on = meta.cover.is_none() && meta.cover_path.is_none() && self.prefs.cover_fetch;
         thread::spawn(move || {
+            let itunes = if need_tags || cover_on {
+                crate::remote_meta::fetch_itunes(&meta.title, &meta.artist, &meta.album)
+            } else {
+                None
+            };
             let lyrics = if lyrics_on {
-                crate::remote_meta::fetch_lyrics(&meta.title, &meta.artist)
+                let artist = itunes
+                    .as_ref()
+                    .map(|h| h.artist.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(meta.artist.as_str());
+                let title = itunes
+                    .as_ref()
+                    .map(|h| h.title.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(meta.title.as_str());
+                crate::remote_meta::fetch_lyrics(title, artist)
             } else {
                 None
             };
             let cover = if cover_on {
-                crate::remote_meta::fetch_cover(&meta.title, &meta.artist, &meta.album)
+                itunes
+                    .as_ref()
+                    .and_then(|h| h.artwork.as_deref())
+                    .and_then(crate::remote_meta::fetch_bytes)
+                    .or_else(|| {
+                        crate::remote_meta::fetch_cover(&meta.title, &meta.artist, &meta.album)
+                    })
             } else {
                 None
             };
@@ -456,29 +505,73 @@ impl App {
                 index,
                 lyrics,
                 cover,
+                artist: itunes
+                    .as_ref()
+                    .map(|h| h.artist.clone())
+                    .filter(|s| !s.is_empty()),
+                title: itunes
+                    .as_ref()
+                    .map(|h| h.title.clone())
+                    .filter(|s| !s.is_empty()),
+                album: itunes
+                    .as_ref()
+                    .map(|h| h.album.clone())
+                    .filter(|s| !s.is_empty()),
                 path,
             });
         });
     }
 
     fn drain_remote_meta(&mut self) {
+        let mut changed = false;
         while let Ok(job) = self.remote_rx.try_recv() {
+            self.meta_inflight.remove(&job.index);
             if job.index >= self.metas.len() {
                 continue;
+            }
+            if self.metas[job.index].is_none() {
+                self.metas[job.index] = Some(TrackMeta::default());
             }
             let Some(slot) = self.metas[job.index].as_mut() else {
                 continue;
             };
+            if slot.artist.trim().is_empty() {
+                if let Some(artist) = job.artist.filter(|s| !s.trim().is_empty()) {
+                    slot.artist = artist;
+                    changed = true;
+                }
+            }
+            if slot.title.trim().is_empty() {
+                if let Some(title) = job.title.filter(|s| !s.trim().is_empty()) {
+                    slot.title = title.clone();
+                    if let Some(track) = self.tracks.get_mut(job.index) {
+                        track.title = title;
+                    }
+                    changed = true;
+                }
+            }
+            if slot.album.trim().is_empty() {
+                if let Some(album) = job.album.filter(|s| !s.trim().is_empty()) {
+                    slot.album = album;
+                    changed = true;
+                }
+            }
             if let Some(raw) = job.lyrics {
                 crate::remote_meta::save_sidecar_lrc(&job.path, &raw);
                 slot.lyrics = crate::meta::parse_lyrics(&raw);
+                changed = true;
             }
             if let Some(bytes) = job.cover {
                 if let Some((cover_path, cover)) = crate::meta::cache_cover(&job.path, &bytes) {
                     slot.cover_path = Some(cover_path);
                     slot.cover = cover;
+                    changed = true;
                 }
             }
+        }
+        if changed {
+            self.refresh_artists();
+            self.push_taste();
         }
     }
 
@@ -519,6 +612,14 @@ impl App {
                             }
                         }
                         n += 1;
+                        if self
+                            .metas
+                            .get(job.index)
+                            .and_then(|m| m.as_ref())
+                            .is_some_and(|m| self.wants_remote(m))
+                        {
+                            self.queue_meta(job.index);
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -610,6 +711,7 @@ impl App {
                 self.drain_decode();
                 self.drain_peek();
                 self.drain_remote_meta();
+                self.pump_meta_queue();
                 self.drain_progress();
                 self.drain_import();
                 self.drain_search();
@@ -681,6 +783,10 @@ impl App {
             KeyCode::Char('t') => {
                 self.overlay = Overlay::Settings;
                 self.settings_idx = 0;
+            }
+            KeyCode::Char('y') => {
+                self.overlay = Overlay::Library;
+                self.library_idx = 0;
             }
             KeyCode::Char('g') if self.tab == Tab::Player => {
                 self.overlay = Overlay::Eq;
@@ -806,9 +912,11 @@ impl App {
                 self.status = mixer.snapshot(self.selected()).status;
             }
             KeyCode::Char('s') => {
-                let mut mixer = self.player.mixer.lock().expect("mixer");
-                mixer.toggle_shuffle();
-                self.status = mixer.snapshot(self.selected()).status;
+                let next = {
+                    let mixer = self.player.mixer.lock().expect("mixer");
+                    mixer.shuffle_mode().next()
+                };
+                self.apply_shuffle(next);
             }
             KeyCode::Char('o') => {
                 let mut mixer = self.player.mixer.lock().expect("mixer");
@@ -854,7 +962,7 @@ impl App {
 
     fn handle_overlay_key(&mut self, key: event::KeyEvent) -> bool {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('t') | KeyCode::Char('g') => {
+            KeyCode::Esc | KeyCode::Char('t') | KeyCode::Char('g') | KeyCode::Char('y') => {
                 self.overlay = Overlay::None;
             }
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -868,6 +976,15 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char(' ') if self.overlay == Overlay::Settings => {
                 self.toggle_setting();
+            }
+            KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Library => {
+                self.library_idx = (self.library_idx + 1) % 4;
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.overlay == Overlay::Library => {
+                self.library_idx = (self.library_idx + 3) % 4;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if self.overlay == Overlay::Library => {
+                self.toggle_library();
             }
             KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Eq => {
                 self.eq_band = (self.eq_band + 1) % 5;
@@ -909,6 +1026,95 @@ impl App {
             self.prefs.lyrics_fetch,
             self.prefs.cover_fetch
         );
+    }
+
+    fn toggle_library(&mut self) {
+        match self.library_idx {
+            0 => {
+                let keep = self.selected();
+                self.prefs.sort_mode = self.prefs.sort_mode.next();
+                self.prefs.save();
+                self.sync_list_cursor(keep);
+                self.status = format!("sort {}", self.prefs.sort_mode.label());
+            }
+            1 => {
+                let next = self.prefs.shuffle_mode.next();
+                self.apply_shuffle(next);
+            }
+            2 => {
+                let n = self.enqueue_missing_meta();
+                self.pump_meta_queue();
+                self.status = if n == 0 {
+                    "meta scan idle".into()
+                } else {
+                    format!("meta queue {n}")
+                };
+            }
+            3 => self.overlay = Overlay::None,
+            _ => {}
+        }
+    }
+
+    fn apply_shuffle(&mut self, mode: ShuffleMode) {
+        self.prefs.shuffle_mode = mode;
+        self.prefs.save();
+        if let Ok(mut mixer) = self.player.mixer.lock() {
+            mixer.set_shuffle_mode(mode);
+            self.status = mixer.snapshot(self.selected()).status;
+        }
+    }
+
+    fn enqueue_missing_meta(&mut self) -> usize {
+        let mut n = 0;
+        for i in 0..self.tracks.len() {
+            if self.meta_inflight.contains(&i) || self.meta_queue.contains(&i) {
+                continue;
+            }
+            let missing = self
+                .metas
+                .get(i)
+                .and_then(|m| m.as_ref())
+                .is_none_or(|m| self.wants_remote(m));
+            if missing {
+                self.meta_queue.push_back(i);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    fn pump_meta_queue(&mut self) {
+        while self.meta_inflight.len() < 2 {
+            let Some(index) = self.meta_queue.pop_front() else {
+                break;
+            };
+            if self.meta_inflight.contains(&index) {
+                continue;
+            }
+            let Some(track) = self.tracks.get(index) else {
+                continue;
+            };
+            let meta = self
+                .metas
+                .get(index)
+                .and_then(|m| m.clone())
+                .unwrap_or_else(|| TrackMeta {
+                    title: track.title.clone(),
+                    ..TrackMeta::default()
+                });
+            if !self.wants_remote(&meta) {
+                continue;
+            }
+            self.meta_inflight.insert(index);
+            self.spawn_remote_meta(index, track.path.clone(), meta);
+        }
+        if !self.meta_inflight.is_empty() {
+            self.job = Some(format!(
+                "meta {} queued · {} inflight",
+                self.meta_queue.len(),
+                self.meta_inflight.len()
+            ));
+        }
     }
 
     fn bump_eq(&mut self, delta: f32) {
@@ -993,8 +1199,11 @@ impl App {
                 self.prefs.save();
                 self.tracks = tracks;
                 self.metas = vec![None; self.tracks.len()];
+                self.meta_queue.clear();
+                self.meta_inflight.clear();
                 if let Ok(mut mixer) = self.player.mixer.lock() {
                     mixer.set_tracks(self.tracks.clone());
+                    mixer.set_shuffle_mode(self.prefs.shuffle_mode);
                 }
                 self.spawn_peek();
                 self.refresh_artists();
@@ -1125,7 +1334,7 @@ impl App {
         self.search_hits.clear();
         self.music_mode = MusicMode::Library;
         self.tab = Tab::Music;
-        self.list_state.select(Some(index));
+        self.sync_list_cursor(index);
         if play {
             self.play_index(index, false);
         }
@@ -1299,6 +1508,7 @@ impl App {
         }
         match self.overlay {
             Overlay::Settings => self.draw_settings(frame),
+            Overlay::Library => self.draw_library(frame),
             Overlay::Help => self.draw_help_modal(frame),
             Overlay::Eq => self.draw_eq(frame),
             Overlay::None => {}
@@ -1509,10 +1719,11 @@ impl App {
             " ".into(),
             remix,
             "  ".into(),
-            if snap.shuffle {
-                Span::styled("SHUF", Style::default().yellow())
-            } else {
-                Span::styled("SEQ", pal.dim_style())
+            match self.prefs.shuffle_mode {
+                ShuffleMode::Off => Span::styled("SEQ", pal.dim_style()),
+                ShuffleMode::Random => Span::styled("SHUF", Style::default().yellow()),
+                ShuffleMode::NoRepeat => Span::styled("NOREP", Style::default().yellow()),
+                ShuffleMode::Taste => Span::styled("TASTE", Style::default().yellow()),
             },
             "  ".into(),
             if self.login.logged_in {
@@ -1534,10 +1745,10 @@ impl App {
     }
 
     fn visible_tracks(&self) -> Vec<usize> {
-        if self.local_filter.is_empty() {
-            (0..self.tracks.len()).collect()
-        } else {
+        if !self.local_filter.is_empty() {
             self.local_hits.clone()
+        } else {
+            sort_indices(&self.tracks, &self.metas, self.prefs.sort_mode)
         }
     }
 
@@ -1605,7 +1816,11 @@ impl App {
             .block(
                 Block::default()
                     .title(if self.local_filter.is_empty() {
-                        " 曲库 · 1列表 2作者 ".into()
+                        format!(
+                            " 曲库 · {} · {} ",
+                            self.prefs.sort_mode.label_zh(),
+                            self.prefs.shuffle_mode.label_zh()
+                        )
                     } else {
                         format!(" local /{} · {} ", self.local_filter, self.local_hits.len())
                     })
@@ -1809,9 +2024,7 @@ impl App {
             format!(":{}", self.command.clone().unwrap_or_default())
         } else {
             match self.tab {
-                Tab::Music => {
-                    "q/e tab  1曲库 2作者  /find  ?搜  t设置  ^k帮助  ^f开目录  ^q退出".into()
-                }
+                Tab::Music => "q/e tab  1曲库 2作者  /find  y库  t设置  ^k帮助  ^q退出".into(),
                 Tab::Player => {
                     "q/e tab  l歌词  g EQ  space  n/p  ↑↓音量  t设置  ^k帮助  ^q退出".into()
                 }
@@ -1872,8 +2085,43 @@ impl App {
         );
     }
 
+    fn draw_library(&self, frame: &mut ratatui::Frame<'_>) {
+        let queued = self.meta_queue.len() + self.meta_inflight.len();
+        let rows = [
+            format!("排序        {}", self.prefs.sort_mode.label_zh()),
+            format!("随机        {}", self.prefs.shuffle_mode.label_zh()),
+            format!(
+                "扫元数据    {}",
+                if queued == 0 {
+                    "缺字段排队".into()
+                } else {
+                    format!("排队 {queued}")
+                }
+            ),
+            "关闭".into(),
+        ];
+        let items: Vec<ListItem> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let mark = if i == self.library_idx { "▸ " } else { "  " };
+                ListItem::new(format!("{mark}{row}"))
+            })
+            .collect();
+        let area = centered(frame.area(), 42, 9);
+        let pal = self.palette();
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            List::new(items)
+                .block(self.overlay_block(" library ", Style::default().yellow()))
+                .style(pal.text_style())
+                .highlight_style(pal.highlight()),
+            area,
+        );
+    }
+
     fn draw_help_modal(&self, frame: &mut ratatui::Frame<'_>) {
-        let text = "q/e 切栏   1曲库 2作者   j/k 或 ↑↓ 移动\n空格 播放暂停   n/p 下一首上一首\nl 歌词   g 均衡器   t 设置\nEsc 关搜索/弹窗   Ctrl+F 打开文件夹   Ctrl+K 帮助\nCtrl+Q 退出   +/- 音量   ←→ 快进快退";
+        let text = "q/e 切栏   1曲库 2作者   j/k 或 ↑↓ 移动\n空格 播放暂停   n/p 下一首上一首\nl 歌词   g 均衡器   t 设置   y 曲库\nEsc 关搜索/弹窗   Ctrl+F 打开文件夹   Ctrl+K 帮助\nCtrl+Q 退出   +/- 音量   ←→ 快进快退";
         let area = centered(frame.area(), 52, 10);
         frame.render_widget(Clear, area);
         frame.render_widget(

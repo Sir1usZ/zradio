@@ -16,6 +16,7 @@ use crate::dsp::{
 };
 use crate::eq::Equalizer;
 use crate::library::Track;
+use crate::prefs::ShuffleMode;
 use crate::remix::RemixMode;
 use crate::spectrum::Spectrum;
 
@@ -147,6 +148,8 @@ pub struct Mixer {
     done: bool,
     spectrum: Spectrum,
     shuffle: bool,
+    shuffle_mode: ShuffleMode,
+    recent: Vec<usize>,
     loop_mode: LoopMode,
     taste_boosts: Vec<f32>,
     eq: Equalizer,
@@ -177,6 +180,8 @@ impl Mixer {
             done: false,
             spectrum: Spectrum::default(),
             shuffle: false,
+            shuffle_mode: ShuffleMode::Off,
+            recent: Vec::new(),
             loop_mode: LoopMode::Off,
             taste_boosts: Vec::new(),
             eq: Equalizer::new(sample_rate, [0.0; 5]),
@@ -209,6 +214,7 @@ impl Mixer {
         self.analyses = vec![None; tracks.len()];
         self.taste_boosts = vec![0.0; tracks.len()];
         self.tracks = tracks;
+        self.recent.clear();
         if self.tracks.is_empty() {
             self.status = "empty library".into();
         } else {
@@ -287,14 +293,35 @@ impl Mixer {
         self.shuffle
     }
 
+    pub fn shuffle_mode(&self) -> ShuffleMode {
+        self.shuffle_mode
+    }
+
+    pub fn set_shuffle_mode(&mut self, mode: ShuffleMode) {
+        self.shuffle_mode = mode;
+        self.shuffle = mode != ShuffleMode::Off;
+        self.status = format!("shuffle {}", mode.label());
+    }
+
     pub fn toggle_shuffle(&mut self) {
-        self.shuffle = !self.shuffle;
-        self.status = if self.shuffle {
-            "shuffle on"
+        if self.shuffle_mode == ShuffleMode::Off {
+            self.set_shuffle_mode(ShuffleMode::Random);
         } else {
-            "shuffle off"
+            self.set_shuffle_mode(ShuffleMode::Off);
         }
-        .into();
+    }
+
+    pub fn remember_played(&mut self, index: usize) {
+        if self.tracks.is_empty() {
+            return;
+        }
+        self.recent.retain(|&i| i != index);
+        self.recent.push(index);
+        let cap = self.tracks.len().saturating_sub(1).min(12);
+        if self.recent.len() > cap {
+            let extra = self.recent.len() - cap;
+            self.recent.drain(0..extra);
+        }
     }
 
     pub fn cycle_loop(&mut self) {
@@ -342,6 +369,7 @@ impl Mixer {
     }
 
     pub fn play_decoded(&mut self, index: usize, buf: AudioBuf) {
+        self.remember_played(index);
         self.current_idx = Some(index);
         self.incoming_idx = None;
         self.incoming = None;
@@ -479,7 +507,7 @@ impl Mixer {
         if self.loop_mode == LoopMode::One {
             return self.current_idx;
         }
-        if self.shuffle && self.tracks.len() > 1 {
+        if self.shuffle_mode != ShuffleMode::Off && self.tracks.len() > 1 {
             return Some(self.shuffled_next());
         }
         if self.loop_mode == LoopMode::All {
@@ -500,8 +528,20 @@ impl Mixer {
     }
 
     fn shuffled_next(&self) -> usize {
+        match self.shuffle_mode {
+            ShuffleMode::Off => self.current_idx.unwrap_or(0),
+            ShuffleMode::Taste => self.taste_next(),
+            ShuffleMode::NoRepeat => self.norepeat_next(),
+            ShuffleMode::Random => self.random_next(),
+        }
+    }
+
+    fn random_next(&self) -> usize {
         let len = self.tracks.len();
         let cur = self.current_idx.unwrap_or(0);
+        if len < 2 {
+            return cur;
+        }
         let seed = (self.current.as_ref().map(|d| d.pos).unwrap_or(0) ^ (cur * 1_000_003) ^ len)
             % (len - 1);
         if seed >= cur {
@@ -509,6 +549,51 @@ impl Mixer {
         } else {
             seed
         }
+    }
+
+    fn norepeat_next(&self) -> usize {
+        let len = self.tracks.len();
+        let cur = self.current_idx;
+        let mut candidates: Vec<usize> = (0..len)
+            .filter(|i| Some(*i) != cur && !self.recent.contains(i))
+            .collect();
+        if candidates.is_empty() {
+            candidates = (0..len).filter(|i| Some(*i) != cur).collect();
+        }
+        if candidates.is_empty() {
+            return cur.unwrap_or(0);
+        }
+        let seed = self.current.as_ref().map(|d| d.pos).unwrap_or(0)
+            ^ (cur.unwrap_or(0) * 1_000_003)
+            ^ len;
+        candidates[seed % candidates.len()]
+    }
+
+    fn taste_next(&self) -> usize {
+        let len = self.tracks.len();
+        let cur = self.current_idx;
+        let weighted: Vec<(usize, f32)> = (0..len)
+            .filter(|i| Some(*i) != cur)
+            .map(|i| {
+                let boost = self.taste_boosts.get(i).copied().unwrap_or(0.0).max(0.0);
+                (i, 1.0 + boost)
+            })
+            .collect();
+        if weighted.is_empty() {
+            return cur.unwrap_or(0);
+        }
+        let total: f32 = weighted.iter().map(|(_, w)| w).sum::<f32>().max(0.001);
+        let seed = self.current.as_ref().map(|d| d.pos).unwrap_or(0)
+            ^ (cur.unwrap_or(0) * 1_000_003)
+            ^ len;
+        let mut pick = (seed % 10_007) as f32 / 10_007.0 * total;
+        for (i, w) in weighted {
+            if pick <= w {
+                return i;
+            }
+            pick -= w;
+        }
+        cur.unwrap_or(0)
     }
 
     pub fn prev_index(&self) -> Option<usize> {
@@ -754,6 +839,9 @@ impl Mixer {
         if let Some(incoming) = self.incoming.take() {
             self.current = Some(incoming);
             self.current_idx = self.incoming_idx.take();
+            if let Some(idx) = self.current_idx {
+                self.remember_played(idx);
+            }
             self.status = format!(
                 "playing {}",
                 self.current_idx
@@ -1007,6 +1095,36 @@ mod tests {
         assert!(!mixer.done);
         assert_eq!(mixer.current_idx, Some(0));
         assert!(mixer.current.as_ref().unwrap().pos < 8);
+    }
+
+    #[test]
+    fn no_repeat_avoids_recent_tracks() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(vec![
+            Track {
+                path: PathBuf::from("a.wav"),
+                title: "A".into(),
+            },
+            Track {
+                path: PathBuf::from("b.wav"),
+                title: "B".into(),
+            },
+            Track {
+                path: PathBuf::from("c.wav"),
+                title: "C".into(),
+            },
+            Track {
+                path: PathBuf::from("d.wav"),
+                title: "D".into(),
+            },
+        ]);
+        mixer.set_shuffle_mode(crate::prefs::ShuffleMode::NoRepeat);
+        mixer.play_decoded(0, const_deck(100, 0.5));
+        mixer.remember_played(0);
+        mixer.remember_played(1);
+        mixer.remember_played(2);
+        let next = mixer.next_index().unwrap();
+        assert_eq!(next, 3);
     }
 
     #[test]

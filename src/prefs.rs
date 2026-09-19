@@ -67,6 +67,84 @@ impl VisualizeMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SortMode {
+    #[default]
+    Path,
+    Title,
+    Artist,
+    Album,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Path => Self::Title,
+            Self::Title => Self::Artist,
+            Self::Artist => Self::Album,
+            Self::Album => Self::Path,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Title => "title",
+            Self::Artist => "artist",
+            Self::Album => "album",
+        }
+    }
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::Path => "路径",
+            Self::Title => "歌名",
+            Self::Artist => "歌手",
+            Self::Album => "专辑",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ShuffleMode {
+    #[default]
+    Off,
+    Random,
+    NoRepeat,
+    Taste,
+}
+
+impl ShuffleMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Random,
+            Self::Random => Self::NoRepeat,
+            Self::NoRepeat => Self::Taste,
+            Self::Taste => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Random => "random",
+            Self::NoRepeat => "norepeat",
+            Self::Taste => "taste",
+        }
+    }
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::Off => "关",
+            Self::Random => "随机",
+            Self::NoRepeat => "避开刚听",
+            Self::Taste => "口味加权",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prefs {
     pub theme: ThemeName,
@@ -77,6 +155,10 @@ pub struct Prefs {
     pub resume: bool,
     pub library: String,
     pub eq_db: [f32; 5],
+    #[serde(default)]
+    pub sort_mode: SortMode,
+    #[serde(default)]
+    pub shuffle_mode: ShuffleMode,
 }
 
 impl Default for Prefs {
@@ -90,6 +172,8 @@ impl Default for Prefs {
             resume: true,
             library: String::new(),
             eq_db: [0.0; 5],
+            sort_mode: SortMode::Path,
+            shuffle_mode: ShuffleMode::Off,
         }
     }
 }
@@ -244,6 +328,20 @@ fn terminal_is_light() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_and_shuffle_cycle() {
+        let mut s = SortMode::Path;
+        assert_eq!(s.next().label(), "title");
+        s = s.next().next().next();
+        assert_eq!(s.label(), "album");
+        assert_eq!(s.next(), SortMode::Path);
+        let r = ShuffleMode::Off;
+        assert_eq!(r.next().label(), "random");
+        assert_eq!(r.next().next().label(), "norepeat");
+        assert_eq!(r.next().next().next().label(), "taste");
+        assert_eq!(r.next().next().next().next(), ShuffleMode::Off);
+    }
 
     #[test]
     fn visualize_cycles_through_cnm() {

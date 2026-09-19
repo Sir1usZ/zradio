@@ -63,6 +63,20 @@ pub fn apply_peek(slot: &mut Option<TrackMeta>, peeked: TrackMeta) -> bool {
     true
 }
 
+pub fn needs_remote(meta: &TrackMeta) -> bool {
+    meta.artist.trim().is_empty()
+        || meta.album.trim().is_empty()
+        || meta.lyrics.is_empty()
+        || (meta.cover.is_none() && meta.cover_path.is_none())
+}
+
+pub fn needs_fetch(meta: &TrackMeta, lyrics: bool, cover: bool) -> bool {
+    meta.artist.trim().is_empty()
+        || meta.album.trim().is_empty()
+        || (meta.lyrics.is_empty() && lyrics)
+        || (meta.cover.is_none() && meta.cover_path.is_none() && cover)
+}
+
 pub fn load_meta(path: &Path, fallback_title: &str) -> TrackMeta {
     let mut meta = TrackMeta {
         title: fallback_title.to_string(),
@@ -461,6 +475,24 @@ mod tests {
         assert!(meta.lyrics.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incomplete_meta_needs_fetch() {
+        let empty = TrackMeta::default();
+        assert!(needs_remote(&empty));
+        let full = TrackMeta {
+            artist: "Avicii".into(),
+            title: "Levels".into(),
+            album: "True".into(),
+            lyrics: vec![LyricLine {
+                time: 0.0,
+                text: "oh".into(),
+            }],
+            cover_path: Some(std::path::PathBuf::from("/tmp/cover.jpg")),
+            ..TrackMeta::default()
+        };
+        assert!(!needs_remote(&full));
     }
 
     #[test]

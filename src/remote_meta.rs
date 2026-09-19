@@ -67,7 +67,24 @@ pub fn lyrics_or_empty(title: &str, artist: &str) -> Vec<crate::meta::LyricLine>
         .unwrap_or_default()
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ItunesHit {
+    pub artist: String,
+    pub title: String,
+    pub album: String,
+    pub artwork: Option<String>,
+}
+
 pub fn fetch_cover(title: &str, artist: &str, album: &str) -> Option<Vec<u8>> {
+    let art = fetch_itunes(title, artist, album)?.artwork?;
+    fetch_bytes(&art)
+}
+
+pub fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
+    curl_bytes(url)
+}
+
+pub fn fetch_itunes(title: &str, artist: &str, album: &str) -> Option<ItunesHit> {
     let (artist, title) = query_artist_title(artist, title);
     let query = [&artist, album, &title]
         .into_iter()
@@ -82,19 +99,37 @@ pub fn fetch_cover(title: &str, artist: &str, album: &str) -> Option<Vec<u8>> {
         url_encode(&query)
     );
     let body = curl(&url)?;
-    let art = parse_itunes_artwork(&body)?;
-    curl_bytes(&art)
+    parse_itunes_hit(&body)
 }
 
-fn parse_itunes_artwork(body: &str) -> Option<String> {
+fn parse_itunes_hit(body: &str) -> Option<ItunesHit> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let url = v
-        .get("results")?
-        .as_array()?
-        .first()?
-        .get("artworkUrl100")?
-        .as_str()?;
-    Some(url.replace("100x100bb", "600x600bb"))
+    let item = v.get("results")?.as_array()?.first()?;
+    let artwork = item
+        .get("artworkUrl100")
+        .and_then(|s| s.as_str())
+        .map(|url| url.replace("100x100bb", "600x600bb"));
+    Some(ItunesHit {
+        artist: item
+            .get("artistName")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        title: item
+            .get("trackName")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        album: item
+            .get("collectionName")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        artwork,
+    })
 }
 
 fn curl_bytes(url: &str) -> Option<Vec<u8>> {
@@ -159,14 +194,24 @@ mod tests {
     fn itunes_artwork_upgrades_100_to_600() {
         let body = r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/image/thumb/Music/aa/bb/cc/100x100bb.jpg"}]}"#;
         assert_eq!(
-            parse_itunes_artwork(body).as_deref(),
+            parse_itunes_hit(body).and_then(|h| h.artwork).as_deref(),
             Some("https://is1-ssl.mzstatic.com/image/thumb/Music/aa/bb/cc/600x600bb.jpg")
         );
     }
 
     #[test]
     fn itunes_artwork_empty_when_no_results() {
-        assert_eq!(parse_itunes_artwork(r#"{"results":[]}"#), None);
+        assert_eq!(parse_itunes_hit(r#"{"results":[]}"#), None);
+    }
+
+    #[test]
+    fn itunes_hit_reads_artist_album_title() {
+        let body = r#"{"results":[{"artistName":"Avicii","trackName":"Levels","collectionName":"True","artworkUrl100":"https://x/100x100bb.jpg"}]}"#;
+        let hit = parse_itunes_hit(body).unwrap();
+        assert_eq!(hit.artist, "Avicii");
+        assert_eq!(hit.title, "Levels");
+        assert_eq!(hit.album, "True");
+        assert_eq!(hit.artwork.as_deref(), Some("https://x/600x600bb.jpg"));
     }
 
     #[test]
