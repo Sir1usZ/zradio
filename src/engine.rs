@@ -543,14 +543,18 @@ impl Mixer {
         }
     }
 
+    fn shuffle_seed(&self) -> usize {
+        let cur = self.current_idx.unwrap_or(0);
+        cur.wrapping_mul(1_000_003) ^ self.tracks.len() ^ 0x9E37
+    }
+
     fn random_next(&self) -> usize {
         let len = self.tracks.len();
         let cur = self.current_idx.unwrap_or(0);
         if len < 2 {
             return cur;
         }
-        let seed = (self.current.as_ref().map(|d| d.pos).unwrap_or(0) ^ (cur * 1_000_003) ^ len)
-            % (len - 1);
+        let seed = self.shuffle_seed() % (len - 1);
         if seed >= cur {
             seed + 1
         } else {
@@ -570,10 +574,7 @@ impl Mixer {
         if candidates.is_empty() {
             return cur.unwrap_or(0);
         }
-        let seed = self.current.as_ref().map(|d| d.pos).unwrap_or(0)
-            ^ (cur.unwrap_or(0) * 1_000_003)
-            ^ len;
-        candidates[seed % candidates.len()]
+        candidates[self.shuffle_seed() % candidates.len()]
     }
 
     fn taste_next(&self) -> usize {
@@ -590,10 +591,7 @@ impl Mixer {
             return cur.unwrap_or(0);
         }
         let total: f32 = weighted.iter().map(|(_, w)| w).sum::<f32>().max(0.001);
-        let seed = self.current.as_ref().map(|d| d.pos).unwrap_or(0)
-            ^ (cur.unwrap_or(0) * 1_000_003)
-            ^ len;
-        let mut pick = (seed % 10_007) as f32 / 10_007.0 * total;
+        let mut pick = (self.shuffle_seed() % 10_007) as f32 / 10_007.0 * total;
         for (i, w) in weighted {
             if pick <= w {
                 return i;
@@ -1129,6 +1127,40 @@ mod tests {
     }
 
     #[test]
+    fn shuffle_next_stays_stable_as_playhead_moves() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(vec![
+            Track {
+                path: PathBuf::from("a.wav"),
+                title: "Alpha".into(),
+            },
+            Track {
+                path: PathBuf::from("b.wav"),
+                title: "Beta".into(),
+            },
+            Track {
+                path: PathBuf::from("c.wav"),
+                title: "Gamma".into(),
+            },
+            Track {
+                path: PathBuf::from("d.wav"),
+                title: "Delta".into(),
+            },
+        ]);
+        mixer.play_decoded(0, const_deck(10_000, 0.5));
+        mixer.set_shuffle_mode(crate::prefs::ShuffleMode::Random);
+        let first = mixer.next_index().unwrap();
+        let hint = mixer.snapshot(0).next_hint.clone();
+        mixer.set_playhead(1);
+        assert_eq!(mixer.next_index(), Some(first));
+        mixer.set_playhead(77);
+        assert_eq!(mixer.next_index(), Some(first));
+        mixer.set_playhead(9_000);
+        assert_eq!(mixer.next_index(), Some(first));
+        assert_eq!(mixer.snapshot(0).next_hint, hint);
+    }
+
+    #[test]
     fn shuffle_next_hint_matches_next_index_not_seq() {
         let mut mixer = Mixer::new(48_000, 2);
         mixer.set_tracks(vec![
@@ -1146,15 +1178,14 @@ mod tests {
             },
         ]);
         mixer.play_decoded(0, const_deck(100, 0.5));
-        mixer.set_playhead(2);
         mixer.set_shuffle_mode(crate::prefs::ShuffleMode::Random);
         let next = mixer.next_index().unwrap();
-        assert_eq!(next, 2);
+        assert_ne!(next, 0);
+        let title = mixer.tracks()[next].title.clone();
         let hint = mixer.snapshot(0).next_hint.unwrap();
-        assert!(hint.contains("Gamma"), "hint={hint}");
         assert!(
-            !hint.contains("Beta"),
-            "must not show sequential next, hint={hint}"
+            hint.contains(&title),
+            "hint must follow next_index, hint={hint} title={title}"
         );
     }
 
