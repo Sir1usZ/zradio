@@ -22,21 +22,13 @@ const tools = [
   },
   {
     name: "zradio_next",
-    description: "Skip to next track or vibe station.",
+    description: "Skip to next track.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "zradio_prev",
-    description: "Go to previous track or vibe station.",
+    description: "Go to previous track.",
     inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "zradio_vibe",
-    description: "Enter vibe radio. Optional genre: lofi, jazz, ambient, electronic, synthwave, lounge, indie, live.",
-    inputSchema: {
-      type: "object",
-      properties: { genre: { type: "string" } },
-    },
   },
   {
     name: "zradio_import_url",
@@ -106,8 +98,6 @@ async function callTool(name, args = {}) {
       return post("/next");
     case "zradio_prev":
       return post("/prev");
-    case "zradio_vibe":
-      return post("/vibe", { genre: args.genre });
     case "zradio_import_url":
       return post("/import", { url: args.url });
     case "zradio_search_splayer": {

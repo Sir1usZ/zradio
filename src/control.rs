@@ -12,7 +12,6 @@ pub enum ControlCmd {
     Pause,
     Next,
     Prev,
-    Vibe(Option<String>),
     Import(String),
     Search(String),
 }
@@ -21,7 +20,6 @@ pub enum ControlCmd {
 struct Body {
     url: Option<String>,
     query: Option<String>,
-    genre: Option<String>,
 }
 
 pub fn start(tx: Sender<ControlCmd>) {
@@ -65,14 +63,12 @@ fn parse(req: &str) -> Option<ControlCmd> {
     let parsed: Body = serde_json::from_str(body).unwrap_or(Body {
         url: None,
         query: None,
-        genre: None,
     });
     match path {
         "/play" => Some(ControlCmd::Play),
         "/pause" => Some(ControlCmd::Pause),
         "/next" => Some(ControlCmd::Next),
         "/prev" => Some(ControlCmd::Prev),
-        "/vibe" => Some(ControlCmd::Vibe(parsed.genre)),
         "/import" => parsed.url.map(ControlCmd::Import),
         "/search" => parsed.query.or(parsed.url).map(ControlCmd::Search),
         "/status" => Some(ControlCmd::Status),
@@ -91,5 +87,14 @@ mod tests {
             Some(ControlCmd::Import(url)) => assert!(url.contains("youtu")),
             _ => panic!("bad parse"),
         }
+    }
+
+    #[test]
+    fn parse_vibe_is_gone() {
+        let req = "POST /vibe HTTP/1.1\r\n\r\n{\"genre\":\"lofi\"}";
+        assert!(
+            parse(req).is_none(),
+            "vibe control endpoint must be removed"
+        );
     }
 }

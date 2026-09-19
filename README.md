@@ -30,9 +30,9 @@ Optional argument: a library directory.
 | `o` | Loop |
 | `m` | Mix mode |
 | `r` | Remix |
-| `v` | Vibe radio |
 | `Ctrl+F` | Open folder |
 | `Ctrl+K` | Help |
+| `Esc` | Close search / overlay (does not quit) |
 | `Ctrl+Q` | Quit |
 
 Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume.

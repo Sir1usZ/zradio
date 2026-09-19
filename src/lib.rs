@@ -14,7 +14,6 @@ pub mod meta;
 pub mod mpris;
 pub mod prefs;
 pub mod progress;
-pub mod pulse;
 pub mod remix;
 pub mod remote_meta;
 pub mod session;
@@ -22,10 +21,8 @@ pub mod session_store;
 pub mod shell;
 pub mod spectrum;
 pub mod splayer;
-pub mod stream;
 pub mod taste;
 pub mod ui;
-pub mod vibe;
 
 pub use dsp::{equal_power_gains, fade_frames, MixMode};
 pub use library::{scan_library, Track};

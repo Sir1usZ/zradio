@@ -35,14 +35,11 @@ use crate::meta::{
 use crate::mpris::{MediaCmd, Mpris};
 use crate::prefs::{Palette, Prefs};
 use crate::progress::{self, TransferBar};
-use crate::pulse::{self, Pulse};
 use crate::remix::{apply_remix, RemixMode};
 use crate::session_store::SessionState;
 use crate::shell::{format_listen_time, Tab};
 use crate::splayer;
-use crate::stream::RadioStream;
 use crate::taste::TasteStore;
-use crate::vibe::{pick_vibe, stations_for, Genre};
 
 struct DecodeJob {
     index: usize,
@@ -82,10 +79,6 @@ pub struct App {
     remote_rx: Receiver<RemoteMetaJob>,
     remote_tx: std::sync::mpsc::Sender<RemoteMetaJob>,
     mpris: Mpris,
-    vibe: bool,
-    genre: Genre,
-    station_idx: usize,
-    radio: RadioStream,
     tick: u64,
     command: Option<String>,
     import_rx: Receiver<Result<String, String>>,
@@ -93,7 +86,6 @@ pub struct App {
     progress_rx: Receiver<String>,
     progress_tx: std::sync::mpsc::Sender<String>,
     control_rx: Receiver<ControlCmd>,
-    pulse: Pulse,
     job: Option<String>,
     job_ratio: f64,
     search_hits: Vec<splayer::Hit>,
@@ -117,6 +109,7 @@ pub struct App {
     artist_state: ListState,
     artist_pages: Vec<browse::ArtistPage>,
     cava: Option<CavaFeed>,
+    pending_seek: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,10 +177,6 @@ impl App {
             remote_rx,
             remote_tx,
             mpris: Mpris::start(),
-            vibe: false,
-            genre: Genre::Live,
-            station_idx: 0,
-            radio: RadioStream::default(),
             tick: 0,
             command: None,
             import_rx,
@@ -195,7 +184,6 @@ impl App {
             progress_rx,
             progress_tx,
             control_rx,
-            pulse: Pulse::default(),
             job: None,
             job_ratio: 0.0,
             search_hits: Vec::new(),
@@ -219,12 +207,14 @@ impl App {
             artist_state: ListState::default(),
             artist_pages: Vec::new(),
             cava: CavaFeed::start(24),
+            pending_seek: None,
         };
         app.push_taste();
         if let Ok(mut mixer) = app.player.mixer.lock() {
             mixer.set_eq_db(app.prefs.eq_db);
         }
         app.spawn_peek();
+        app.resume_if_needed();
         Ok(app)
     }
 
@@ -251,9 +241,33 @@ impl App {
     }
 
     fn play_index(&mut self, index: usize, transition: bool) {
+        self.pending_seek = None;
         self.note_leave(transition);
-        self.list_state.select(Some(index));
+        self.sync_list_cursor(index);
         self.spawn_decode(index, transition, transition);
+    }
+
+    fn sync_list_cursor(&mut self, track_index: usize) {
+        if !self.local_filter.is_empty() {
+            if let Some(row) = visible_row(&self.local_hits, track_index) {
+                self.local_idx = row;
+                self.list_state.select(Some(row));
+                return;
+            }
+        }
+        self.list_state.select(Some(track_index));
+    }
+
+    fn resume_if_needed(&mut self) {
+        if !self.prefs.resume {
+            return;
+        }
+        let session = SessionState::load();
+        let Some(index) = session.track_index(&self.tracks) else {
+            return;
+        };
+        self.play_index(index, false);
+        self.pending_seek = Some(session.position_secs);
     }
 
     fn note_leave(&mut self, skipped: bool) {
@@ -404,6 +418,15 @@ impl App {
         } else {
             mixer.play_decoded(job.index, buf);
         }
+        if let Some(secs) = self.pending_seek.take() {
+            let snap = mixer.snapshot(job.index);
+            let duration = if snap.sample_rate == 0 {
+                0.0
+            } else {
+                snap.duration_frames as f32 / snap.sample_rate as f32
+            };
+            mixer.seek_to(crate::session_store::resume_seek(secs, duration));
+        }
         self.last_taste = None;
         self.status = mixer.snapshot(job.index).status;
         drop(mixer);
@@ -543,7 +566,7 @@ impl App {
             let finished = self.player.mixer.lock().expect("mixer").take_finished();
             if finished {
                 self.note_leave(false);
-                self.list_state.select(Some(index));
+                self.sync_list_cursor(index);
                 self.spawn_decode(index, false, false);
             }
             return;
@@ -584,7 +607,6 @@ impl App {
             }
             if last.elapsed() >= tick {
                 self.tick = self.tick.wrapping_add(1);
-                self.radio.poll();
                 self.drain_decode();
                 self.drain_peek();
                 self.drain_remote_meta();
@@ -593,7 +615,6 @@ impl App {
                 self.drain_search();
                 self.drain_control();
                 if self.tick.is_multiple_of(90) {
-                    self.pulse = pulse::poll();
                     self.login = splayer::login_status();
                 }
                 self.drain_mpris();
@@ -686,21 +707,23 @@ impl App {
                     "lyrics off".into()
                 };
             }
-            KeyCode::Esc => {
-                if !self.search_hits.is_empty() {
+            KeyCode::Esc => match esc_outcome(
+                !self.search_hits.is_empty(),
+                !self.local_hits.is_empty() || !self.local_filter.is_empty(),
+            ) {
+                EscOutcome::CloseSearch => {
                     self.search_hits.clear();
                     self.status = "search closed".into();
-                    return false;
                 }
-                if !self.local_hits.is_empty() || !self.local_filter.is_empty() {
+                EscOutcome::CloseLocal => {
                     self.local_hits.clear();
                     self.local_filter.clear();
                     self.status = "local search closed".into();
-                    return false;
                 }
-                self.save_session();
-                return true;
-            }
+                EscOutcome::Dismiss => {
+                    self.status = "Ctrl+Q 退出".into();
+                }
+            },
             KeyCode::Char(':') => {
                 self.command = Some(String::new());
                 self.status = "url / search 歌名 / find 本地".into();
@@ -719,11 +742,15 @@ impl App {
                 if !self.search_hits.is_empty() {
                     self.download_hit(self.search_idx);
                 } else if self.tab == Tab::Music && self.music_mode == MusicMode::Artists {
-                    if let Some(page) = self.artist_pages.get(self.artist_idx) {
-                        if let Some(&i) = page.tracks.first() {
-                            self.play_index(i, false);
-                            self.tab = Tab::Player;
-                        }
+                    if let Some((name, tracks)) =
+                        browse::open_artist(&self.artist_pages, self.artist_idx)
+                    {
+                        self.music_mode = MusicMode::Library;
+                        self.local_filter = name.clone();
+                        self.local_hits = tracks;
+                        self.local_idx = 0;
+                        self.list_state.select(Some(0));
+                        self.status = format!("{name} · {} tracks", self.local_hits.len());
                     }
                 } else if !self.local_hits.is_empty() {
                     let i = self.local_hits[self.local_idx];
@@ -747,23 +774,15 @@ impl App {
                 }
             }
             KeyCode::Char('n') => {
-                if self.vibe {
-                    self.next_station();
-                } else {
-                    let next = self.player.mixer.lock().expect("mixer").next_index();
-                    if let Some(i) = next {
-                        self.play_index(i, true);
-                    }
+                let next = self.player.mixer.lock().expect("mixer").next_index();
+                if let Some(i) = next {
+                    self.play_index(i, true);
                 }
             }
             KeyCode::Char('p') => {
-                if self.vibe {
-                    self.prev_station();
-                } else {
-                    let prev = self.player.mixer.lock().expect("mixer").prev_index();
-                    if let Some(i) = prev {
-                        self.play_index(i, true);
-                    }
+                let prev = self.player.mixer.lock().expect("mixer").prev_index();
+                if let Some(i) = prev {
+                    self.play_index(i, true);
                 }
             }
             KeyCode::Char('m') => {
@@ -786,7 +805,7 @@ impl App {
                 mixer.bump_volume(-0.05);
                 self.status = mixer.snapshot(self.selected()).status;
             }
-            KeyCode::Char('s') if !self.vibe => {
+            KeyCode::Char('s') => {
                 let mut mixer = self.player.mixer.lock().expect("mixer");
                 mixer.toggle_shuffle();
                 self.status = mixer.snapshot(self.selected()).status;
@@ -806,10 +825,6 @@ impl App {
                 mixer.seek_by(5.0);
                 self.status = mixer.snapshot(self.selected()).status;
             }
-            KeyCode::Char('v') => self.toggle_vibe(),
-            KeyCode::Tab if self.vibe => self.cycle_genre(true),
-            KeyCode::BackTab if self.vibe => self.cycle_genre(false),
-            KeyCode::Char('s') if self.vibe => self.auto_vibe(),
             _ => {}
         }
         false
@@ -1151,31 +1166,24 @@ impl App {
         while let Ok(cmd) = self.control_rx.try_recv() {
             match cmd {
                 ControlCmd::Play => {
-                    if self.vibe {
-                        self.play_station();
-                    } else {
-                        let i = self.selected();
-                        let empty = self
-                            .player
-                            .mixer
-                            .lock()
-                            .ok()
-                            .is_none_or(|m| m.snapshot(0).current.is_none());
-                        if empty {
-                            self.play_index(i, false);
-                        } else if let Ok(mut mixer) = self.player.mixer.lock() {
-                            if mixer.snapshot(0).paused {
-                                mixer.toggle_pause();
-                            }
-                            self.status = mixer.snapshot(self.selected()).status;
+                    let i = self.selected();
+                    let empty = self
+                        .player
+                        .mixer
+                        .lock()
+                        .ok()
+                        .is_none_or(|m| m.snapshot(0).current.is_none());
+                    if empty {
+                        self.play_index(i, false);
+                    } else if let Ok(mut mixer) = self.player.mixer.lock() {
+                        if mixer.snapshot(0).paused {
+                            mixer.toggle_pause();
                         }
+                        self.status = mixer.snapshot(self.selected()).status;
                     }
                 }
                 ControlCmd::Pause => {
-                    if self.vibe {
-                        self.radio.stop();
-                        self.status = "paused".into();
-                    } else if let Ok(mut mixer) = self.player.mixer.lock() {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
                         if !mixer.snapshot(0).paused {
                             mixer.toggle_pause();
                         }
@@ -1183,34 +1191,13 @@ impl App {
                     }
                 }
                 ControlCmd::Next => {
-                    if self.vibe {
-                        self.next_station();
-                    } else if let Some(i) =
-                        self.player.mixer.lock().ok().and_then(|m| m.next_index())
-                    {
+                    if let Some(i) = self.player.mixer.lock().ok().and_then(|m| m.next_index()) {
                         self.play_index(i, true);
                     }
                 }
                 ControlCmd::Prev => {
-                    if self.vibe {
-                        self.prev_station();
-                    } else if let Some(i) =
-                        self.player.mixer.lock().ok().and_then(|m| m.prev_index())
-                    {
+                    if let Some(i) = self.player.mixer.lock().ok().and_then(|m| m.prev_index()) {
                         self.play_index(i, true);
-                    }
-                }
-                ControlCmd::Vibe(genre) => {
-                    if let Some(name) = genre {
-                        if let Some(g) = Genre::ALL.iter().copied().find(|g| g.label() == name) {
-                            self.genre = g;
-                            self.station_idx = 0;
-                        }
-                    }
-                    if !self.vibe {
-                        self.toggle_vibe();
-                    } else {
-                        self.play_station();
                     }
                 }
                 ControlCmd::Import(url) => self.start_import(&url),
@@ -1276,66 +1263,6 @@ impl App {
         self.mpris.publish(&snap, meta, cover);
     }
 
-    fn current_station(&self) -> Option<&'static crate::vibe::Station> {
-        stations_for(self.genre).get(self.station_idx).copied()
-    }
-
-    fn toggle_vibe(&mut self) {
-        self.vibe = !self.vibe;
-        if self.vibe {
-            let _ = self.player.mixer.lock().map(|mut m| {
-                if !m.snapshot(0).paused && m.snapshot(0).current.is_some() {
-                    m.toggle_pause();
-                }
-            });
-            self.play_station();
-        } else {
-            self.radio.stop();
-            self.status = "library".into();
-        }
-    }
-
-    fn cycle_genre(&mut self, forward: bool) {
-        self.genre = if forward {
-            self.genre.next()
-        } else {
-            self.genre.prev()
-        };
-        self.station_idx = 0;
-        if self.vibe {
-            self.play_station();
-        }
-    }
-
-    fn auto_vibe(&mut self) {
-        self.genre = pick_vibe();
-        self.station_idx = 0;
-        self.play_station();
-    }
-
-    fn next_station(&mut self) {
-        let n = stations_for(self.genre).len().max(1);
-        self.station_idx = (self.station_idx + 1) % n;
-        self.play_station();
-    }
-
-    fn prev_station(&mut self) {
-        let n = stations_for(self.genre).len().max(1);
-        self.station_idx = (self.station_idx + n - 1) % n;
-        self.play_station();
-    }
-
-    fn play_station(&mut self) {
-        if let Some(station) = self.current_station() {
-            match self.radio.play(*station) {
-                Ok(()) => {
-                    self.status = format!("vibe {} · {}", station.genre.label(), station.name)
-                }
-                Err(err) => self.status = format!("mpv fail {err}"),
-            }
-        }
-    }
-
     fn current_meta(&self, snap: &Snapshot) -> Option<&TrackMeta> {
         snap.current
             .and_then(|i| self.metas.get(i).and_then(|m| m.as_ref()))
@@ -1381,10 +1308,6 @@ impl App {
     fn draw_music(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect, snap: &Snapshot) {
         if !self.search_hits.is_empty() {
             self.draw_search(frame, area);
-            return;
-        }
-        if self.vibe {
-            self.draw_vibe(frame, area, snap);
             return;
         }
         match self.music_mode {
@@ -1537,27 +1460,20 @@ impl App {
                 Style::default().magenta().add_modifier(Modifier::BOLD),
             ),
         };
-        let remix = if self.vibe {
-            Span::styled(
-                "VIBE",
+        let remix = match snap.remix {
+            RemixMode::Off => Span::styled("RAW", pal.dim_style().add_modifier(Modifier::BOLD)),
+            RemixMode::Chill => Span::styled(
+                "CHILL",
+                Style::default().blue().add_modifier(Modifier::BOLD),
+            ),
+            RemixMode::Club => Span::styled(
+                "CLUB",
+                Style::default().yellow().add_modifier(Modifier::BOLD),
+            ),
+            RemixMode::Nightcore => Span::styled(
+                "NCORE",
                 Style::default().magenta().add_modifier(Modifier::BOLD),
-            )
-        } else {
-            match snap.remix {
-                RemixMode::Off => Span::styled("RAW", pal.dim_style().add_modifier(Modifier::BOLD)),
-                RemixMode::Chill => Span::styled(
-                    "CHILL",
-                    Style::default().blue().add_modifier(Modifier::BOLD),
-                ),
-                RemixMode::Club => Span::styled(
-                    "CLUB",
-                    Style::default().yellow().add_modifier(Modifier::BOLD),
-                ),
-                RemixMode::Nightcore => Span::styled(
-                    "NCORE",
-                    Style::default().magenta().add_modifier(Modifier::BOLD),
-                ),
-            }
+            ),
         };
         let state = if self.decoding {
             Span::styled("DEC", Style::default().yellow())
@@ -1760,91 +1676,6 @@ impl App {
         frame.render_widget(lyric, area);
     }
 
-    fn draw_vibe(&self, frame: &mut ratatui::Frame<'_>, area: Rect, snap: &Snapshot) {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(36),
-                Constraint::Percentage(40),
-                Constraint::Min(16),
-            ])
-            .split(area);
-        let station = self.current_station();
-        let inner = cols[0].inner(ratatui::layout::Margin {
-            horizontal: 1,
-            vertical: 1,
-        });
-        let cover_lines = letterbox_cover(
-            self.current_meta(snap).and_then(|m| m.cover.as_ref()),
-            inner.width,
-            inner.height,
-        );
-        let title = station
-            .map(|s| format!(" {} ", s.name))
-            .unwrap_or_else(|| " vibe ".into());
-        frame.render_widget(
-            Paragraph::new(cover_lines).block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().magenta()),
-            ),
-            cols[0],
-        );
-
-        let mut body = vec![
-            Line::from(
-                format!(
-                    " {}  {}",
-                    station.map(|s| s.genre.label()).unwrap_or("vibe"),
-                    station.map(|s| s.name).unwrap_or("idle")
-                )
-                .cyan(),
-            ),
-            Line::from(Span::styled(
-                station.map(|s| s.blurb).unwrap_or("no station"),
-                self.palette().dim_style(),
-            )),
-            Line::from(""),
-        ];
-        body.extend(pulse::lines(
-            &self.pulse,
-            self.tick,
-            cols[1].height.saturating_sub(4),
-        ));
-        frame.render_widget(
-            Paragraph::new(body).block(
-                Block::default()
-                    .title(" live · opencode ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().yellow()),
-            ),
-            cols[1],
-        );
-
-        let list: Vec<ListItem> = Genre::ALL
-            .iter()
-            .map(|g| {
-                let mark = if *g == self.genre { "▸ " } else { "  " };
-                let n = stations_for(*g).len();
-                ListItem::new(format!("{mark}{}  {n}", g.label()))
-            })
-            .collect();
-        let pal = self.palette();
-        frame.render_widget(
-            List::new(list)
-                .block(
-                    Block::default()
-                        .title(" stations ")
-                        .borders(Borders::ALL)
-                        .border_style(pal.dim_style()),
-                )
-                .style(pal.text_style())
-                .highlight_style(pal.highlight()),
-            cols[2],
-        );
-    }
-
     fn draw_spectrum(&self, frame: &mut ratatui::Frame<'_>, area: Rect, snap: &Snapshot) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -2042,7 +1873,7 @@ impl App {
     }
 
     fn draw_help_modal(&self, frame: &mut ratatui::Frame<'_>) {
-        let text = "q/e 切栏   1曲库 2作者   j/k 或 ↑↓ 移动\n空格 播放暂停   n/p 下一首上一首\nl 歌词   g 均衡器   t 设置\nCtrl+F 打开文件夹   Ctrl+K 帮助   Ctrl+Q 退出\n+/- 音量   ←→ 快进快退";
+        let text = "q/e 切栏   1曲库 2作者   j/k 或 ↑↓ 移动\n空格 播放暂停   n/p 下一首上一首\nl 歌词   g 均衡器   t 设置\nEsc 关搜索/弹窗   Ctrl+F 打开文件夹   Ctrl+K 帮助\nCtrl+Q 退出   +/- 音量   ←→ 快进快退";
         let area = centered(frame.area(), 52, 10);
         frame.render_widget(Clear, area);
         frame.render_widget(
@@ -2074,6 +1905,27 @@ impl App {
             area,
         );
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscOutcome {
+    CloseSearch,
+    CloseLocal,
+    Dismiss,
+}
+
+fn esc_outcome(search_open: bool, local_open: bool) -> EscOutcome {
+    if search_open {
+        EscOutcome::CloseSearch
+    } else if local_open {
+        EscOutcome::CloseLocal
+    } else {
+        EscOutcome::Dismiss
+    }
+}
+
+fn visible_row(visible: &[usize], track_index: usize) -> Option<usize> {
+    visible.iter().position(|&i| i == track_index)
 }
 
 fn on_off(v: bool) -> &'static str {
@@ -2167,5 +2019,19 @@ mod tests {
         assert!(panel.height < scrim.height);
         assert!(panel.x > scrim.x);
         assert!(panel.y > scrim.y);
+    }
+
+    #[test]
+    fn esc_does_not_quit() {
+        assert_eq!(esc_outcome(true, false), EscOutcome::CloseSearch);
+        assert_eq!(esc_outcome(false, true), EscOutcome::CloseLocal);
+        assert_eq!(esc_outcome(false, false), EscOutcome::Dismiss);
+    }
+
+    #[test]
+    fn filtered_list_cursor_uses_visible_row() {
+        let visible = [4, 9, 12];
+        assert_eq!(visible_row(&visible, 9), Some(1));
+        assert_eq!(visible_row(&visible, 0), None);
     }
 }

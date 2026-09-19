@@ -43,7 +43,7 @@ const BEATS: &[WorkBeat] = &[
     },
     WorkBeat {
         tool: "Edit",
-        target: "src/vibe.rs",
+        target: "src/cover.rs",
         detail: "keep letterbox",
     },
     WorkBeat {
