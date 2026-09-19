@@ -1,0 +1,28 @@
+[package]
+name = "zradio"
+version = "0.1.0"
+edition = "2021"
+description = "Local TUI radio player with AutoMix"
+license = "MIT"
+repository = "https://github.com/Sir1usZ/zradio"
+
+[dependencies]
+anyhow = "1"
+cpal = "0.15"
+crossterm = "0.28"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+lofty = "0.22"
+ratatui = "0.29"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+souvlaki = "0.8"
+symphonia = { version = "0.5", features = ["all"] }
+
+[lib]
+name = "zradio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zradio"
+path = "src/main.rs"
