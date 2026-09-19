@@ -313,6 +313,19 @@ impl Mixer {
             deck.seek_seconds(now + seconds, sr);
             self.status = format!("seek {seconds:+.0}s");
         }
+        self.clear_ahead();
+    }
+
+    pub fn seek_to(&mut self, seconds: f32) {
+        let sr = self.sample_rate;
+        if let Some(deck) = self.current.as_mut() {
+            deck.seek_seconds(seconds, sr);
+            self.status = format!("seek {seconds:.0}s");
+        }
+        self.clear_ahead();
+    }
+
+    fn clear_ahead(&mut self) {
         self.armed = None;
         self.incoming = None;
         self.incoming_idx = None;
@@ -969,6 +982,16 @@ mod tests {
         assert_eq!(mixer.current.as_ref().unwrap().pos, 48_000 * 2);
         mixer.seek_by(-1.0);
         assert_eq!(mixer.current.as_ref().unwrap().pos, 48_000);
+    }
+
+    #[test]
+    fn seek_to_jumps_absolute() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.play_decoded(0, const_deck(48_000 * 10, 0.5));
+        mixer.seek_by(4.0);
+        mixer.seek_to(2.0);
+        assert_eq!(mixer.current.as_ref().unwrap().pos, 48_000 * 2);
     }
 
     #[test]

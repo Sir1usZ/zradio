@@ -23,6 +23,12 @@ pub fn artist_pages(metas: &[Option<TrackMeta>]) -> Vec<ArtistPage> {
         .collect()
 }
 
+pub fn open_artist(pages: &[ArtistPage], idx: usize) -> Option<(String, Vec<usize>)> {
+    pages
+        .get(idx)
+        .map(|page| (page.name.clone(), page.tracks.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,5 +61,18 @@ mod tests {
         assert_eq!(pages[0].name, "Avicii");
         assert_eq!(pages[0].tracks, vec![0, 2]);
         assert_eq!(pages[1].name, "Other");
+    }
+
+    #[test]
+    fn opening_artist_keeps_every_track() {
+        let pages = artist_pages(&[
+            Some(meta("Avicii")),
+            Some(meta("Avicii")),
+            Some(meta("Avicii")),
+        ]);
+        let (name, tracks) = open_artist(&pages, 0).expect("page");
+        assert_eq!(name, "Avicii");
+        assert_eq!(tracks, vec![0, 1, 2]);
+        assert_ne!(tracks, vec![0], "must not collapse to the first song");
     }
 }
