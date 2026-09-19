@@ -470,6 +470,13 @@ impl Mixer {
         self.status = self.mix_status(index);
     }
 
+    #[cfg(test)]
+    fn set_playhead(&mut self, pos: usize) {
+        if let Some(deck) = self.current.as_mut() {
+            deck.pos = pos.min(deck.frames().saturating_sub(1));
+        }
+    }
+
     pub fn remaining_frames(&self) -> usize {
         self.current.as_ref().map(Deck::remaining).unwrap_or(0)
     }
@@ -691,20 +698,14 @@ impl Mixer {
     }
 
     fn next_hint(&self) -> Option<String> {
-        let plan = pick_next(
-            &self.tracks,
-            self.current_idx,
-            &self.analyses,
-            self.mix,
-            &self.taste_boosts,
-        )?;
-        if plan.next_index == self.current_idx.unwrap_or(usize::MAX) {
+        let next = self.next_index()?;
+        if Some(next) == self.current_idx {
             return None;
         }
         Some(format!(
             "next {} {}",
-            self.title_at(plan.next_index),
-            self.meta_label(plan.next_index)
+            self.title_at(next),
+            self.meta_label(next)
         ))
     }
 
@@ -1125,6 +1126,36 @@ mod tests {
         mixer.remember_played(2);
         let next = mixer.next_index().unwrap();
         assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn shuffle_next_hint_matches_next_index_not_seq() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(vec![
+            Track {
+                path: PathBuf::from("a.wav"),
+                title: "Alpha".into(),
+            },
+            Track {
+                path: PathBuf::from("b.wav"),
+                title: "Beta".into(),
+            },
+            Track {
+                path: PathBuf::from("c.wav"),
+                title: "Gamma".into(),
+            },
+        ]);
+        mixer.play_decoded(0, const_deck(100, 0.5));
+        mixer.set_playhead(2);
+        mixer.set_shuffle_mode(crate::prefs::ShuffleMode::Random);
+        let next = mixer.next_index().unwrap();
+        assert_eq!(next, 2);
+        let hint = mixer.snapshot(0).next_hint.unwrap();
+        assert!(hint.contains("Gamma"), "hint={hint}");
+        assert!(
+            !hint.contains("Beta"),
+            "must not show sequential next, hint={hint}"
+        );
     }
 
     #[test]

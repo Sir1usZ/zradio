@@ -113,9 +113,11 @@ pub struct App {
     artist_idx: usize,
     artist_state: ListState,
     artist_pages: Vec<browse::ArtistPage>,
+    album_pages: Vec<browse::ArtistPage>,
     cava: Option<CavaFeed>,
     pending_seek: Option<f32>,
     library_idx: usize,
+    browse_kind: BrowseKind,
     meta_queue: VecDeque<usize>,
     meta_inflight: HashSet<usize>,
 }
@@ -133,6 +135,37 @@ enum Overlay {
 enum MusicMode {
     Library,
     Artists,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowseKind {
+    All,
+    Tagged,
+    Untagged,
+    Artists,
+    Albums,
+}
+
+impl BrowseKind {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Tagged,
+            Self::Tagged => Self::Untagged,
+            Self::Untagged => Self::Artists,
+            Self::Artists => Self::Albums,
+            Self::Albums => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "全部",
+            Self::Tagged => "有标签",
+            Self::Untagged => "缺标签",
+            Self::Artists => "歌手",
+            Self::Albums => "专辑",
+        }
+    }
 }
 
 impl App {
@@ -215,9 +248,11 @@ impl App {
             artist_idx: 0,
             artist_state: ListState::default(),
             artist_pages: Vec::new(),
+            album_pages: Vec::new(),
             cava: CavaFeed::start(24),
             pending_seek: None,
             library_idx: 0,
+            browse_kind: BrowseKind::All,
             meta_queue: VecDeque::new(),
             meta_inflight: HashSet::new(),
         };
@@ -634,15 +669,78 @@ impl App {
 
     fn refresh_artists(&mut self) {
         self.artist_pages = browse::artist_pages(&self.metas);
-        if self.artist_pages.is_empty() {
+        self.album_pages = browse::album_pages(&self.metas);
+        if self.browse_kind == BrowseKind::Artists || self.browse_kind == BrowseKind::Albums {
+            self.reset_group_cursor();
+        }
+    }
+
+    fn group_pages(&self) -> &[browse::ArtistPage] {
+        match self.browse_kind {
+            BrowseKind::Albums => &self.album_pages,
+            _ => &self.artist_pages,
+        }
+    }
+
+    fn reset_group_cursor(&mut self) {
+        let len = self.group_pages().len();
+        if len == 0 {
             self.artist_idx = 0;
             self.artist_state.select(None);
             return;
         }
-        if self.artist_idx >= self.artist_pages.len() {
+        if self.artist_idx >= len {
             self.artist_idx = 0;
         }
         self.artist_state.select(Some(self.artist_idx));
+    }
+
+    fn apply_browse(&mut self) {
+        self.local_hits.clear();
+        self.local_filter.clear();
+        self.local_idx = 0;
+        match self.browse_kind {
+            BrowseKind::All => {
+                self.music_mode = MusicMode::Library;
+                self.list_state.select(if self.tracks.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
+                self.status = format!("browse {}", self.browse_kind.label());
+            }
+            BrowseKind::Tagged => {
+                self.music_mode = MusicMode::Library;
+                self.local_filter = "有标签".into();
+                self.local_hits = browse::tagged_indices(&self.metas);
+                self.list_state.select(if self.local_hits.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
+                self.status = format!("有标签 · {} tracks", self.local_hits.len());
+            }
+            BrowseKind::Untagged => {
+                self.music_mode = MusicMode::Library;
+                self.local_filter = "缺标签".into();
+                self.local_hits = browse::untagged_indices(&self.metas);
+                self.list_state.select(if self.local_hits.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
+                self.status = format!("缺标签 · {} tracks", self.local_hits.len());
+            }
+            BrowseKind::Artists | BrowseKind::Albums => {
+                self.music_mode = MusicMode::Artists;
+                self.reset_group_cursor();
+                self.status = format!(
+                    "{} · {} groups",
+                    self.browse_kind.label(),
+                    self.group_pages().len()
+                );
+            }
+        }
     }
 
     fn maybe_prefetch(&mut self) {
@@ -795,8 +893,14 @@ impl App {
                 self.command = Some("open ".into());
                 self.status = "open 本地文件夹".into();
             }
-            KeyCode::Char('1') => self.music_mode = MusicMode::Library,
-            KeyCode::Char('2') => self.music_mode = MusicMode::Artists,
+            KeyCode::Char('1') => {
+                self.browse_kind = BrowseKind::All;
+                self.apply_browse();
+            }
+            KeyCode::Char('2') => {
+                self.browse_kind = BrowseKind::Artists;
+                self.apply_browse();
+            }
             KeyCode::Char('q') => {
                 self.tab = self.tab.prev();
                 self.status = format!("tab {}", self.tab.label());
@@ -849,7 +953,7 @@ impl App {
                     self.download_hit(self.search_idx);
                 } else if self.tab == Tab::Music && self.music_mode == MusicMode::Artists {
                     if let Some((name, tracks)) =
-                        browse::open_artist(&self.artist_pages, self.artist_idx)
+                        browse::open_artist(self.group_pages(), self.artist_idx)
                     {
                         self.music_mode = MusicMode::Library;
                         self.local_filter = name.clone();
@@ -945,10 +1049,10 @@ impl App {
             return;
         }
         if self.tab == Tab::Music && self.music_mode == MusicMode::Artists {
-            if self.artist_pages.is_empty() {
+            let len = self.group_pages().len() as i32;
+            if len == 0 {
                 return;
             }
-            let len = self.artist_pages.len() as i32;
             self.artist_idx = (self.artist_idx as i32 + delta).rem_euclid(len) as usize;
             self.artist_state.select(Some(self.artist_idx));
             return;
@@ -978,10 +1082,10 @@ impl App {
                 self.toggle_setting();
             }
             KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Library => {
-                self.library_idx = (self.library_idx + 1) % 4;
+                self.library_idx = (self.library_idx + 1) % 5;
             }
             KeyCode::Char('k') | KeyCode::Up if self.overlay == Overlay::Library => {
-                self.library_idx = (self.library_idx + 3) % 4;
+                self.library_idx = (self.library_idx + 4) % 5;
             }
             KeyCode::Enter | KeyCode::Char(' ') if self.overlay == Overlay::Library => {
                 self.toggle_library();
@@ -1042,6 +1146,11 @@ impl App {
                 self.apply_shuffle(next);
             }
             2 => {
+                self.browse_kind = self.browse_kind.next();
+                self.apply_browse();
+                self.overlay = Overlay::Library;
+            }
+            3 => {
                 let n = self.enqueue_missing_meta();
                 self.pump_meta_queue();
                 self.status = if n == 0 {
@@ -1050,7 +1159,7 @@ impl App {
                     format!("meta queue {n}")
                 };
             }
-            3 => self.overlay = Overlay::None,
+            4 => self.overlay = Overlay::None,
             _ => {}
         }
     }
@@ -1084,7 +1193,8 @@ impl App {
     }
 
     fn pump_meta_queue(&mut self) {
-        while self.meta_inflight.len() < 2 {
+        const META_PARALLEL: usize = 6;
+        while self.meta_inflight.len() < META_PARALLEL {
             let Some(index) = self.meta_queue.pop_front() else {
                 break;
             };
@@ -1219,25 +1329,10 @@ impl App {
     }
 
     fn search_local(&mut self, query: &str) {
-        let q = query.trim().to_lowercase();
-        self.local_filter = q.clone();
-        self.local_hits = self
-            .tracks
-            .iter()
-            .enumerate()
-            .filter(|(i, t)| {
-                let artist = self
-                    .metas
-                    .get(*i)
-                    .and_then(|m| m.as_ref())
-                    .map(|m| m.artist.to_lowercase())
-                    .unwrap_or_default();
-                t.title.to_lowercase().contains(&q)
-                    || artist.contains(&q)
-                    || t.path.to_string_lossy().to_lowercase().contains(&q)
-            })
-            .map(|(i, _)| i)
-            .collect();
+        self.browse_kind = BrowseKind::All;
+        self.music_mode = MusicMode::Library;
+        self.local_filter = query.trim().to_string();
+        self.local_hits = browse::meta_search(&self.tracks, &self.metas, query);
         self.local_idx = 0;
         self.list_state.select(if self.local_hits.is_empty() {
             None
@@ -1527,8 +1622,8 @@ impl App {
     }
 
     fn draw_artists(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let items: Vec<ListItem> = self
-            .artist_pages
+        let pages = self.group_pages();
+        let items: Vec<ListItem> = pages
             .iter()
             .enumerate()
             .map(|(i, page)| {
@@ -1536,15 +1631,15 @@ impl App {
                 ListItem::new(format!("{mark}{}  {} tracks", page.name, page.tracks.len()))
             })
             .collect();
-        if self.artist_state.selected().is_none() && !self.artist_pages.is_empty() {
+        if self.artist_state.selected().is_none() && !pages.is_empty() {
             self.artist_state
-                .select(Some(self.artist_idx.min(self.artist_pages.len() - 1)));
+                .select(Some(self.artist_idx.min(pages.len() - 1)));
         }
         let pal = self.palette();
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(" 作者 · 1列表 2作者 ")
+                    .title(format!(" {} · 1列表 2作者 ", self.browse_kind.label()))
                     .borders(Borders::ALL)
                     .border_style(pal.dim_style()),
             )
@@ -1817,12 +1912,18 @@ impl App {
                 Block::default()
                     .title(if self.local_filter.is_empty() {
                         format!(
-                            " 曲库 · {} · {} ",
+                            " 曲库 · {} · {} · {} ",
+                            self.browse_kind.label(),
                             self.prefs.sort_mode.label_zh(),
                             self.prefs.shuffle_mode.label_zh()
                         )
                     } else {
-                        format!(" local /{} · {} ", self.local_filter, self.local_hits.len())
+                        format!(
+                            " {} · {} · {} ",
+                            self.local_filter,
+                            self.local_hits.len(),
+                            self.prefs.sort_mode.label_zh()
+                        )
                     })
                     .borders(Borders::ALL)
                     .border_style(pal.dim_style()),
@@ -2037,6 +2138,9 @@ impl App {
     }
 
     fn draw_overlay_scrim(&self, frame: &mut ratatui::Frame<'_>) {
+        if self.overlay == Overlay::Library {
+            return;
+        }
         let pal = self.palette();
         let area = overlay_scrim(frame.area());
         frame.render_widget(Clear, area);
@@ -2087,13 +2191,21 @@ impl App {
 
     fn draw_library(&self, frame: &mut ratatui::Frame<'_>) {
         let queued = self.meta_queue.len() + self.meta_inflight.len();
+        let tagged = browse::tagged_indices(&self.metas).len();
+        let untagged = self.tracks.len().saturating_sub(tagged);
         let rows = [
             format!("排序        {}", self.prefs.sort_mode.label_zh()),
             format!("随机        {}", self.prefs.shuffle_mode.label_zh()),
             format!(
+                "分类        {}  {}/{}",
+                self.browse_kind.label(),
+                tagged,
+                untagged
+            ),
+            format!(
                 "扫元数据    {}",
                 if queued == 0 {
-                    "缺字段排队".into()
+                    "6路并行".into()
                 } else {
                     format!("排队 {queued}")
                 }
@@ -2108,7 +2220,7 @@ impl App {
                 ListItem::new(format!("{mark}{row}"))
             })
             .collect();
-        let area = centered(frame.area(), 42, 9);
+        let area = centered(frame.area(), 36, 10);
         let pal = self.palette();
         frame.render_widget(Clear, area);
         frame.render_widget(
@@ -2121,7 +2233,7 @@ impl App {
     }
 
     fn draw_help_modal(&self, frame: &mut ratatui::Frame<'_>) {
-        let text = "q/e 切栏   1曲库 2作者   j/k 或 ↑↓ 移动\n空格 播放暂停   n/p 下一首上一首\nl 歌词   g 均衡器   t 设置   y 曲库\nEsc 关搜索/弹窗   Ctrl+F 打开文件夹   Ctrl+K 帮助\nCtrl+Q 退出   +/- 音量   ←→ 快进快退";
+        let text = "q/e 切栏   1曲库 2作者   / 元数据检索\n空格 播放暂停   n/p 下一首上一首\nl 歌词   g 均衡器   t 设置   y 曲库\nEsc 关搜索/弹窗   Ctrl+F 打开文件夹   Ctrl+K 帮助\nCtrl+Q 退出   +/- 音量   ←→ 快进快退";
         let area = centered(frame.area(), 52, 10);
         frame.render_widget(Clear, area);
         frame.render_widget(
@@ -2261,7 +2373,7 @@ mod tests {
             height: 24,
         };
         let scrim = overlay_scrim(frame);
-        let panel = centered(frame, 42, 12);
+        let panel = centered(frame, 36, 10);
         assert_eq!(scrim, frame);
         assert!(panel.width < scrim.width);
         assert!(panel.height < scrim.height);
