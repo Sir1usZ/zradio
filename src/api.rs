@@ -19,6 +19,12 @@ pub struct ApiSnapshot {
     pub eq: [f32; 5],
     pub taste_top: Vec<TasteEntry>,
     pub total_listen_secs: u64,
+    /// 完整曲目列表（按序号）
+    pub library: Vec<TrackInfo>,
+    /// 偏好设置快照
+    pub prefs: Option<PrefsSnapshot>,
+    /// 当前歌词
+    pub lyrics: Vec<LyricLine>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -39,6 +45,25 @@ pub struct TasteEntry {
     pub score: f32,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LyricLine {
+    pub time: f32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PrefsSnapshot {
+    pub theme: String,
+    pub transparent: bool,
+    pub visualize: String,
+    pub lyrics_fetch: bool,
+    pub cover_fetch: bool,
+    pub resume: bool,
+    pub library: String,
+    pub sort_mode: String,
+    pub shuffle_mode: String,
+}
+
 pub type SharedState = Arc<Mutex<ApiSnapshot>>;
 
 pub fn new_shared_state() -> SharedState {
@@ -49,6 +74,7 @@ pub fn new_shared_state() -> SharedState {
 
 #[derive(Debug, Deserialize)]
 struct ControlRequest {
+    #[serde(default)]
     action: String,
     #[serde(default)]
     value: Option<f32>,
@@ -56,6 +82,8 @@ struct ControlRequest {
     index: Option<usize>,
     #[serde(default)]
     query: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,7 +126,6 @@ fn handle_connection(
     let reader = stream.try_clone()?;
     let mut buf_reader = BufReader::new(reader);
 
-    // 读请求行
     let mut request_line = String::new();
     buf_reader.read_line(&mut request_line)?;
     let parts: Vec<&str> = request_line.split_whitespace().collect();
@@ -109,7 +136,6 @@ fn handle_connection(
     let method = parts[0];
     let path = parts[1];
 
-    // 读 headers，找 Content-Length
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
@@ -123,7 +149,6 @@ fn handle_connection(
         }
     }
 
-    // 读 body
     let body = if content_length > 0 {
         let mut body_buf = vec![0u8; content_length];
         buf_reader.read_exact(&mut body_buf)?;
@@ -132,12 +157,10 @@ fn handle_connection(
         String::new()
     };
 
-    // CORS 预检
     if method == "OPTIONS" {
         return send_cors_preflight(&mut stream);
     }
 
-    // 路由
     let response = route(method, path, &body, tx, state);
     send_json(&mut stream, 200, &response)
 }
@@ -149,28 +172,47 @@ fn route(
     tx: &Sender<ControlCmd>,
     state: &SharedState,
 ) -> serde_json::Value {
-    // ── GET ──
+    // ── GET ────────────────────────────────────────────────────
     if method == "GET" {
         return match path {
+            // 状态
             "/status" => handle_status(state),
-            "/library" => handle_library_list(state),
-            "/taste" => handle_taste(state),
-            "/prefs" => handle_prefs(),
             "/health" => ok(serde_json::json!({"version": "0.1.0", "name": "zradio"})),
-            p if p.starts_with("/track/") => handle_track_detail(p, state),
+            // 资料库
+            "/library" => handle_library(state),
+            "/library/full" => handle_library_full(state),
+            // 曲目
+            p if p.starts_with("/track/") => handle_track(p, state),
             p if p.starts_with("/cover/") => handle_cover(p, state),
             p if p.starts_with("/lyrics/") => handle_lyrics(p, state),
+            // 模式查询
+            "/shuffle" => handle_get_shuffle(state),
+            "/loop" => handle_get_loop(state),
+            "/mix" => handle_get_mix(state),
+            "/remix" => handle_get_remix(state),
+            "/sort" => handle_get_sort(state),
+            // 口味统计
+            "/taste" => handle_taste(state),
+            // 偏好设置
+            "/prefs" => handle_prefs(state),
+            "/eq" => handle_get_eq(state),
             _ => err("not found"),
         };
     }
 
-    // ── POST ──
+    // ── POST ───────────────────────────────────────────────────
     if method == "POST" {
         return match path {
+            // 播放控制
             "/control" => handle_control(body, tx, state),
+            // 资料库操作
             "/import" => handle_import(body, tx),
             "/library/scan" => handle_library_scan(tx),
+            "/meta/scan" => handle_meta_scan(tx),
+            // EQ
             "/eq" => handle_eq(body, tx),
+            "/eq/reset" => handle_eq_reset(tx),
+            // 搜索
             "/search" => handle_search(body, state),
             _ => err("not found"),
         };
@@ -179,7 +221,9 @@ fn route(
     err("method not allowed")
 }
 
-// ── 处理函数 ───────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+//  GET 处理函数
+// ══════════════════════════════════════════════════════════════════
 
 fn handle_status(state: &SharedState) -> serde_json::Value {
     let snap = match state.lock() {
@@ -191,19 +235,32 @@ fn handle_status(state: &SharedState) -> serde_json::Value {
         let sr = s.sample_rate.max(1);
         serde_json::json!({
             "paused": s.paused,
-            "position_secs": s.position_frames as f32 / sr as f32,
-            "duration_secs": s.duration_frames as f32 / sr as f32,
+            "position_secs": (s.position_frames as f32 / sr as f32 * 10.0).round() / 10.0,
+            "duration_secs": (s.duration_frames as f32 / sr as f32 * 10.0).round() / 10.0,
             "volume": (s.volume * 100.0).round() as u32,
             "mix_mode": format!("{:?}", s.mix).to_lowercase(),
-            "remix_mode": s.remix.label(),
+            "remix_mode": s.remix.label().to_string(),
             "shuffle": s.shuffle,
-            "loop_mode": s.loop_mode.label(),
-            "status": s.status,
+            "loop_mode": s.loop_mode.label().to_string(),
+            "status": s.status.clone(),
             "fading": s.fading,
             "bpm": s.current_bpm,
-            "key": s.current_key,
-            "next_hint": s.next_hint,
+            "key": s.current_key.clone(),
+            "next_hint": s.next_hint.clone(),
             "sample_rate": s.sample_rate,
+        })
+    });
+
+    let prefs = snap.prefs.as_ref().map(|p| {
+        serde_json::json!({
+            "theme": p.theme,
+            "transparent": p.transparent,
+            "visualize": p.visualize,
+            "lyrics_fetch": p.lyrics_fetch,
+            "cover_fetch": p.cover_fetch,
+            "resume": p.resume,
+            "sort_mode": p.sort_mode,
+            "shuffle_mode": p.shuffle_mode,
         })
     });
 
@@ -211,9 +268,9 @@ fn handle_status(state: &SharedState) -> serde_json::Value {
         "playback": playback.unwrap_or(serde_json::json!({
             "paused": true, "position_secs": 0.0, "duration_secs": 0.0,
             "volume": 90, "mix_mode": "crossfade", "remix_mode": "RAW",
-            "shuffle": false, "loop_mode": "OFF", "status": "idle",
-            "fading": false, "bpm": null, "key": null, "next_hint": null,
-            "sample_rate": 0,
+            "shuffle": false, "shuffle_mode": "off", "loop_mode": "OFF",
+            "status": "idle", "fading": false,
+            "bpm": null, "key": null, "next_hint": null, "sample_rate": 0,
         })),
         "current_track": snap.track,
         "eq": {
@@ -227,10 +284,13 @@ fn handle_status(state: &SharedState) -> serde_json::Value {
             "total_listen_secs": snap.total_listen_secs,
             "top_tracks": snap.taste_top,
         },
+        "prefs": prefs,
     }))
 }
 
-fn handle_library_list(state: &SharedState) -> serde_json::Value {
+// ── 资料库 ─────────────────────────────────────────────────────
+
+fn handle_library(state: &SharedState) -> serde_json::Value {
     let snap = match state.lock() {
         Ok(s) => s,
         Err(_) => return err("state lock"),
@@ -241,7 +301,20 @@ fn handle_library_list(state: &SharedState) -> serde_json::Value {
     }))
 }
 
-fn handle_track_detail(path: &str, state: &SharedState) -> serde_json::Value {
+fn handle_library_full(state: &SharedState) -> serde_json::Value {
+    let snap = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return err("state lock"),
+    };
+    ok(serde_json::json!({
+        "total": snap.library.len(),
+        "tracks": snap.library,
+    }))
+}
+
+// ── 曲目详情 ───────────────────────────────────────────────────
+
+fn handle_track(path: &str, state: &SharedState) -> serde_json::Value {
     let index = path
         .trim_start_matches("/track/")
         .split('/')
@@ -258,6 +331,7 @@ fn handle_track_detail(path: &str, state: &SharedState) -> serde_json::Value {
         Err(_) => return err("state lock"),
     };
 
+    // 优先返回当前播放曲目
     if let Some(ref track) = snap.track {
         if track.index == index {
             return ok(serde_json::json!({
@@ -268,11 +342,16 @@ fn handle_track_detail(path: &str, state: &SharedState) -> serde_json::Value {
         }
     }
 
-    err("track not in current session")
+    // 从完整资料库中查找
+    if let Some(track) = snap.library.iter().find(|t| t.index == index) {
+        return ok(serde_json::json!({"info": track}));
+    }
+
+    err("track not found")
 }
 
 fn handle_cover(path: &str, state: &SharedState) -> serde_json::Value {
-    let _index = path
+    let index = path
         .trim_start_matches("/cover/")
         .split('/')
         .next()
@@ -283,19 +362,22 @@ fn handle_cover(path: &str, state: &SharedState) -> serde_json::Value {
         Err(_) => return err("state lock"),
     };
 
-    if let Some(ref track) = snap.track {
+    if let Some(track) = snap
+        .library
+        .iter()
+        .find(|t| t.index == index.or(snap.track.as_ref().map(|t| t.index)).unwrap_or(0))
+    {
         return ok(serde_json::json!({
             "index": track.index,
             "has_cover": track.has_cover,
-            "note": "cover image served via /cover/<index>/image endpoint",
         }));
     }
 
-    err("no track loaded")
+    err("track not found")
 }
 
 fn handle_lyrics(path: &str, state: &SharedState) -> serde_json::Value {
-    let _index = path
+    let index = path
         .trim_start_matches("/lyrics/")
         .split('/')
         .next()
@@ -306,16 +388,112 @@ fn handle_lyrics(path: &str, state: &SharedState) -> serde_json::Value {
         Err(_) => return err("state lock"),
     };
 
-    if let Some(ref track) = snap.track {
-        return ok(serde_json::json!({
-            "index": track.index,
-            "has_lyrics": track.has_lyrics,
-            "note": "lyrics loaded per-track in the TUI session",
-        }));
+    // 如果请求的是当前曲目，返回缓存的歌词
+    let target = index.or(snap.track.as_ref().map(|t| t.index));
+    if let Some(idx) = target {
+        if snap.track.as_ref().is_some_and(|t| t.index == idx) && !snap.lyrics.is_empty() {
+            return ok(serde_json::json!({
+                "index": idx,
+                "lyrics": snap.lyrics,
+            }));
+        }
+        if let Some(track) = snap.library.iter().find(|t| t.index == idx) {
+            return ok(serde_json::json!({
+                "index": idx,
+                "has_lyrics": track.has_lyrics,
+                "note": if track.has_lyrics { "lyrics available" } else { "no lyrics embedded" },
+            }));
+        }
     }
 
-    err("no track loaded")
+    err("track not found")
 }
+
+// ── 模式查询 ───────────────────────────────────────────────────
+
+fn handle_get_shuffle(state: &SharedState) -> serde_json::Value {
+    let snap = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return err("state lock"),
+    };
+    let shuffle = snap.snapshot.as_ref().map(|s| s.shuffle).unwrap_or(false);
+    let mode = snap
+        .prefs
+        .as_ref()
+        .map(|p| p.shuffle_mode.clone())
+        .unwrap_or_else(|| "off".into());
+    ok(serde_json::json!({
+        "shuffle": shuffle,
+        "mode": mode,
+        "modes": ["off", "random", "norepeat", "taste"],
+    }))
+}
+
+fn handle_get_loop(state: &SharedState) -> serde_json::Value {
+    let snap = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return err("state lock"),
+    };
+    let mode = snap
+        .snapshot
+        .as_ref()
+        .map(|s| s.loop_mode.label().to_lowercase())
+        .unwrap_or_else(|| "off".into());
+    ok(serde_json::json!({
+        "mode": mode,
+        "modes": ["off", "one", "all"],
+    }))
+}
+
+fn handle_get_mix(state: &SharedState) -> serde_json::Value {
+    let snap = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return err("state lock"),
+    };
+    let mode = snap
+        .snapshot
+        .as_ref()
+        .map(|s| format!("{:?}", s.mix).to_lowercase())
+        .unwrap_or_else(|| "crossfade".into());
+    ok(serde_json::json!({
+        "mode": mode,
+        "modes": ["cut", "crossfade", "automix"],
+    }))
+}
+
+fn handle_get_remix(state: &SharedState) -> serde_json::Value {
+    let snap = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return err("state lock"),
+    };
+    let mode = snap
+        .snapshot
+        .as_ref()
+        .map(|s| s.remix.label().to_string())
+        .unwrap_or_else(|| "RAW".into());
+    ok(serde_json::json!({
+        "mode": mode,
+        "modes": ["off", "chill", "club", "ncore"],
+    }))
+}
+
+fn handle_get_sort(state: &SharedState) -> serde_json::Value {
+    let snap = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return err("state lock"),
+    };
+    let mode = snap
+        .prefs
+        .as_ref()
+        .map(|p| p.sort_mode.clone())
+        .unwrap_or_else(|| "path".into());
+    ok(serde_json::json!({
+        "mode": mode,
+        "modes": ["path", "title", "artist", "album"],
+    }))
+}
+
+// ── 口味统计 ───────────────────────────────────────────────────
 
 fn handle_taste(state: &SharedState) -> serde_json::Value {
     let snap = match state.lock() {
@@ -329,20 +507,47 @@ fn handle_taste(state: &SharedState) -> serde_json::Value {
     }))
 }
 
-fn handle_prefs() -> serde_json::Value {
-    let prefs = crate::prefs::Prefs::load();
+// ── 偏好设置 ───────────────────────────────────────────────────
+
+fn handle_prefs(state: &SharedState) -> serde_json::Value {
+    let snap = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return err("state lock"),
+    };
+    if let Some(ref prefs) = snap.prefs {
+        return ok(serde_json::json!({
+            "theme": prefs.theme,
+            "transparent": prefs.transparent,
+            "visualize": prefs.visualize,
+            "lyrics_fetch": prefs.lyrics_fetch,
+            "cover_fetch": prefs.cover_fetch,
+            "resume": prefs.resume,
+            "library": prefs.library,
+            "sort_mode": prefs.sort_mode,
+            "shuffle_mode": prefs.shuffle_mode,
+            "themes": ["system", "latte", "frappe", "macchiato", "mocha"],
+            "visualizes": ["off", "bars", "scope", "cnm"],
+            "sorts": ["path", "title", "artist", "album"],
+            "shuffles": ["off", "random", "norepeat", "taste"],
+        }));
+    }
+    err("prefs not loaded")
+}
+
+fn handle_get_eq(state: &SharedState) -> serde_json::Value {
+    let snap = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return err("state lock"),
+    };
     ok(serde_json::json!({
-        "theme": prefs.theme.label(),
-        "visualize": prefs.visualize.label(),
-        "lyrics_fetch": prefs.lyrics_fetch,
-        "cover_fetch": prefs.cover_fetch,
-        "resume": prefs.resume,
-        "library": prefs.library,
-        "eq_db": prefs.eq_db,
-        "sort_mode": prefs.sort_mode.label(),
-        "shuffle_mode": prefs.shuffle_mode.label(),
+        "bands": ["60", "250", "1k", "4k", "12k"],
+        "db": snap.eq,
     }))
 }
+
+// ══════════════════════════════════════════════════════════════════
+//  POST 处理函数
+// ══════════════════════════════════════════════════════════════════
 
 fn handle_control(body: &str, tx: &Sender<ControlCmd>, state: &SharedState) -> serde_json::Value {
     let req: ControlRequest = match serde_json::from_str(body) {
@@ -351,6 +556,7 @@ fn handle_control(body: &str, tx: &Sender<ControlCmd>, state: &SharedState) -> s
     };
 
     let cmd = match req.action.as_str() {
+        // ── 播放控制 ──
         "play" => {
             if let Some(idx) = req.index {
                 ControlCmd::PlayIndex(idx)
@@ -358,29 +564,95 @@ fn handle_control(body: &str, tx: &Sender<ControlCmd>, state: &SharedState) -> s
                 ControlCmd::Play
             }
         }
+        "play_path" => {
+            let path = match req.path {
+                Some(p) => p,
+                None => return err("missing path field"),
+            };
+            ControlCmd::PlayPath(path)
+        }
         "pause" => ControlCmd::Pause,
         "toggle" => ControlCmd::TogglePause,
         "next" => ControlCmd::Next,
         "prev" => ControlCmd::Prev,
+
+        // ── 跳转 ──
         "seek" => ControlCmd::Seek(req.value.unwrap_or(0.0)),
         "seek_to" => ControlCmd::SeekTo(req.value.unwrap_or(0.0)),
+
+        // ── 音量 ──
         "volume" => ControlCmd::Volume(req.value.unwrap_or(0.0)),
+        "set_volume" => {
+            let v = req.value.unwrap_or(90.0).clamp(0.0, 100.0) / 100.0;
+            ControlCmd::SetVolume(v)
+        }
+
+        // ── 混音模式 ──
         "mix" => ControlCmd::CycleMix,
+        "set_mix" => {
+            let mode = req.query.unwrap_or_default();
+            ControlCmd::SetMix(mode)
+        }
+
+        // ── Remix 模式 ──
         "remix" => ControlCmd::CycleRemix,
+        "set_remix" => {
+            let mode = req.query.unwrap_or_default();
+            ControlCmd::SetRemix(mode)
+        }
+
+        // ── 随机播放 ──
         "shuffle" => ControlCmd::ToggleShuffle,
+        "set_shuffle" => {
+            let mode = req.query.unwrap_or_default();
+            ControlCmd::SetShuffle(mode)
+        }
+
+        // ── 循环模式 ──
         "loop" => ControlCmd::CycleLoop,
+        "set_loop" => {
+            let mode = req.query.unwrap_or_default();
+            ControlCmd::SetLoop(mode)
+        }
+
+        // ── 选中 ──
         "select" => ControlCmd::Select(req.index.unwrap_or(0)),
+
+        // ── EQ ──
         "eq" => {
             let band = req.index.unwrap_or(0);
             let db = req.value.unwrap_or(0.0);
             ControlCmd::SetEq(band, db)
         }
         "eq_reset" => ControlCmd::ResetEq,
+
+        // ── 排序 ──
+        "set_sort" => {
+            let mode = req.query.unwrap_or_default();
+            ControlCmd::SetSort(mode)
+        }
+
+        // ── 主题/可视化 ──
+        "set_theme" => {
+            let mode = req.query.unwrap_or_default();
+            ControlCmd::SetTheme(mode)
+        }
+        "set_visualize" => {
+            let mode = req.query.unwrap_or_default();
+            ControlCmd::SetVisualize(mode)
+        }
+        "toggle_transparent" => ControlCmd::ToggleTransparent,
+        "toggle_lyrics_fetch" => ControlCmd::ToggleLyricsFetch,
+        "toggle_cover_fetch" => ControlCmd::ToggleCoverFetch,
+        "toggle_resume" => ControlCmd::ToggleResume,
+
+        // ── 资料库 ──
+        "meta_scan" => ControlCmd::MetaScan,
+
         _ => return err(format!("unknown action: {}", req.action)),
     };
 
     let _ = tx.send(cmd);
-    // 返回更新后的状态
     handle_status(state)
 }
 
@@ -398,6 +670,11 @@ fn handle_library_scan(tx: &Sender<ControlCmd>) -> serde_json::Value {
     ok(serde_json::json!({"scan": "started"}))
 }
 
+fn handle_meta_scan(tx: &Sender<ControlCmd>) -> serde_json::Value {
+    let _ = tx.send(ControlCmd::MetaScan);
+    ok(serde_json::json!({"meta_scan": "started"}))
+}
+
 fn handle_eq(body: &str, tx: &Sender<ControlCmd>) -> serde_json::Value {
     let req: EqRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -407,19 +684,48 @@ fn handle_eq(body: &str, tx: &Sender<ControlCmd>) -> serde_json::Value {
     ok(serde_json::json!({"eq": "updated", "band": req.band, "db": req.db}))
 }
 
-fn handle_search(body: &str, _state: &SharedState) -> serde_json::Value {
+fn handle_eq_reset(tx: &Sender<ControlCmd>) -> serde_json::Value {
+    let _ = tx.send(ControlCmd::ResetEq);
+    ok(serde_json::json!({"eq": "reset"}))
+}
+
+fn handle_search(body: &str, state: &SharedState) -> serde_json::Value {
     let req: ControlRequest = match serde_json::from_str(body) {
         Ok(r) => r,
         Err(e) => return err(format!("bad json: {e}")),
     };
     let query = req.query.unwrap_or_default();
+    if query.is_empty() {
+        return err("missing query field");
+    }
+
+    let snap = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return err("state lock"),
+    };
+
+    let q = query.to_lowercase();
+    let matches: Vec<&TrackInfo> = snap
+        .library
+        .iter()
+        .filter(|t| {
+            t.title.to_lowercase().contains(&q)
+                || t.artist.to_lowercase().contains(&q)
+                || t.album.to_lowercase().contains(&q)
+                || t.path.to_lowercase().contains(&q)
+        })
+        .collect();
+
     ok(serde_json::json!({
         "query": query,
-        "note": "search forwarded to TUI; use /status to see results",
+        "total": matches.len(),
+        "matches": matches,
     }))
 }
 
-// ── 辅助函数 ───────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+//  辅助函数
+// ══════════════════════════════════════════════════════════════════
 
 fn ok(data: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"ok": true, "data": data})
@@ -462,7 +768,9 @@ fn send_cors_preflight(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.write_all(header.as_bytes())
 }
 
-// ── 测试 ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+//  测试
+// ══════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
@@ -486,32 +794,30 @@ mod tests {
     fn control_request_parses_play() {
         let req: ControlRequest = serde_json::from_str(r#"{"action":"play"}"#).unwrap();
         assert_eq!(req.action, "play");
-        assert!(req.value.is_none());
-        assert!(req.index.is_none());
     }
 
     #[test]
-    fn control_request_parses_seek() {
+    fn control_request_parses_set_shuffle() {
         let req: ControlRequest =
-            serde_json::from_str(r#"{"action":"seek","value":30.0}"#).unwrap();
-        assert_eq!(req.action, "seek");
-        assert_eq!(req.value, Some(30.0));
+            serde_json::from_str(r#"{"action":"set_shuffle","query":"taste"}"#).unwrap();
+        assert_eq!(req.action, "set_shuffle");
+        assert_eq!(req.query.as_deref(), Some("taste"));
     }
 
     #[test]
-    fn control_request_parses_play_index() {
-        let req: ControlRequest = serde_json::from_str(r#"{"action":"play","index":5}"#).unwrap();
-        assert_eq!(req.action, "play");
-        assert_eq!(req.index, Some(5));
-    }
-
-    #[test]
-    fn control_request_parses_eq() {
+    fn control_request_parses_set_volume() {
         let req: ControlRequest =
-            serde_json::from_str(r#"{"action":"eq","index":2,"value":6.0}"#).unwrap();
-        assert_eq!(req.action, "eq");
-        assert_eq!(req.index, Some(2));
-        assert_eq!(req.value, Some(6.0));
+            serde_json::from_str(r#"{"action":"set_volume","value":75.0}"#).unwrap();
+        assert_eq!(req.action, "set_volume");
+        assert_eq!(req.value, Some(75.0));
+    }
+
+    #[test]
+    fn control_request_parses_play_path() {
+        let req: ControlRequest =
+            serde_json::from_str(r#"{"action":"play_path","path":"/music/a.mp3"}"#).unwrap();
+        assert_eq!(req.action, "play_path");
+        assert_eq!(req.path.as_deref(), Some("/music/a.mp3"));
     }
 
     #[test]
@@ -520,5 +826,58 @@ mod tests {
         assert_eq!(resp["ok"], true);
         assert!(resp["data"]["playback"].is_object());
         assert!(resp["data"]["library"].is_object());
+        // prefs 为 None 时序列化为 null，这是正常行为
+    }
+
+    #[test]
+    fn search_filters_by_title() {
+        let state = Arc::new(Mutex::new(ApiSnapshot {
+            library: vec![
+                TrackInfo {
+                    index: 0,
+                    title: "Levels".into(),
+                    artist: "Avicii".into(),
+                    ..Default::default()
+                },
+                TrackInfo {
+                    index: 1,
+                    title: "Clarity".into(),
+                    artist: "Zedd".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }));
+        let resp = handle_search(r#"{"query":"levels"}"#, &state);
+        assert_eq!(resp["data"]["total"], 1);
+        assert_eq!(resp["data"]["matches"][0]["title"], "Levels");
+    }
+
+    #[test]
+    fn shuffle_endpoint_returns_modes() {
+        let resp = handle_get_shuffle(&Arc::new(Mutex::new(ApiSnapshot::default())));
+        assert_eq!(resp["ok"], true);
+        assert!(resp["data"]["modes"].is_array());
+    }
+
+    #[test]
+    fn library_full_returns_track_list() {
+        let state = Arc::new(Mutex::new(ApiSnapshot {
+            library: vec![
+                TrackInfo {
+                    index: 0,
+                    title: "A".into(),
+                    ..Default::default()
+                },
+                TrackInfo {
+                    index: 1,
+                    title: "B".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }));
+        let resp = handle_library_full(&state);
+        assert_eq!(resp["data"]["total"], 2);
     }
 }

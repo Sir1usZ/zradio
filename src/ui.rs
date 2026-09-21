@@ -1527,17 +1527,12 @@ impl App {
         });
 
         // EQ
-        let eq = snapshot
-            .as_ref()
-            .map(|s| s.spectrum_levels)
-            .map(|_| {
-                self.player
-                    .mixer
-                    .lock()
-                    .ok()
-                    .map(|m| m.eq_db())
-                    .unwrap_or([0.0; 5])
-            })
+        let eq = self
+            .player
+            .mixer
+            .lock()
+            .ok()
+            .map(|m| m.eq_db())
             .unwrap_or([0.0; 5]);
 
         // Taste 排行
@@ -1552,17 +1547,70 @@ impl App {
             })
             .collect();
 
+        // 完整资料库（每 tick 重建，开销可接受）
+        let library: Vec<api::TrackInfo> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let meta = self.metas.get(i).and_then(|m| m.as_ref());
+                api::TrackInfo {
+                    index: i,
+                    title: meta
+                        .map(|m| m.title.clone())
+                        .unwrap_or_else(|| t.title.clone()),
+                    artist: meta.map(|m| m.artist.clone()).unwrap_or_default(),
+                    album: meta.map(|m| m.album.clone()).unwrap_or_default(),
+                    path: t.path.display().to_string(),
+                    has_cover: meta.is_some_and(|m| m.cover.is_some() || m.cover_path.is_some()),
+                    has_lyrics: meta.is_some_and(|m| !m.lyrics.is_empty()),
+                }
+            })
+            .collect();
+
+        // 当前歌词
+        let lyrics: Vec<api::LyricLine> = current_idx
+            .and_then(|idx| self.metas.get(idx))
+            .and_then(|m| m.as_ref())
+            .map(|meta| {
+                meta.lyrics
+                    .iter()
+                    .map(|l| api::LyricLine {
+                        time: l.time,
+                        text: l.text.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // 偏好快照
+        let prefs = Some(api::PrefsSnapshot {
+            theme: self.prefs.theme.label().into(),
+            transparent: self.prefs.transparent,
+            visualize: self.prefs.visualize.label().into(),
+            lyrics_fetch: self.prefs.lyrics_fetch,
+            cover_fetch: self.prefs.cover_fetch,
+            resume: self.prefs.resume,
+            library: self.prefs.library.clone(),
+            sort_mode: self.prefs.sort_mode.label().into(),
+            shuffle_mode: self.prefs.shuffle_mode.label().into(),
+        });
+
         snap.snapshot = snapshot;
         snap.track = track;
         snap.tracks_total = self.tracks.len();
         snap.eq = eq;
         snap.taste_top = taste_top;
         snap.total_listen_secs = self.taste.total_listen_secs();
+        snap.library = library;
+        snap.lyrics = lyrics;
+        snap.prefs = prefs;
     }
 
     fn drain_control(&mut self) {
         while let Ok(cmd) = self.control_rx.try_recv() {
             match cmd {
+                // ── 基础播放控制 ──
                 ControlCmd::Play => {
                     let i = self.selected();
                     let empty = self
@@ -1609,54 +1657,167 @@ impl App {
                         self.play_index(idx, true);
                     }
                 }
+                ControlCmd::PlayPath(path) => {
+                    if let Some(idx) = self
+                        .tracks
+                        .iter()
+                        .position(|t| t.path == std::path::Path::new(&path))
+                    {
+                        self.play_index(idx, true);
+                    } else {
+                        self.status = format!("path not found: {path}");
+                    }
+                }
+
+                // ── 跳转 ──
                 ControlCmd::Seek(secs) => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
                         mixer.seek_by(secs);
+                        self.status = mixer.snapshot(self.selected()).status;
                     }
                 }
                 ControlCmd::SeekTo(secs) => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
                         mixer.seek_to(secs);
+                        self.status = mixer.snapshot(self.selected()).status;
                     }
                 }
+
+                // ── 音量 ──
                 ControlCmd::Volume(delta) => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
                         mixer.bump_volume(delta);
                         self.status = mixer.snapshot(self.selected()).status;
                     }
                 }
+                ControlCmd::SetVolume(v) => {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        let current = mixer.snapshot(0).volume;
+                        mixer.bump_volume(v - current);
+                        self.status = mixer.snapshot(self.selected()).status;
+                    }
+                }
+
+                // ── 混音模式 ──
                 ControlCmd::CycleMix => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
                         mixer.cycle_mix();
                         self.status = mixer.snapshot(self.selected()).status;
                     }
                 }
+                ControlCmd::SetMix(mode) => {
+                    use crate::dsp::MixMode;
+                    let target = match mode.to_lowercase().as_str() {
+                        "cut" => Some(MixMode::Cut),
+                        "crossfade" => Some(MixMode::Crossfade),
+                        "automix" => Some(MixMode::AutoMix),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        if let Ok(mut mixer) = self.player.mixer.lock() {
+                            while mixer.mix() != target {
+                                mixer.cycle_mix();
+                            }
+                            self.status = mixer.snapshot(self.selected()).status;
+                        }
+                    }
+                }
+
+                // ── Remix 模式 ──
                 ControlCmd::CycleRemix => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
                         mixer.cycle_remix();
                         self.status = mixer.snapshot(self.selected()).status;
                     }
                 }
-                ControlCmd::ToggleShuffle => {
-                    if let Ok(mut mixer) = self.player.mixer.lock() {
-                        mixer.toggle_shuffle();
-                        self.status = mixer.snapshot(self.selected()).status;
+                ControlCmd::SetRemix(mode) => {
+                    use crate::remix::RemixMode;
+                    let target = match mode.to_lowercase().as_str() {
+                        "off" | "raw" => Some(RemixMode::Off),
+                        "chill" => Some(RemixMode::Chill),
+                        "club" => Some(RemixMode::Club),
+                        "ncore" | "nightcore" => Some(RemixMode::Nightcore),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        if let Ok(mut mixer) = self.player.mixer.lock() {
+                            while mixer.remix() != target {
+                                mixer.cycle_remix();
+                            }
+                            self.status = mixer.snapshot(self.selected()).status;
+                        }
                     }
                 }
+
+                // ── 随机播放 ──
+                ControlCmd::ToggleShuffle => {
+                    let next = {
+                        let mixer = self.player.mixer.lock().expect("mixer");
+                        mixer.shuffle_mode().next()
+                    };
+                    self.apply_shuffle(next);
+                }
+                ControlCmd::SetShuffle(mode) => {
+                    use crate::prefs::ShuffleMode;
+                    let target = match mode.to_lowercase().as_str() {
+                        "off" => Some(ShuffleMode::Off),
+                        "random" => Some(ShuffleMode::Random),
+                        "norepeat" | "no_repeat" | "no-repeat" => Some(ShuffleMode::NoRepeat),
+                        "taste" => Some(ShuffleMode::Taste),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        self.apply_shuffle(target);
+                    }
+                }
+
+                // ── 循环模式 ──
                 ControlCmd::CycleLoop => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
                         mixer.cycle_loop();
                         self.status = mixer.snapshot(self.selected()).status;
                     }
                 }
+                ControlCmd::SetLoop(mode) => {
+                    use crate::engine::LoopMode;
+                    let target = match mode.to_lowercase().as_str() {
+                        "off" => Some(LoopMode::Off),
+                        "one" | "1" => Some(LoopMode::One),
+                        "all" => Some(LoopMode::All),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        if let Ok(mut mixer) = self.player.mixer.lock() {
+                            while mixer.snapshot(0).loop_mode != target {
+                                mixer.cycle_loop();
+                            }
+                            self.status = mixer.snapshot(self.selected()).status;
+                        }
+                    }
+                }
+
+                // ── 选中 ──
                 ControlCmd::Select(idx) => {
                     if idx < self.visible_tracks().len() {
                         self.list_state.select(Some(idx));
                     }
                 }
+
+                // ── 资料库 ──
                 ControlCmd::RescanLibrary => {
                     self.rescan_library();
                 }
+                ControlCmd::MetaScan => {
+                    let n = self.enqueue_missing_meta();
+                    self.pump_meta_queue();
+                    self.status = if n == 0 {
+                        "meta scan idle".into()
+                    } else {
+                        format!("meta queue {n}")
+                    };
+                }
+
+                // ── EQ ──
                 ControlCmd::SetEq(band, db) => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
                         mixer.bump_eq(band, db);
@@ -1671,6 +1832,80 @@ impl App {
                         self.status = mixer.snapshot(self.selected()).status;
                     }
                 }
+
+                // ── 排序 ──
+                ControlCmd::SetSort(mode) => {
+                    use crate::prefs::SortMode;
+                    let target = match mode.to_lowercase().as_str() {
+                        "path" => Some(SortMode::Path),
+                        "title" => Some(SortMode::Title),
+                        "artist" => Some(SortMode::Artist),
+                        "album" => Some(SortMode::Album),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        let keep = self.selected();
+                        self.prefs.sort_mode = target;
+                        self.prefs.save();
+                        self.sync_list_cursor(keep);
+                        self.status = format!("sort {}", self.prefs.sort_mode.label());
+                    }
+                }
+
+                // ── 主题/可视化/偏好 ──
+                ControlCmd::SetTheme(mode) => {
+                    use crate::prefs::ThemeName;
+                    let target = match mode.to_lowercase().as_str() {
+                        "system" => Some(ThemeName::System),
+                        "latte" => Some(ThemeName::Latte),
+                        "frappe" => Some(ThemeName::Frappe),
+                        "macchiato" => Some(ThemeName::Macchiato),
+                        "mocha" => Some(ThemeName::Mocha),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        self.prefs.theme = target;
+                        self.prefs.save();
+                        self.status = format!("theme {}", self.prefs.theme.label());
+                    }
+                }
+                ControlCmd::SetVisualize(mode) => {
+                    use crate::prefs::VisualizeMode;
+                    let target = match mode.to_lowercase().as_str() {
+                        "off" => Some(VisualizeMode::Off),
+                        "bars" => Some(VisualizeMode::Bars),
+                        "scope" | "oscilloscope" => Some(VisualizeMode::Oscilloscope),
+                        "cnm" => Some(VisualizeMode::Cnm),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        self.prefs.visualize = target;
+                        self.prefs.save();
+                        self.status = format!("viz {}", self.prefs.visualize.label());
+                    }
+                }
+                ControlCmd::ToggleTransparent => {
+                    self.prefs.transparent = !self.prefs.transparent;
+                    self.prefs.save();
+                    self.status = format!("transparent {}", self.prefs.transparent);
+                }
+                ControlCmd::ToggleLyricsFetch => {
+                    self.prefs.lyrics_fetch = !self.prefs.lyrics_fetch;
+                    self.prefs.save();
+                    self.status = format!("lyrics_fetch {}", self.prefs.lyrics_fetch);
+                }
+                ControlCmd::ToggleCoverFetch => {
+                    self.prefs.cover_fetch = !self.prefs.cover_fetch;
+                    self.prefs.save();
+                    self.status = format!("cover_fetch {}", self.prefs.cover_fetch);
+                }
+                ControlCmd::ToggleResume => {
+                    self.prefs.resume = !self.prefs.resume;
+                    self.prefs.save();
+                    self.status = format!("resume {}", self.prefs.resume);
+                }
+
+                // ── 保留兼容 ──
                 ControlCmd::Import(url) => self.start_import(&url),
                 ControlCmd::Search(query) => self.search_splayer(&query),
                 ControlCmd::Status => {}
