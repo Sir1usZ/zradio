@@ -2,6 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::io::{self, stdout};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,9 +21,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph};
 
 use crate::analysis::{analyze_buffer, AnalysisStore, TrackAnalysis};
+use crate::api;
 use crate::browse;
 use crate::cava::CavaFeed;
-use crate::control::{self, ControlCmd};
+use crate::control::ControlCmd;
 use crate::cover;
 use crate::decode::AudioBuf;
 use crate::dsp::MixMode;
@@ -120,6 +122,8 @@ pub struct App {
     browse_kind: BrowseKind,
     meta_queue: VecDeque<usize>,
     meta_inflight: HashSet<usize>,
+    /// 远程控制 API 共享状态
+    api_state: api::SharedState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,7 +182,9 @@ impl App {
         let (peek_tx, peek_rx) = mpsc::channel();
         let (remote_tx, remote_rx) = mpsc::channel();
         let (control_tx, control_rx) = mpsc::channel();
-        control::start(control_tx);
+        // 新版 JSON API 替代旧 TCP 控制，监听 0.0.0.0:18765
+        let api_state = api::new_shared_state();
+        api::start(control_tx, Arc::clone(&api_state));
         let mut prefs = Prefs::load();
         if prefs.library.trim().is_empty() {
             prefs.set_library(&root);
@@ -255,6 +261,7 @@ impl App {
             browse_kind: BrowseKind::All,
             meta_queue: VecDeque::new(),
             meta_inflight: HashSet::new(),
+            api_state,
         };
         app.push_taste();
         if let Ok(mut mixer) = app.player.mixer.lock() {
@@ -819,6 +826,7 @@ impl App {
                 }
                 self.drain_mpris();
                 self.publish_mpris();
+                self.update_api_state();
                 self.maybe_prefetch();
                 if let Ok(mut mixer) = self.player.mixer.lock() {
                     if let Some(cava) = self.cava.as_ref() {
@@ -1328,6 +1336,31 @@ impl App {
         }
     }
 
+    fn rescan_library(&mut self) {
+        let root = self.prefs.library_path();
+        match scan_library(&root) {
+            Ok(tracks) => {
+                self.tracks = tracks;
+                self.metas = vec![None; self.tracks.len()];
+                self.meta_queue.clear();
+                self.meta_inflight.clear();
+                if let Ok(mut mixer) = self.player.mixer.lock() {
+                    mixer.set_tracks(self.tracks.clone());
+                    mixer.set_shuffle_mode(self.prefs.shuffle_mode);
+                }
+                self.spawn_peek();
+                self.refresh_artists();
+                self.list_state.select(if self.tracks.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
+                self.status = format!("rescan {} · {} tracks", root.display(), self.tracks.len());
+            }
+            Err(err) => self.status = format!("rescan fail {err}"),
+        }
+    }
+
     fn search_local(&mut self, query: &str) {
         self.browse_kind = BrowseKind::All;
         self.music_mode = MusicMode::Library;
@@ -1466,6 +1499,67 @@ impl App {
         }
     }
 
+    /// 将当前播放状态同步到 API 共享状态，供远程客户端读取
+    fn update_api_state(&self) {
+        let Ok(mut snap) = self.api_state.lock() else {
+            return;
+        };
+
+        // 播放快照
+        let snapshot = self.player.mixer.lock().ok().map(|m| m.snapshot(0));
+
+        // 当前曲目元数据
+        let current_idx = snapshot.as_ref().and_then(|s| s.current);
+        let track = current_idx.and_then(|idx| {
+            let track = self.tracks.get(idx)?;
+            let meta = self.metas.get(idx).and_then(|m| m.as_ref());
+            Some(api::TrackInfo {
+                index: idx,
+                title: meta
+                    .map(|m| m.title.clone())
+                    .unwrap_or_else(|| track.title.clone()),
+                artist: meta.map(|m| m.artist.clone()).unwrap_or_default(),
+                album: meta.map(|m| m.album.clone()).unwrap_or_default(),
+                path: track.path.display().to_string(),
+                has_cover: meta.is_some_and(|m| m.cover.is_some() || m.cover_path.is_some()),
+                has_lyrics: meta.is_some_and(|m| !m.lyrics.is_empty()),
+            })
+        });
+
+        // EQ
+        let eq = snapshot
+            .as_ref()
+            .map(|s| s.spectrum_levels)
+            .map(|_| {
+                self.player
+                    .mixer
+                    .lock()
+                    .ok()
+                    .map(|m| m.eq_db())
+                    .unwrap_or([0.0; 5])
+            })
+            .unwrap_or([0.0; 5]);
+
+        // Taste 排行
+        let taste_top: Vec<api::TasteEntry> = self
+            .taste
+            .top_tracks(10)
+            .into_iter()
+            .map(|(title, artist, score)| api::TasteEntry {
+                title,
+                artist,
+                score,
+            })
+            .collect();
+
+        snap.snapshot = snapshot;
+        snap.track = track;
+        snap.tracks_total = self.tracks.len();
+        snap.eq = eq;
+        snap.taste_top = taste_top;
+        snap.total_listen_secs = self.taste.total_listen_secs();
+    }
+
     fn drain_control(&mut self) {
         while let Ok(cmd) = self.control_rx.try_recv() {
             match cmd {
@@ -1494,6 +1588,12 @@ impl App {
                         self.status = mixer.snapshot(self.selected()).status;
                     }
                 }
+                ControlCmd::TogglePause => {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        mixer.toggle_pause();
+                        self.status = mixer.snapshot(self.selected()).status;
+                    }
+                }
                 ControlCmd::Next => {
                     if let Some(i) = self.player.mixer.lock().ok().and_then(|m| m.next_index()) {
                         self.play_index(i, true);
@@ -1502,6 +1602,73 @@ impl App {
                 ControlCmd::Prev => {
                     if let Some(i) = self.player.mixer.lock().ok().and_then(|m| m.prev_index()) {
                         self.play_index(i, true);
+                    }
+                }
+                ControlCmd::PlayIndex(idx) => {
+                    if idx < self.tracks.len() {
+                        self.play_index(idx, true);
+                    }
+                }
+                ControlCmd::Seek(secs) => {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        mixer.seek_by(secs);
+                    }
+                }
+                ControlCmd::SeekTo(secs) => {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        mixer.seek_to(secs);
+                    }
+                }
+                ControlCmd::Volume(delta) => {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        mixer.bump_volume(delta);
+                        self.status = mixer.snapshot(self.selected()).status;
+                    }
+                }
+                ControlCmd::CycleMix => {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        mixer.cycle_mix();
+                        self.status = mixer.snapshot(self.selected()).status;
+                    }
+                }
+                ControlCmd::CycleRemix => {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        mixer.cycle_remix();
+                        self.status = mixer.snapshot(self.selected()).status;
+                    }
+                }
+                ControlCmd::ToggleShuffle => {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        mixer.toggle_shuffle();
+                        self.status = mixer.snapshot(self.selected()).status;
+                    }
+                }
+                ControlCmd::CycleLoop => {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        mixer.cycle_loop();
+                        self.status = mixer.snapshot(self.selected()).status;
+                    }
+                }
+                ControlCmd::Select(idx) => {
+                    if idx < self.visible_tracks().len() {
+                        self.list_state.select(Some(idx));
+                    }
+                }
+                ControlCmd::RescanLibrary => {
+                    self.rescan_library();
+                }
+                ControlCmd::SetEq(band, db) => {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        mixer.bump_eq(band, db);
+                        self.prefs.eq_db = mixer.eq_db();
+                        self.status = mixer.snapshot(self.selected()).status;
+                    }
+                }
+                ControlCmd::ResetEq => {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        mixer.reset_eq();
+                        self.prefs.eq_db = mixer.eq_db();
+                        self.status = mixer.snapshot(self.selected()).status;
                     }
                 }
                 ControlCmd::Import(url) => self.start_import(&url),

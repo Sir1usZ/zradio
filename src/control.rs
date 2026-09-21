@@ -10,10 +10,35 @@ pub enum ControlCmd {
     Status,
     Play,
     Pause,
+    TogglePause,
     Next,
     Prev,
     Import(String),
     Search(String),
+    /// 播放指定索引的曲目
+    PlayIndex(usize),
+    /// 相对跳转（秒）
+    Seek(f32),
+    /// 绝对跳转（秒）
+    SeekTo(f32),
+    /// 音量增减（-1.0 ~ 1.0）
+    Volume(f32),
+    /// 循环切换混音模式
+    CycleMix,
+    /// 循环切换 Remix 模式
+    CycleRemix,
+    /// 切换随机播放
+    ToggleShuffle,
+    /// 循环切换循环模式
+    CycleLoop,
+    /// 选中指定索引
+    Select(usize),
+    /// 重新扫描资料库
+    RescanLibrary,
+    /// 设置 EQ 某个频段
+    SetEq(usize, f32),
+    /// 重置 EQ
+    ResetEq,
 }
 
 #[derive(Deserialize)]
@@ -67,6 +92,7 @@ fn parse(req: &str) -> Option<ControlCmd> {
     match path {
         "/play" => Some(ControlCmd::Play),
         "/pause" => Some(ControlCmd::Pause),
+        "/toggle" => Some(ControlCmd::TogglePause),
         "/next" => Some(ControlCmd::Next),
         "/prev" => Some(ControlCmd::Prev),
         "/import" => parsed.url.map(ControlCmd::Import),

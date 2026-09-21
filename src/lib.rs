@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod api;
 pub mod automix;
 pub mod browse;
 pub mod cava;
