@@ -7,7 +7,7 @@ use cpal::{Sample, SampleFormat, Stream};
 
 use crate::analysis::TrackAnalysis;
 use crate::automix::{
-    aligned_mix_in, fade_secs_for, mix_start_frame, pick_next, plan_for, MixStyle, TransitionPlan,
+    aligned_mix_in, fade_secs_for, mix_start_frame, plan_for, MixStyle, TransitionPlan,
 };
 use crate::decode::{decode_file, AudioBuf};
 use crate::dsp::{
@@ -153,6 +153,7 @@ pub struct Mixer {
     loop_mode: LoopMode,
     taste_boosts: Vec<f32>,
     eq: Equalizer,
+    playable: Option<Vec<usize>>,
 }
 
 impl Mixer {
@@ -185,6 +186,7 @@ impl Mixer {
             loop_mode: LoopMode::Off,
             taste_boosts: Vec::new(),
             eq: Equalizer::new(sample_rate, [0.0; 5]),
+            playable: None,
         }
     }
 
@@ -208,6 +210,14 @@ impl Mixer {
 
     pub fn eq_db(&self) -> [f32; 5] {
         self.eq.db()
+    }
+
+    pub fn set_playable(&mut self, playable: Option<Vec<usize>>) {
+        self.playable = playable;
+    }
+
+    pub fn playable(&self) -> Option<&[usize]> {
+        self.playable.as_deref()
     }
 
     pub fn set_tracks(&mut self, tracks: Vec<Track>) {
@@ -510,36 +520,87 @@ impl Mixer {
         deck.remaining() <= need
     }
 
+    fn pool(&self) -> Vec<usize> {
+        match &self.playable {
+            None => (0..self.tracks.len()).collect(),
+            Some(p) => p
+                .iter()
+                .copied()
+                .filter(|&i| i < self.tracks.len())
+                .collect(),
+        }
+    }
+
+    fn step_in_pool(&self, pool: &[usize], delta: i32) -> usize {
+        match self
+            .current_idx
+            .and_then(|cur| pool.iter().position(|&i| i == cur))
+        {
+            Some(pos) => {
+                let len = pool.len() as i32;
+                pool[(pos as i32 + delta).rem_euclid(len) as usize]
+            }
+            None => match self.current_idx {
+                None => pool[0],
+                Some(cur) if delta >= 0 => {
+                    pool.iter().copied().find(|&i| i > cur).unwrap_or(pool[0])
+                }
+                Some(cur) => pool
+                    .iter()
+                    .copied()
+                    .rev()
+                    .find(|&i| i < cur)
+                    .unwrap_or(*pool.last().unwrap_or(&0)),
+            },
+        }
+    }
+
+    fn pick_next_in_pool(&self, pool: &[usize]) -> Option<usize> {
+        if pool.is_empty() {
+            return None;
+        }
+        if self.mix != MixMode::AutoMix || pool.len() == 1 {
+            return Some(self.step_in_pool(pool, 1));
+        }
+        let cur = self.current_idx;
+        let mut best: Option<(usize, f32)> = None;
+        for &i in pool {
+            if Some(i) == cur {
+                continue;
+            }
+            let mut candidate = plan_for(cur, i, &self.analyses, self.mix, false);
+            candidate.score += self.taste_boosts.get(i).copied().unwrap_or(0.0);
+            if best.is_none_or(|(_, s)| candidate.score > s) {
+                best = Some((i, candidate.score));
+            }
+        }
+        best.map(|(i, _)| i)
+            .or_else(|| Some(self.step_in_pool(pool, 1)))
+    }
+
     pub fn next_index(&self) -> Option<usize> {
         if self.loop_mode == LoopMode::One {
             return self.current_idx;
         }
-        if self.shuffle_mode != ShuffleMode::Off && self.tracks.len() > 1 {
-            return Some(self.shuffled_next());
+        let pool = self.pool();
+        if pool.is_empty() {
+            return None;
+        }
+        if self.shuffle_mode != ShuffleMode::Off && pool.len() > 1 {
+            return Some(self.shuffled_next(&pool));
         }
         if self.loop_mode == LoopMode::All {
-            let len = self.tracks.len();
-            if len == 0 {
-                return None;
-            }
-            return Some(self.current_idx.map(|i| (i + 1) % len).unwrap_or(0));
+            return Some(self.step_in_pool(&pool, 1));
         }
-        pick_next(
-            &self.tracks,
-            self.current_idx,
-            &self.analyses,
-            self.mix,
-            &self.taste_boosts,
-        )
-        .map(|p| p.next_index)
+        self.pick_next_in_pool(&pool)
     }
 
-    fn shuffled_next(&self) -> usize {
+    fn shuffled_next(&self, pool: &[usize]) -> usize {
         match self.shuffle_mode {
-            ShuffleMode::Off => self.current_idx.unwrap_or(0),
-            ShuffleMode::Taste => self.taste_next(),
-            ShuffleMode::NoRepeat => self.norepeat_next(),
-            ShuffleMode::Random => self.random_next(),
+            ShuffleMode::Off => self.current_idx.unwrap_or(pool[0]),
+            ShuffleMode::Taste => self.taste_next(pool),
+            ShuffleMode::NoRepeat => self.norepeat_next(pool),
+            ShuffleMode::Random => self.random_next(pool),
         }
     }
 
@@ -548,39 +609,36 @@ impl Mixer {
         cur.wrapping_mul(1_000_003) ^ self.tracks.len() ^ 0x9E37
     }
 
-    fn random_next(&self) -> usize {
-        let len = self.tracks.len();
-        let cur = self.current_idx.unwrap_or(0);
-        if len < 2 {
-            return cur;
-        }
-        let seed = self.shuffle_seed() % (len - 1);
-        if seed >= cur {
-            seed + 1
-        } else {
-            seed
-        }
-    }
-
-    fn norepeat_next(&self) -> usize {
-        let len = self.tracks.len();
+    fn random_next(&self, pool: &[usize]) -> usize {
         let cur = self.current_idx;
-        let mut candidates: Vec<usize> = (0..len)
-            .filter(|i| Some(*i) != cur && !self.recent.contains(i))
-            .collect();
+        let candidates: Vec<usize> = pool.iter().copied().filter(|&i| Some(i) != cur).collect();
         if candidates.is_empty() {
-            candidates = (0..len).filter(|i| Some(*i) != cur).collect();
-        }
-        if candidates.is_empty() {
-            return cur.unwrap_or(0);
+            return cur.unwrap_or(pool[0]);
         }
         candidates[self.shuffle_seed() % candidates.len()]
     }
 
-    fn taste_next(&self) -> usize {
-        let len = self.tracks.len();
+    fn norepeat_next(&self, pool: &[usize]) -> usize {
         let cur = self.current_idx;
-        let weighted: Vec<(usize, f32)> = (0..len)
+        let mut candidates: Vec<usize> = pool
+            .iter()
+            .copied()
+            .filter(|i| Some(*i) != cur && !self.recent.contains(i))
+            .collect();
+        if candidates.is_empty() {
+            candidates = pool.iter().copied().filter(|i| Some(*i) != cur).collect();
+        }
+        if candidates.is_empty() {
+            return cur.unwrap_or(pool[0]);
+        }
+        candidates[self.shuffle_seed() % candidates.len()]
+    }
+
+    fn taste_next(&self, pool: &[usize]) -> usize {
+        let cur = self.current_idx;
+        let weighted: Vec<(usize, f32)> = pool
+            .iter()
+            .copied()
             .filter(|i| Some(*i) != cur)
             .map(|i| {
                 let boost = self.taste_boosts.get(i).copied().unwrap_or(0.0).max(0.0);
@@ -588,7 +646,7 @@ impl Mixer {
             })
             .collect();
         if weighted.is_empty() {
-            return cur.unwrap_or(0);
+            return cur.unwrap_or(pool[0]);
         }
         let total: f32 = weighted.iter().map(|(_, w)| w).sum::<f32>().max(0.001);
         let mut pick = (self.shuffle_seed() % 10_007) as f32 / 10_007.0 * total;
@@ -598,19 +656,15 @@ impl Mixer {
             }
             pick -= w;
         }
-        cur.unwrap_or(0)
+        cur.unwrap_or(pool[0])
     }
 
     pub fn prev_index(&self) -> Option<usize> {
-        let len = self.tracks.len();
-        if len == 0 {
+        let pool = self.pool();
+        if pool.is_empty() {
             return None;
         }
-        Some(
-            self.current_idx
-                .map(|i| if i == 0 { len - 1 } else { i - 1 })
-                .unwrap_or(0),
-        )
+        Some(self.step_in_pool(&pool, -1))
     }
 
     pub fn take_finished(&mut self) -> bool {
@@ -1237,5 +1291,87 @@ mod tests {
         mixer.set_analysis(2, analysis_at(0.0, 16.0, 20.0));
         mixer.set_taste_boosts(vec![0.0, 0.0, 0.3]);
         assert_eq!(mixer.next_index(), Some(2));
+    }
+
+    fn four_tracks() -> Vec<Track> {
+        vec![
+            Track {
+                path: PathBuf::from("a.wav"),
+                title: "A".into(),
+            },
+            Track {
+                path: PathBuf::from("b.wav"),
+                title: "B".into(),
+            },
+            Track {
+                path: PathBuf::from("c.wav"),
+                title: "C".into(),
+            },
+            Track {
+                path: PathBuf::from("d.wav"),
+                title: "D".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn playable_next_stays_inside_filter() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(four_tracks());
+        mixer.set_playable(Some(vec![1, 3]));
+        mixer.play_decoded(1, const_deck(100, 0.5));
+        mixer.cycle_loop();
+        mixer.cycle_loop();
+        assert_eq!(mixer.loop_mode, LoopMode::All);
+        assert_eq!(mixer.next_index(), Some(3));
+        mixer.play_decoded(3, const_deck(100, 0.5));
+        assert_eq!(mixer.next_index(), Some(1));
+        assert_eq!(mixer.prev_index(), Some(1));
+    }
+
+    #[test]
+    fn playable_empty_returns_none() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(four_tracks());
+        mixer.set_playable(Some(vec![]));
+        mixer.play_decoded(0, const_deck(100, 0.5));
+        assert_eq!(mixer.next_index(), None);
+        assert_eq!(mixer.prev_index(), None);
+    }
+
+    #[test]
+    fn playable_none_matches_whole_library() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(four_tracks());
+        mixer.play_decoded(0, const_deck(100, 0.5));
+        mixer.cycle_loop();
+        mixer.cycle_loop();
+        let unrestricted = mixer.next_index();
+        mixer.set_playable(None);
+        assert_eq!(mixer.next_index(), unrestricted);
+        assert_eq!(unrestricted, Some(1));
+    }
+
+    #[test]
+    fn shuffle_playable_stays_inside() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(four_tracks());
+        mixer.set_playable(Some(vec![0, 2]));
+        mixer.play_decoded(0, const_deck(100, 0.5));
+        mixer.set_shuffle_mode(crate::prefs::ShuffleMode::Random);
+        let next = mixer.next_index().unwrap();
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn current_outside_playable_picks_from_range() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(four_tracks());
+        mixer.set_playable(Some(vec![2, 3]));
+        mixer.play_decoded(0, const_deck(100, 0.5));
+        mixer.cycle_loop();
+        mixer.cycle_loop();
+        assert_eq!(mixer.next_index(), Some(2));
+        assert_eq!(mixer.prev_index(), Some(3));
     }
 }
