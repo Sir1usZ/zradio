@@ -37,6 +37,7 @@ use crate::meta::{
     TrackMeta,
 };
 use crate::mpris::{MediaCmd, Mpris};
+use crate::playlist::{store_path, PlaylistStore};
 use crate::prefs::{Palette, Prefs, ShuffleMode};
 use crate::progress::{self, TransferBar};
 use crate::remix::{apply_remix, RemixMode};
@@ -118,12 +119,18 @@ pub struct App {
     album_pages: Vec<browse::ArtistPage>,
     cava: Option<CavaFeed>,
     pending_seek: Option<f32>,
-    library_idx: usize,
     browse_kind: BrowseKind,
     meta_queue: VecDeque<usize>,
     meta_inflight: HashSet<usize>,
     /// 远程控制 API 共享状态
     api_state: api::SharedState,
+    playlists: PlaylistStore,
+    lib_row: usize,
+    lib_state: ListState,
+    lib_group: Option<String>,
+    context_idx: usize,
+    context_target: ContextTarget,
+    context_from: Overlay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +140,26 @@ enum Overlay {
     Help,
     Eq,
     Library,
+    Context,
+    ContextAdd,
+}
+
+#[derive(Debug, Clone)]
+enum RangeRow {
+    Present(usize),
+    Missing(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+enum LibRow {
+    Track(usize),
+    Group { name: String, tracks: Vec<usize> },
+}
+
+#[derive(Debug, Clone)]
+enum ContextTarget {
+    Track(usize),
+    Missing(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +185,16 @@ impl BrowseKind {
             Self::Untagged => Self::Artists,
             Self::Artists => Self::Albums,
             Self::Albums => Self::All,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::All => Self::Albums,
+            Self::Tagged => Self::All,
+            Self::Untagged => Self::Tagged,
+            Self::Artists => Self::Untagged,
+            Self::Albums => Self::Artists,
         }
     }
 
@@ -257,25 +294,358 @@ impl App {
             album_pages: Vec::new(),
             cava: CavaFeed::start(24),
             pending_seek: None,
-            library_idx: 0,
             browse_kind: BrowseKind::All,
             meta_queue: VecDeque::new(),
             meta_inflight: HashSet::new(),
             api_state,
+            playlists: PlaylistStore::load(),
+            lib_row: 0,
+            lib_state: ListState::default(),
+            lib_group: None,
+            context_idx: 0,
+            context_target: ContextTarget::Track(0),
+            context_from: Overlay::None,
         };
         app.push_taste();
         if let Ok(mut mixer) = app.player.mixer.lock() {
             mixer.set_eq_db(app.prefs.eq_db);
             mixer.set_shuffle_mode(app.prefs.shuffle_mode);
         }
+        app.sync_playable();
         app.spawn_peek();
         app.resume_if_needed();
         Ok(app)
     }
 
     fn selected(&self) -> usize {
-        let row = self.list_state.selected().unwrap_or(0);
-        self.visible_tracks().get(row).copied().unwrap_or(row)
+        self.selected_present().unwrap_or(0)
+    }
+
+    fn persist_playlists(&mut self) -> bool {
+        let backup = PlaylistStore::load_from(&store_path());
+        match self.playlists.persist_or_rollback(backup, &store_path()) {
+            Ok(()) => true,
+            Err(err) => {
+                self.status = err.as_status();
+                false
+            }
+        }
+    }
+
+    fn sync_playable(&mut self) {
+        let playable = self.playlists.playable_indices(&self.tracks);
+        if let Ok(mut mixer) = self.player.mixer.lock() {
+            mixer.set_playable(playable);
+        }
+    }
+
+    fn apply_play_range(&mut self) {
+        self.local_hits.clear();
+        self.local_filter.clear();
+        self.local_idx = 0;
+        self.music_mode = MusicMode::Library;
+        self.sync_playable();
+        let n = if self.local_filter.is_empty() {
+            self.range_rows().len()
+        } else {
+            self.local_hits.len()
+        };
+        self.list_state.select(if n == 0 { None } else { Some(0) });
+        self.status = self.range_status();
+    }
+
+    fn range_status(&self) -> String {
+        if self.playlists.active == 0 {
+            format!("1 · 全部 · {} tracks", self.tracks.len())
+        } else {
+            let name = self.playlists.slot_name(self.playlists.active + 1);
+            let n = self
+                .playlists
+                .playable_indices(&self.tracks)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            format!("{} · {name} · {n} tracks", self.playlists.active + 1)
+        }
+    }
+
+    fn jump_slot(&mut self, slot: usize) {
+        match self.playlists.jump_slot(slot) {
+            Ok(_) => {
+                if self.persist_playlists() {
+                    self.apply_play_range();
+                } else {
+                    self.sync_playable();
+                }
+            }
+            Err(err) => self.status = err.as_status(),
+        }
+    }
+
+    fn cycle_playlist(&mut self, delta: i32) {
+        self.playlists.cycle(delta);
+        if self.persist_playlists() {
+            self.apply_play_range();
+        } else {
+            self.sync_playable();
+        }
+    }
+
+    fn create_playlist(&mut self, name: &str) {
+        match self.playlists.create(name) {
+            Ok(_) => {
+                if self.persist_playlists() {
+                    self.apply_play_range();
+                    self.status = format!(
+                        "♪ {} · 槽 {}",
+                        self.playlists.slot_name(self.playlists.active + 1),
+                        self.playlists.active + 1
+                    );
+                } else {
+                    self.sync_playable();
+                }
+            }
+            Err(err) => self.status = err.as_status(),
+        }
+    }
+
+    fn remove_current_playlist(&mut self) {
+        match self.playlists.remove_current() {
+            Ok(()) => {
+                if self.persist_playlists() {
+                    self.apply_play_range();
+                    self.status = "已删列表 · 回到全部".into();
+                } else {
+                    self.sync_playable();
+                }
+            }
+            Err(err) => self.status = err.as_status(),
+        }
+    }
+
+    fn add_track_to_list(&mut self, list_idx: usize, track_idx: usize) {
+        let Some(path) = self.tracks.get(track_idx).map(|t| t.path.clone()) else {
+            self.status = "没有可选曲目".into();
+            return;
+        };
+        let name = self
+            .playlists
+            .lists
+            .get(list_idx)
+            .map(|l| l.name.clone())
+            .unwrap_or_default();
+        match self.playlists.add_path(list_idx, path) {
+            Ok(()) => {
+                if self.persist_playlists() {
+                    if self.playlists.current_list_idx() == Some(list_idx) {
+                        self.apply_play_range();
+                    }
+                    self.status = format!("♪ 已加入 {name}");
+                } else {
+                    self.sync_playable();
+                }
+            }
+            Err(err) => self.status = err.as_status(),
+        }
+    }
+
+    fn remove_path_from_current(&mut self, path: &std::path::Path) {
+        let Some(list_idx) = self.playlists.current_list_idx() else {
+            return;
+        };
+        match self.playlists.remove_path(list_idx, path) {
+            Ok(()) => {
+                if self.persist_playlists() {
+                    self.apply_play_range();
+                    self.status = "已从列表移除".into();
+                } else {
+                    self.sync_playable();
+                }
+            }
+            Err(err) => self.status = err.as_status(),
+        }
+    }
+
+    fn range_rows(&self) -> Vec<RangeRow> {
+        if self.playlists.active == 0 {
+            return sort_indices(&self.tracks, &self.metas, self.prefs.sort_mode)
+                .into_iter()
+                .map(RangeRow::Present)
+                .collect();
+        }
+        let Some(list) = self.playlists.current_list() else {
+            return Vec::new();
+        };
+        list.paths
+            .iter()
+            .map(|p| match self.tracks.iter().position(|t| &t.path == p) {
+                Some(i) => RangeRow::Present(i),
+                None => RangeRow::Missing(p.clone()),
+            })
+            .collect()
+    }
+
+    fn lib_rows(&self) -> Vec<LibRow> {
+        if let Some(name) = self.lib_group.as_ref() {
+            let tracks = self
+                .group_pages()
+                .iter()
+                .find(|p| p.name == *name)
+                .map(|p| p.tracks.clone())
+                .unwrap_or_default();
+            return tracks.into_iter().map(LibRow::Track).collect();
+        }
+        match self.browse_kind {
+            BrowseKind::All => sort_indices(&self.tracks, &self.metas, self.prefs.sort_mode)
+                .into_iter()
+                .map(LibRow::Track)
+                .collect(),
+            BrowseKind::Tagged => {
+                let tagged = browse::tagged_indices(&self.metas);
+                sort_indices(&self.tracks, &self.metas, self.prefs.sort_mode)
+                    .into_iter()
+                    .filter(|i| tagged.contains(i))
+                    .map(LibRow::Track)
+                    .collect()
+            }
+            BrowseKind::Untagged => {
+                let untagged = browse::untagged_indices(&self.metas);
+                sort_indices(&self.tracks, &self.metas, self.prefs.sort_mode)
+                    .into_iter()
+                    .filter(|i| untagged.contains(i))
+                    .map(LibRow::Track)
+                    .collect()
+            }
+            BrowseKind::Artists | BrowseKind::Albums => self
+                .group_pages()
+                .iter()
+                .map(|p| LibRow::Group {
+                    name: p.name.clone(),
+                    tracks: p.tracks.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn lib_selected_track(&self) -> Option<usize> {
+        match self.lib_rows().get(self.lib_row) {
+            Some(LibRow::Track(i)) => Some(*i),
+            _ => None,
+        }
+    }
+
+    fn clamp_lib_row(&mut self) {
+        let n = self.lib_rows().len();
+        if n == 0 {
+            self.lib_row = 0;
+            self.lib_state.select(None);
+            return;
+        }
+        if self.lib_row >= n {
+            self.lib_row = n - 1;
+        }
+        self.lib_state.select(Some(self.lib_row));
+    }
+
+    fn enqueue_one_meta(&mut self, index: usize) {
+        if self.meta_inflight.contains(&index) || self.meta_queue.contains(&index) {
+            self.meta_queue.retain(|&i| i != index);
+            self.meta_queue.push_front(index);
+            self.status = "补全排队".into();
+            self.pump_meta_queue();
+            return;
+        }
+        self.meta_queue.push_front(index);
+        self.status = "补全排队".into();
+        self.pump_meta_queue();
+    }
+
+    fn open_context(&mut self, target: ContextTarget) {
+        if let ContextTarget::Track(i) = &target {
+            if *i >= self.tracks.len() {
+                return;
+            }
+        }
+        self.context_target = target;
+        self.context_idx = 0;
+        self.context_from = self.overlay;
+        self.overlay = Overlay::Context;
+    }
+
+    fn selected_context_target(&self) -> Option<ContextTarget> {
+        if !self.local_filter.is_empty() {
+            return self
+                .local_hits
+                .get(self.list_state.selected().unwrap_or(0))
+                .copied()
+                .map(ContextTarget::Track);
+        }
+        match self
+            .range_rows()
+            .get(self.list_state.selected().unwrap_or(0))
+        {
+            Some(RangeRow::Present(i)) => Some(ContextTarget::Track(*i)),
+            Some(RangeRow::Missing(path)) => Some(ContextTarget::Missing(path.clone())),
+            None => None,
+        }
+    }
+
+    fn context_actions(&self) -> Vec<&'static str> {
+        match &self.context_target {
+            ContextTarget::Missing(_) => vec!["从当前列表移除"],
+            ContextTarget::Track(i) => {
+                let mut rows = vec!["加到播放列表", "补全这首", "播放"];
+                if self.playlists.current_list_idx().is_some() {
+                    if let Some(path) = self.tracks.get(*i).map(|t| t.path.as_path()) {
+                        if self
+                            .playlists
+                            .current_list()
+                            .is_some_and(|l| l.paths.iter().any(|p| p == path))
+                        {
+                            rows.push("从当前列表移除");
+                        }
+                    }
+                }
+                rows
+            }
+        }
+    }
+
+    fn slot_title(&self) -> String {
+        let mut parts = Vec::new();
+        for slot in 1..=9 {
+            let mark = if self.playlists.active + 1 == slot {
+                "▸"
+            } else {
+                " "
+            };
+            if slot == 1 {
+                parts.push(format!("{mark}{slot} · 全部"));
+                continue;
+            }
+            let list_idx = slot - 2;
+            if let Some(list) = self.playlists.lists.get(list_idx) {
+                parts.push(format!("{mark}{slot} ♪ {}", list.name));
+            } else {
+                parts.push(format!("{mark}{slot} · —"));
+            }
+        }
+        format!(" {} ", parts.join("  "))
+    }
+
+    fn selected_present(&self) -> Option<usize> {
+        if !self.local_filter.is_empty() {
+            return self
+                .local_hits
+                .get(self.list_state.selected().unwrap_or(0))
+                .copied();
+        }
+        match self
+            .range_rows()
+            .get(self.list_state.selected().unwrap_or(0))
+        {
+            Some(RangeRow::Present(i)) => Some(*i),
+            _ => None,
+        }
     }
 
     fn move_local(&mut self, delta: i32) {
@@ -288,11 +658,14 @@ impl App {
     }
 
     fn select_delta(&mut self, delta: i32) {
-        let visible = self.visible_tracks();
-        if visible.is_empty() {
+        let len = if !self.local_filter.is_empty() {
+            self.local_hits.len()
+        } else {
+            self.range_rows().len()
+        } as i32;
+        if len == 0 {
             return;
         }
-        let len = visible.len() as i32;
         let next =
             (self.list_state.selected().unwrap_or(0) as i32 + delta).rem_euclid(len) as usize;
         self.list_state.select(Some(next));
@@ -306,15 +679,21 @@ impl App {
     }
 
     fn sync_list_cursor(&mut self, track_index: usize) {
-        let visible = self.visible_tracks();
-        if let Some(row) = visible_row(&visible, track_index) {
-            if !self.local_filter.is_empty() {
+        if !self.local_filter.is_empty() {
+            if let Some(row) = visible_row(&self.local_hits, track_index) {
                 self.local_idx = row;
+                self.list_state.select(Some(row));
+                return;
             }
+        } else if let Some(row) = self
+            .range_rows()
+            .iter()
+            .position(|r| matches!(r, RangeRow::Present(i) if *i == track_index))
+        {
             self.list_state.select(Some(row));
             return;
         }
-        self.list_state.select(Some(track_index));
+        self.list_state.select(Some(0));
     }
 
     fn resume_if_needed(&mut self) {
@@ -702,54 +1081,6 @@ impl App {
         self.artist_state.select(Some(self.artist_idx));
     }
 
-    fn apply_browse(&mut self) {
-        self.local_hits.clear();
-        self.local_filter.clear();
-        self.local_idx = 0;
-        match self.browse_kind {
-            BrowseKind::All => {
-                self.music_mode = MusicMode::Library;
-                self.list_state.select(if self.tracks.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                });
-                self.status = format!("browse {}", self.browse_kind.label());
-            }
-            BrowseKind::Tagged => {
-                self.music_mode = MusicMode::Library;
-                self.local_filter = "有标签".into();
-                self.local_hits = browse::tagged_indices(&self.metas);
-                self.list_state.select(if self.local_hits.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                });
-                self.status = format!("有标签 · {} tracks", self.local_hits.len());
-            }
-            BrowseKind::Untagged => {
-                self.music_mode = MusicMode::Library;
-                self.local_filter = "缺标签".into();
-                self.local_hits = browse::untagged_indices(&self.metas);
-                self.list_state.select(if self.local_hits.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                });
-                self.status = format!("缺标签 · {} tracks", self.local_hits.len());
-            }
-            BrowseKind::Artists | BrowseKind::Albums => {
-                self.music_mode = MusicMode::Artists;
-                self.reset_group_cursor();
-                self.status = format!(
-                    "{} · {} groups",
-                    self.browse_kind.label(),
-                    self.group_pages().len()
-                );
-            }
-        }
-    }
-
     fn maybe_prefetch(&mut self) {
         if self.inflight.is_some() {
             return;
@@ -892,8 +1223,14 @@ impl App {
             }
             KeyCode::Char('y') => {
                 self.overlay = Overlay::Library;
-                self.library_idx = 0;
+                self.lib_row = 0;
+                self.lib_group = None;
+                self.clamp_lib_row();
             }
+            KeyCode::Char('x') => match self.selected_context_target() {
+                Some(target) => self.open_context(target),
+                None => self.status = "没有可选曲目".into(),
+            },
             KeyCode::Char('g') if self.tab == Tab::Player => {
                 self.overlay = Overlay::Eq;
             }
@@ -901,13 +1238,8 @@ impl App {
                 self.command = Some("open ".into());
                 self.status = "open 本地文件夹".into();
             }
-            KeyCode::Char('1') => {
-                self.browse_kind = BrowseKind::All;
-                self.apply_browse();
-            }
-            KeyCode::Char('2') => {
-                self.browse_kind = BrowseKind::Artists;
-                self.apply_browse();
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' && self.tab == Tab::Music => {
+                self.jump_slot(c.to_digit(10).unwrap_or(1) as usize);
             }
             KeyCode::Char('q') => {
                 self.tab = self.tab.prev();
@@ -944,7 +1276,7 @@ impl App {
             },
             KeyCode::Char(':') => {
                 self.command = Some(String::new());
-                self.status = "url / search 歌名 / find 本地".into();
+                self.status = "playlist 名字 / playlist-rm / url / find".into();
             }
             KeyCode::Char('/') => {
                 self.command = Some("find ".into());
@@ -973,9 +1305,10 @@ impl App {
                 } else if !self.local_hits.is_empty() {
                     let i = self.local_hits[self.local_idx];
                     self.play_index(i, false);
-                } else {
-                    let i = self.selected();
+                } else if let Some(i) = self.selected_present() {
                     self.play_index(i, false);
+                } else {
+                    self.status = "列表空".into();
                 }
             }
             KeyCode::Char(' ') => {
@@ -984,8 +1317,11 @@ impl App {
                     drop(mixer);
                 } else if mixer.snapshot(0).current.is_none() {
                     drop(mixer);
-                    let i = self.selected();
-                    self.play_index(i, false);
+                    if let Some(i) = self.selected_present() {
+                        self.play_index(i, false);
+                    } else {
+                        self.status = "列表空".into();
+                    }
                 } else {
                     mixer.toggle_pause();
                     self.status = mixer.snapshot(self.selected()).status;
@@ -995,12 +1331,16 @@ impl App {
                 let next = self.player.mixer.lock().expect("mixer").next_index();
                 if let Some(i) = next {
                     self.play_index(i, true);
+                } else {
+                    self.status = "列表空".into();
                 }
             }
             KeyCode::Char('p') => {
                 let prev = self.player.mixer.lock().expect("mixer").prev_index();
                 if let Some(i) = prev {
                     self.play_index(i, true);
+                } else {
+                    self.status = "列表空".into();
                 }
             }
             KeyCode::Char('m') => {
@@ -1036,14 +1376,22 @@ impl App {
                 self.status = mixer.snapshot(self.selected()).status;
             }
             KeyCode::Left => {
-                let mut mixer = self.player.mixer.lock().expect("mixer");
-                mixer.seek_by(-5.0);
-                self.status = mixer.snapshot(self.selected()).status;
+                if self.tab == Tab::Music {
+                    self.cycle_playlist(-1);
+                } else if self.tab == Tab::Player {
+                    let mut mixer = self.player.mixer.lock().expect("mixer");
+                    mixer.seek_by(-5.0);
+                    self.status = mixer.snapshot(self.selected()).status;
+                }
             }
             KeyCode::Right => {
-                let mut mixer = self.player.mixer.lock().expect("mixer");
-                mixer.seek_by(5.0);
-                self.status = mixer.snapshot(self.selected()).status;
+                if self.tab == Tab::Music {
+                    self.cycle_playlist(1);
+                } else if self.tab == Tab::Player {
+                    let mut mixer = self.player.mixer.lock().expect("mixer");
+                    mixer.seek_by(5.0);
+                    self.status = mixer.snapshot(self.selected()).status;
+                }
             }
             _ => {}
         }
@@ -1073,50 +1421,213 @@ impl App {
     }
 
     fn handle_overlay_key(&mut self, key: event::KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('t') | KeyCode::Char('g') | KeyCode::Char('y') => {
-                self.overlay = Overlay::None;
+        match self.overlay {
+            Overlay::Library => self.handle_library_key(key),
+            Overlay::Context => self.handle_context_key(key),
+            Overlay::ContextAdd => self.handle_context_add_key(key),
+            Overlay::Settings => match key.code {
+                KeyCode::Esc | KeyCode::Char('t') => self.overlay = Overlay::None,
+                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.overlay = Overlay::None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.settings_idx = (self.settings_idx + 1) % 7;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.settings_idx = (self.settings_idx + 6) % 7;
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => self.toggle_setting(),
+                _ => {}
+            },
+            Overlay::Eq => match key.code {
+                KeyCode::Esc | KeyCode::Char('g') => self.overlay = Overlay::None,
+                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.overlay = Overlay::None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => self.eq_band = (self.eq_band + 1) % 5,
+                KeyCode::Char('k') | KeyCode::Up => self.eq_band = (self.eq_band + 4) % 5,
+                KeyCode::Left => self.bump_eq(-1.0),
+                KeyCode::Right => self.bump_eq(1.0),
+                KeyCode::Char('r') => {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        mixer.reset_eq();
+                        self.prefs.reset_eq();
+                        self.prefs.save();
+                        self.status = mixer.snapshot(self.selected()).status;
+                    }
+                }
+                _ => {}
+            },
+            Overlay::Help => {
+                if matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Char('t') | KeyCode::Char('g') | KeyCode::Char('y')
+                ) || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('k')))
+                {
+                    self.overlay = Overlay::None;
+                }
             }
+            Overlay::None => {}
+        }
+        false
+    }
+
+    fn handle_library_key(&mut self, key: event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('y') => self.overlay = Overlay::None,
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.overlay = Overlay::None;
             }
-            KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Settings => {
-                self.settings_idx = (self.settings_idx + 1) % 7;
+            KeyCode::Char('j') | KeyCode::Down => {
+                let n = self.lib_rows().len() as i32;
+                if n > 0 {
+                    self.lib_row = (self.lib_row as i32 + 1).rem_euclid(n) as usize;
+                    self.lib_state.select(Some(self.lib_row));
+                }
             }
-            KeyCode::Char('k') | KeyCode::Up if self.overlay == Overlay::Settings => {
-                self.settings_idx = (self.settings_idx + 6) % 7;
+            KeyCode::Char('k') | KeyCode::Up => {
+                let n = self.lib_rows().len() as i32;
+                if n > 0 {
+                    self.lib_row = (self.lib_row as i32 - 1).rem_euclid(n) as usize;
+                    self.lib_state.select(Some(self.lib_row));
+                }
             }
-            KeyCode::Enter | KeyCode::Char(' ') if self.overlay == Overlay::Settings => {
-                self.toggle_setting();
+            KeyCode::Tab => {
+                self.browse_kind = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.browse_kind.prev()
+                } else {
+                    self.browse_kind.next()
+                };
+                self.lib_group = None;
+                self.lib_row = 0;
+                self.clamp_lib_row();
             }
-            KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Library => {
-                self.library_idx = (self.library_idx + 1) % 5;
+            KeyCode::BackTab => {
+                self.browse_kind = self.browse_kind.prev();
+                self.lib_group = None;
+                self.lib_row = 0;
+                self.clamp_lib_row();
             }
-            KeyCode::Char('k') | KeyCode::Up if self.overlay == Overlay::Library => {
-                self.library_idx = (self.library_idx + 4) % 5;
+            KeyCode::Char('.') => {
+                self.prefs.sort_mode = self.prefs.sort_mode.next();
+                self.prefs.save();
+                self.clamp_lib_row();
+                self.status = format!("sort {}", self.prefs.sort_mode.label());
             }
-            KeyCode::Enter | KeyCode::Char(' ') if self.overlay == Overlay::Library => {
-                self.toggle_library();
+            KeyCode::Char('s') => {
+                let next = {
+                    let mixer = self.player.mixer.lock().expect("mixer");
+                    mixer.shuffle_mode().next()
+                };
+                self.apply_shuffle(next);
             }
-            KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Eq => {
-                self.eq_band = (self.eq_band + 1) % 5;
+            KeyCode::Char('u') => {
+                if let Some(i) = self.lib_selected_track() {
+                    self.enqueue_one_meta(i);
+                }
             }
-            KeyCode::Char('k') | KeyCode::Up if self.overlay == Overlay::Eq => {
-                self.eq_band = (self.eq_band + 4) % 5;
+            KeyCode::Char('U') => {
+                let n = self.enqueue_missing_meta();
+                self.pump_meta_queue();
+                self.status = if n == 0 {
+                    "meta scan idle".into()
+                } else {
+                    format!("meta queue {n}")
+                };
             }
-            KeyCode::Left if self.overlay == Overlay::Eq => self.bump_eq(-1.0),
-            KeyCode::Right if self.overlay == Overlay::Eq => self.bump_eq(1.0),
-            KeyCode::Char('r') if self.overlay == Overlay::Eq => {
-                if let Ok(mut mixer) = self.player.mixer.lock() {
-                    mixer.reset_eq();
-                    self.prefs.reset_eq();
-                    self.prefs.save();
-                    self.status = mixer.snapshot(self.selected()).status;
+            KeyCode::Char('x') => {
+                if let Some(i) = self.lib_selected_track() {
+                    self.open_context(ContextTarget::Track(i));
+                }
+            }
+            KeyCode::Backspace => {
+                if self.lib_group.take().is_some() {
+                    self.lib_row = 0;
+                    self.clamp_lib_row();
+                }
+            }
+            KeyCode::Enter => match self.lib_rows().get(self.lib_row).cloned() {
+                Some(LibRow::Group { name, .. }) => {
+                    self.lib_group = Some(name);
+                    self.lib_row = 0;
+                    self.clamp_lib_row();
+                }
+                Some(LibRow::Track(i)) => self.play_index(i, false),
+                None => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn handle_context_key(&mut self, key: event::KeyEvent) {
+        let n = self.context_actions().len().max(1);
+        match key.code {
+            KeyCode::Esc => self.overlay = self.context_from,
+            KeyCode::Char('j') | KeyCode::Down => self.context_idx = (self.context_idx + 1) % n,
+            KeyCode::Char('k') | KeyCode::Up => self.context_idx = (self.context_idx + n - 1) % n,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let action = self
+                    .context_actions()
+                    .get(self.context_idx)
+                    .copied()
+                    .unwrap_or("");
+                match action {
+                    "加到播放列表" => {
+                        if self.playlists.lists.is_empty() {
+                            self.status = "先 :playlist 名字".into();
+                            self.overlay = self.context_from;
+                        } else {
+                            self.context_idx = 0;
+                            self.overlay = Overlay::ContextAdd;
+                        }
+                    }
+                    "补全这首" => {
+                        if let ContextTarget::Track(i) = self.context_target {
+                            self.enqueue_one_meta(i);
+                        }
+                        self.overlay = self.context_from;
+                    }
+                    "播放" => {
+                        if let ContextTarget::Track(i) = self.context_target {
+                            self.play_index(i, false);
+                        }
+                        self.overlay = Overlay::None;
+                    }
+                    "从当前列表移除" => {
+                        match self.context_target.clone() {
+                            ContextTarget::Track(i) => {
+                                if let Some(path) = self.tracks.get(i).map(|t| t.path.clone()) {
+                                    self.remove_path_from_current(&path);
+                                }
+                            }
+                            ContextTarget::Missing(path) => {
+                                self.remove_path_from_current(&path);
+                            }
+                        }
+                        self.overlay = Overlay::None;
+                    }
+                    _ => self.overlay = self.context_from,
                 }
             }
             _ => {}
         }
-        false
+    }
+
+    fn handle_context_add_key(&mut self, key: event::KeyEvent) {
+        let n = self.playlists.lists.len().max(1);
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::Context,
+            KeyCode::Char('j') | KeyCode::Down => self.context_idx = (self.context_idx + 1) % n,
+            KeyCode::Char('k') | KeyCode::Up => self.context_idx = (self.context_idx + n - 1) % n,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let ContextTarget::Track(i) = self.context_target {
+                    self.add_track_to_list(self.context_idx, i);
+                }
+                self.overlay = Overlay::None;
+            }
+            _ => {}
+        }
     }
 
     fn toggle_setting(&mut self) {
@@ -1138,38 +1649,6 @@ impl App {
             self.prefs.lyrics_fetch,
             self.prefs.cover_fetch
         );
-    }
-
-    fn toggle_library(&mut self) {
-        match self.library_idx {
-            0 => {
-                let keep = self.selected();
-                self.prefs.sort_mode = self.prefs.sort_mode.next();
-                self.prefs.save();
-                self.sync_list_cursor(keep);
-                self.status = format!("sort {}", self.prefs.sort_mode.label());
-            }
-            1 => {
-                let next = self.prefs.shuffle_mode.next();
-                self.apply_shuffle(next);
-            }
-            2 => {
-                self.browse_kind = self.browse_kind.next();
-                self.apply_browse();
-                self.overlay = Overlay::Library;
-            }
-            3 => {
-                let n = self.enqueue_missing_meta();
-                self.pump_meta_queue();
-                self.status = if n == 0 {
-                    "meta scan idle".into()
-                } else {
-                    format!("meta queue {n}")
-                };
-            }
-            4 => self.overlay = Overlay::None,
-            _ => {}
-        }
     }
 
     fn apply_shuffle(&mut self, mode: ShuffleMode) {
@@ -1307,6 +1786,14 @@ impl App {
             self.open_folder(PathBuf::from(rest.trim()));
             return;
         }
+        if let Some(rest) = raw.strip_prefix("playlist ") {
+            self.create_playlist(rest);
+            return;
+        }
+        if raw == "playlist-rm" {
+            self.remove_current_playlist();
+            return;
+        }
         self.search_local(raw);
     }
 
@@ -1323,6 +1810,7 @@ impl App {
                     mixer.set_tracks(self.tracks.clone());
                     mixer.set_shuffle_mode(self.prefs.shuffle_mode);
                 }
+                self.sync_playable();
                 self.spawn_peek();
                 self.refresh_artists();
                 self.list_state.select(if self.tracks.is_empty() {
@@ -1348,6 +1836,7 @@ impl App {
                     mixer.set_tracks(self.tracks.clone());
                     mixer.set_shuffle_mode(self.prefs.shuffle_mode);
                 }
+                self.sync_playable();
                 self.spawn_peek();
                 self.refresh_artists();
                 self.list_state.select(if self.tracks.is_empty() {
@@ -1456,6 +1945,7 @@ impl App {
             if let Ok(mut mixer) = self.player.mixer.lock() {
                 mixer.set_tracks(self.tracks.clone());
             }
+            self.sync_playable();
             self.refresh_artists();
             self.tracks.len() - 1
         };
@@ -1612,7 +2102,6 @@ impl App {
             match cmd {
                 // ── 基础播放控制 ──
                 ControlCmd::Play => {
-                    let i = self.selected();
                     let empty = self
                         .player
                         .mixer
@@ -1620,7 +2109,11 @@ impl App {
                         .ok()
                         .is_none_or(|m| m.snapshot(0).current.is_none());
                     if empty {
-                        self.play_index(i, false);
+                        if let Some(i) = self.selected_present() {
+                            self.play_index(i, false);
+                        } else {
+                            self.status = "列表空".into();
+                        }
                     } else if let Ok(mut mixer) = self.player.mixer.lock() {
                         if mixer.snapshot(0).paused {
                             mixer.toggle_pause();
@@ -1645,11 +2138,15 @@ impl App {
                 ControlCmd::Next => {
                     if let Some(i) = self.player.mixer.lock().ok().and_then(|m| m.next_index()) {
                         self.play_index(i, true);
+                    } else {
+                        self.status = "列表空".into();
                     }
                 }
                 ControlCmd::Prev => {
                     if let Some(i) = self.player.mixer.lock().ok().and_then(|m| m.prev_index()) {
                         self.play_index(i, true);
+                    } else {
+                        self.status = "列表空".into();
                     }
                 }
                 ControlCmd::PlayIndex(idx) => {
@@ -1798,7 +2295,12 @@ impl App {
 
                 // ── 选中 ──
                 ControlCmd::Select(idx) => {
-                    if idx < self.visible_tracks().len() {
+                    let n = if self.local_filter.is_empty() {
+                        self.range_rows().len()
+                    } else {
+                        self.local_hits.len()
+                    };
+                    if idx < n {
                         self.list_state.select(Some(idx));
                     }
                 }
@@ -1920,8 +2422,11 @@ impl App {
                     let mut mixer = self.player.mixer.lock().expect("mixer");
                     if mixer.snapshot(0).current.is_none() {
                         drop(mixer);
-                        let i = self.selected();
-                        self.play_index(i, false);
+                        if let Some(i) = self.selected_present() {
+                            self.play_index(i, false);
+                        } else {
+                            self.status = "列表空".into();
+                        }
                     } else {
                         mixer.toggle_pause();
                         self.status = mixer.snapshot(self.selected()).status;
@@ -1931,12 +2436,16 @@ impl App {
                     let next = self.player.mixer.lock().expect("mixer").next_index();
                     if let Some(i) = next {
                         self.play_index(i, true);
+                    } else {
+                        self.status = "列表空".into();
                     }
                 }
                 MediaCmd::Previous => {
                     let prev = self.player.mixer.lock().expect("mixer").prev_index();
                     if let Some(i) = prev {
                         self.play_index(i, true);
+                    } else {
+                        self.status = "列表空".into();
                     }
                 }
                 MediaCmd::Stop => {
@@ -2008,6 +2517,8 @@ impl App {
             Overlay::Library => self.draw_library(frame),
             Overlay::Help => self.draw_help_modal(frame),
             Overlay::Eq => self.draw_eq(frame),
+            Overlay::Context => self.draw_context(frame),
+            Overlay::ContextAdd => self.draw_context_add(frame),
             Overlay::None => {}
         }
     }
@@ -2241,16 +2752,28 @@ impl App {
         frame.render_widget(title, area);
     }
 
-    fn visible_tracks(&self) -> Vec<usize> {
-        if !self.local_filter.is_empty() {
-            self.local_hits.clone()
+    fn track_row_text(&self, i: usize, snap: &Snapshot, extra: &str) -> (String, bool) {
+        let playing = snap.current == Some(i);
+        let mark = if playing { "▸ " } else { "  " };
+        let title = self.tracks.get(i).map(|t| t.title.as_str()).unwrap_or("—");
+        let artist = self
+            .metas
+            .get(i)
+            .and_then(|m| m.as_ref())
+            .map(|m| m.artist.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+        let text = if artist.is_empty() {
+            format!("{mark}{title}{extra}")
         } else {
-            sort_indices(&self.tracks, &self.metas, self.prefs.sort_mode)
-        }
+            format!("{mark}{artist} — {title}{extra}")
+        };
+        (text, playing)
     }
 
     fn draw_list(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect, snap: &Snapshot) {
-        let metas: Vec<String> = {
+        let pal = self.palette();
+        let extras: Vec<String> = {
             let mixer = self.player.mixer.lock().expect("mixer");
             self.tracks
                 .iter()
@@ -2271,54 +2794,47 @@ impl App {
                 })
                 .collect()
         };
-        let visible = self.visible_tracks();
-        let items: Vec<ListItem> = visible
-            .iter()
-            .filter_map(|&i| self.tracks.get(i).map(|track| (i, track)))
-            .map(|(i, track)| {
-                let mark = if snap.current == Some(i) {
-                    "▸ "
-                } else {
-                    "  "
-                };
-                let artist = self
-                    .metas
-                    .get(i)
-                    .and_then(|m| m.as_ref())
-                    .map(|m| m.artist.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("");
-                let text = if artist.is_empty() {
-                    format!(
-                        "{mark}{}{}",
-                        track.title,
-                        metas.get(i).cloned().unwrap_or_default()
-                    )
-                } else {
-                    format!(
-                        "{mark}{artist} — {}{}",
-                        track.title,
-                        metas.get(i).cloned().unwrap_or_default()
-                    )
-                };
-                let mut item = ListItem::new(text);
-                if snap.current == Some(i) {
-                    item = item.style(Style::default().magenta());
-                }
-                item
-            })
-            .collect();
-        let pal = self.palette();
+        let items: Vec<ListItem> = if !self.local_filter.is_empty() {
+            self.local_hits
+                .iter()
+                .map(|&i| {
+                    let extra = extras.get(i).cloned().unwrap_or_default();
+                    let (text, playing) = self.track_row_text(i, snap, &extra);
+                    let mut item = ListItem::new(text);
+                    if playing {
+                        item = item.style(Style::default().magenta());
+                    }
+                    item
+                })
+                .collect()
+        } else {
+            self.range_rows()
+                .into_iter()
+                .map(|row| match row {
+                    RangeRow::Present(i) => {
+                        let extra = extras.get(i).cloned().unwrap_or_default();
+                        let (text, playing) = self.track_row_text(i, snap, &extra);
+                        let mut item = ListItem::new(text);
+                        if playing {
+                            item = item.style(Style::default().magenta());
+                        }
+                        item
+                    }
+                    RangeRow::Missing(path) => {
+                        let name = path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        ListItem::new(format!("  {name}  失踪")).style(pal.dim_style())
+                    }
+                })
+                .collect()
+        };
         let list = List::new(items)
             .block(
                 Block::default()
                     .title(if self.local_filter.is_empty() {
-                        format!(
-                            " 曲库 · {} · {} · {} ",
-                            self.browse_kind.label(),
-                            self.prefs.sort_mode.label_zh(),
-                            self.prefs.shuffle_mode.label_zh()
-                        )
+                        self.slot_title()
                     } else {
                         format!(
                             " {} · {} · {} ",
@@ -2527,9 +3043,11 @@ impl App {
             format!(":{}", self.command.clone().unwrap_or_default())
         } else {
             match self.tab {
-                Tab::Music => "q/e tab  1曲库 2作者  /find  y库  t设置  ^k帮助  ^q退出".into(),
+                Tab::Music => {
+                    "q/e tab  1全部 2-9列表  ←→切列表  x菜单  y库  :playlist  ^q退出".into()
+                }
                 Tab::Player => {
-                    "q/e tab  l歌词  g EQ  space  n/p  ↑↓音量  t设置  ^k帮助  ^q退出".into()
+                    "q/e tab  l歌词  g EQ  space  n/p  ←→seek  t设置  ^k帮助  ^q退出".into()
                 }
                 Tab::Me => "q/e tab  听歌时长/最爱  t设置  ^k帮助  ^q退出".into(),
             }
@@ -2591,43 +3109,251 @@ impl App {
         );
     }
 
-    fn draw_library(&self, frame: &mut ratatui::Frame<'_>) {
-        let queued = self.meta_queue.len() + self.meta_inflight.len();
-        let tagged = browse::tagged_indices(&self.metas).len();
-        let untagged = self.tracks.len().saturating_sub(tagged);
-        let rows = [
-            format!("排序        {}", self.prefs.sort_mode.label_zh()),
-            format!("随机        {}", self.prefs.shuffle_mode.label_zh()),
-            format!(
-                "分类        {}  {}/{}",
-                self.browse_kind.label(),
-                tagged,
-                untagged
-            ),
-            format!(
-                "扫元数据    {}",
-                if queued == 0 {
-                    "6路并行".into()
-                } else {
-                    format!("排队 {queued}")
-                }
-            ),
-            "关闭".into(),
+    fn draw_library(&mut self, frame: &mut ratatui::Frame<'_>) {
+        let pal = self.palette();
+        let area = centered_pct(frame.area(), 80, 80);
+        frame.render_widget(Clear, area);
+        let title = format!(" library · {} ", self.tracks.len());
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().yellow())
+            .style(Style::default().bg(pal.panel()).fg(Palette::rgb(pal.text)));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(6)])
+            .split(inner);
+        let kinds = [
+            BrowseKind::All,
+            BrowseKind::Tagged,
+            BrowseKind::Untagged,
+            BrowseKind::Artists,
+            BrowseKind::Albums,
         ];
+        let mut tabs = Vec::new();
+        for kind in kinds {
+            let active = kind == self.browse_kind;
+            tabs.push(Span::styled(
+                format!(" {} ", kind.label()),
+                if active {
+                    pal.highlight()
+                } else {
+                    pal.dim_style()
+                },
+            ));
+        }
+        let queued = self.meta_queue.len() + self.meta_inflight.len();
+        tabs.push(Span::raw("  "));
+        tabs.push(Span::styled(
+            format!("排序 {}", self.prefs.sort_mode.label_zh()),
+            pal.text_style(),
+        ));
+        tabs.push(Span::raw("  "));
+        tabs.push(Span::styled(
+            if queued == 0 {
+                "扫库 闲".into()
+            } else {
+                format!("扫库 {queued}")
+            },
+            pal.dim_style(),
+        ));
+        if let Some(name) = self.lib_group.as_ref() {
+            tabs.push(Span::raw("  "));
+            tabs.push(Span::styled(format!("▸ {name}"), pal.text_style()));
+        }
+        frame.render_widget(Paragraph::new(Line::from(tabs)), rows[0]);
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+            .split(rows[1]);
+        self.draw_lib_detail(frame, cols[0]);
+        self.draw_lib_list(frame, cols[1]);
+    }
+
+    fn draw_lib_detail(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let pal = self.palette();
+        match self.lib_rows().get(self.lib_row) {
+            Some(LibRow::Group { name, tracks }) => {
+                let lines = vec![
+                    Line::from(Span::styled(name.clone(), pal.peak_style())),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("{} 首", tracks.len()),
+                        pal.text_style(),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled("Enter 进入  Backspace 返回", pal.dim_style())),
+                ];
+                frame.render_widget(
+                    Paragraph::new(lines).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(pal.dim_style()),
+                    ),
+                    area,
+                );
+            }
+            Some(LibRow::Track(i)) => {
+                let meta = self.metas.get(*i).and_then(|m| m.as_ref());
+                let track = self.tracks.get(*i);
+                let title = meta
+                    .map(|m| m.title.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| track.map(|t| t.title.as_str()))
+                    .unwrap_or("—");
+                let artist = meta
+                    .map(|m| m.artist.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("—");
+                let album = meta
+                    .map(|m| m.album.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("—");
+                let ext = track
+                    .and_then(|t| t.path.extension())
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("?")
+                    .to_ascii_uppercase();
+                let has_cover = meta.is_some_and(|m| m.cover.is_some() || m.cover_path.is_some());
+                let has_lyrics = meta.is_some_and(|m| !m.lyrics.is_empty());
+                let inner = area.inner(ratatui::layout::Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                });
+                let parts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(4), Constraint::Length(7)])
+                    .split(inner);
+                let cover_lines = match meta.and_then(|m| m.cover.as_ref()) {
+                    Some(cover) => letterbox_cover(Some(cover), parts[0].width, parts[0].height),
+                    None => vec![Line::from(Span::styled("无封面", pal.dim_style()))
+                        .alignment(Alignment::Center)],
+                };
+                frame.render_widget(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(pal.dim_style()),
+                    area,
+                );
+                frame.render_widget(
+                    Paragraph::new(cover_lines).alignment(Alignment::Center),
+                    parts[0],
+                );
+                let info = vec![
+                    Line::from(Span::styled(artist.to_string(), pal.text_style())),
+                    Line::from(Span::styled(
+                        title.to_string(),
+                        pal.peak_style().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(format!("{album} · {ext}"), pal.dim_style())),
+                    Line::from(Span::styled(
+                        format!(
+                            "{} · {}",
+                            if has_cover { "有封面" } else { "无封面" },
+                            if has_lyrics { "有歌词" } else { "无歌词" }
+                        ),
+                        pal.dim_style(),
+                    )),
+                    Line::from(Span::styled("u 补全  x 菜单", pal.dim_style())),
+                ];
+                frame.render_widget(Paragraph::new(info), parts[1]);
+            }
+            None => {
+                frame.render_widget(
+                    Paragraph::new("空").style(pal.dim_style()).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(pal.dim_style()),
+                    ),
+                    area,
+                );
+            }
+        }
+    }
+
+    fn draw_lib_list(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let pal = self.palette();
+        let items: Vec<ListItem> = self
+            .lib_rows()
+            .into_iter()
+            .map(|row| match row {
+                LibRow::Track(i) => {
+                    let name = self
+                        .tracks
+                        .get(i)
+                        .and_then(|t| t.path.file_name())
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| {
+                            self.tracks
+                                .get(i)
+                                .map(|t| t.title.clone())
+                                .unwrap_or_default()
+                        });
+                    ListItem::new(name)
+                }
+                LibRow::Group { name, tracks } => {
+                    ListItem::new(format!("{name}  {} 首", tracks.len()))
+                }
+            })
+            .collect();
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(pal.dim_style()),
+            )
+            .style(pal.text_style())
+            .highlight_style(pal.highlight())
+            .highlight_symbol("▶ ");
+        frame.render_stateful_widget(list, area, &mut self.lib_state);
+    }
+
+    fn draw_context(&self, frame: &mut ratatui::Frame<'_>) {
+        let pal = self.palette();
+        let rows = self.context_actions();
         let items: Vec<ListItem> = rows
             .iter()
             .enumerate()
             .map(|(i, row)| {
-                let mark = if i == self.library_idx { "▸ " } else { "  " };
+                let mark = if i == self.context_idx { "▸ " } else { "  " };
                 ListItem::new(format!("{mark}{row}"))
             })
             .collect();
-        let area = centered(frame.area(), 36, 10);
-        let pal = self.palette();
+        let area = centered(
+            frame.area(),
+            28,
+            (rows.len() as u16).saturating_add(2).max(5),
+        );
         frame.render_widget(Clear, area);
         frame.render_widget(
             List::new(items)
-                .block(self.overlay_block(" library ", Style::default().yellow()))
+                .block(self.overlay_block(" 操作 ", Style::default().yellow()))
+                .style(pal.text_style())
+                .highlight_style(pal.highlight()),
+            area,
+        );
+    }
+
+    fn draw_context_add(&self, frame: &mut ratatui::Frame<'_>) {
+        let pal = self.palette();
+        let items: Vec<ListItem> = self
+            .playlists
+            .lists
+            .iter()
+            .enumerate()
+            .map(|(i, list)| {
+                let mark = if i == self.context_idx { "▸ " } else { "  " };
+                ListItem::new(format!("{mark}{}  {}", i + 2, list.name))
+            })
+            .collect();
+        let h = (self.playlists.lists.len() as u16).saturating_add(2).max(5);
+        let area = centered(frame.area(), 32, h);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            List::new(items)
+                .block(self.overlay_block(" 加到 ", Style::default().yellow()))
                 .style(pal.text_style())
                 .highlight_style(pal.highlight()),
             area,
@@ -2635,7 +3361,7 @@ impl App {
     }
 
     fn draw_help_modal(&self, frame: &mut ratatui::Frame<'_>) {
-        let text = "q/e 切栏   1曲库 2作者   / 元数据检索\n空格 播放暂停   n/p 下一首上一首\nl 歌词   g 均衡器   t 设置   y 曲库\nEsc 关搜索/弹窗   Ctrl+F 打开文件夹   Ctrl+K 帮助\nCtrl+Q 退出   +/- 音量   ←→ 快进快退";
+        let text = "q/e 切栏   1全部 2-9列表  ←→切列表  x菜单\n空格 播放暂停   n/p 下一首上一首\nl 歌词   g 均衡器   t 设置   y 曲库\n:playlist 名字  新建   :playlist-rm 删当前\nEsc 关搜索/弹窗   Ctrl+Q 退出   播放器tab ←→ 快进快退";
         let area = centered(frame.area(), 52, 10);
         frame.render_widget(Clear, area);
         frame.render_widget(
@@ -2716,6 +3442,12 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width: width.min(area.width),
         height: height.min(area.height),
     }
+}
+
+fn centered_pct(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
+    let width = (area.width as u32 * width_pct as u32 / 100).max(20) as u16;
+    let height = (area.height as u32 * height_pct as u32 / 100).max(12) as u16;
+    centered(area, width.min(area.width), height.min(area.height))
 }
 
 fn overlay_scrim(area: Rect) -> Rect {
