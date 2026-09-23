@@ -18,22 +18,31 @@ Optional argument: a library directory.
 | Key | Action |
 |---|---|
 | `q` / `e` | Previous / next tab |
-| `1` / `2` | Library / artists |
+| `1` | All library (music tab) |
+| `2`–`9` | Jump user playlist (empty slot refuses) |
+| `←` / `→` | Cycle playlists (music) / seek 5s (player) |
+| `x` | Context menu (add / fetch / play / remove) |
+| `y` | Large library window (whole library, not play range) |
 | `j` `k` or arrows | Move |
 | Space | Play / pause |
-| `n` / `p` | Next / previous |
+| `n` / `p` | Next / previous (current list) |
 | `l` | Lyrics (player tab) |
 | `g` | EQ |
 | `t` | Settings |
+| `s` | Cycle shuffle |
 | `/` | Find local |
 | `?` | Search Netease/QQ via SPlayer |
 | `o` | Loop |
 | `m` | Mix mode |
 | `r` | Remix |
+| `:playlist 名字` | Create user list (max 8) |
+| `:playlist-rm` | Delete current user list |
 | `Ctrl+F` | Open folder |
 | `Ctrl+K` | Help |
 | `Esc` | Close search / overlay (does not quit) |
 | `Ctrl+Q` | Quit |
+
+Playlists live in `~/.local/share/zradio/playlists.json`. Slot `1` is the whole library; slots `2`–`9` are user lists. The current list is the play range for `n` / shuffle / loop. Missing files stay in the JSON, render gray, and are skipped.
 
 Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume.
 
