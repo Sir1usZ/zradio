@@ -13,6 +13,7 @@ pub mod fetch;
 pub mod library;
 pub mod meta;
 pub mod mpris;
+pub mod playlist;
 pub mod prefs;
 pub mod progress;
 pub mod remix;
