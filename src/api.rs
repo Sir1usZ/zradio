@@ -23,8 +23,10 @@ pub struct ApiSnapshot {
     pub library: Vec<TrackInfo>,
     /// 偏好设置快照
     pub prefs: Option<PrefsSnapshot>,
-    /// 当前歌词
+    /// 当前歌词（时间戳行，播放器内部用）
     pub lyrics: Vec<LyricLine>,
+    /// 全库完整 LRC 文本，下标对齐曲目序号；空字符串表示没有歌词
+    pub lyrics_lrc: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -388,25 +390,19 @@ fn handle_lyrics(path: &str, state: &SharedState) -> serde_json::Value {
         Err(_) => return err("state lock"),
     };
 
-    // 如果请求的是当前曲目，返回缓存的歌词
-    let target = index.or(snap.track.as_ref().map(|t| t.index));
-    if let Some(idx) = target {
-        if snap.track.as_ref().is_some_and(|t| t.index == idx) && !snap.lyrics.is_empty() {
-            return ok(serde_json::json!({
-                "index": idx,
-                "lyrics": snap.lyrics,
-            }));
-        }
-        if let Some(track) = snap.library.iter().find(|t| t.index == idx) {
-            return ok(serde_json::json!({
-                "index": idx,
-                "has_lyrics": track.has_lyrics,
-                "note": if track.has_lyrics { "lyrics available" } else { "no lyrics embedded" },
-            }));
-        }
+    let idx = match index.or(snap.track.as_ref().map(|t| t.index)) {
+        Some(i) => i,
+        None => return err("track not found"),
+    };
+    if snap.library.iter().all(|t| t.index != idx) && snap.lyrics_lrc.get(idx).is_none() {
+        return err("track not found");
     }
-
-    err("track not found")
+    let lrc = snap.lyrics_lrc.get(idx).cloned().unwrap_or_default();
+    ok(serde_json::json!({
+        "index": idx,
+        "lrc": lrc,
+        "has_lyrics": !lrc.is_empty(),
+    }))
 }
 
 // ── 模式查询 ───────────────────────────────────────────────────
@@ -879,5 +875,47 @@ mod tests {
         }));
         let resp = handle_library_full(&state);
         assert_eq!(resp["data"]["total"], 2);
+    }
+
+    fn sample_track(index: usize, title: &str) -> TrackInfo {
+        TrackInfo {
+            index,
+            title: title.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn lyrics_returns_complete_lrc_for_any_index() {
+        let lrc = "[00:12.50]hello\n[01:03.00]world\n";
+        let state = Arc::new(Mutex::new(ApiSnapshot {
+            library: vec![sample_track(0, "A"), sample_track(1, "B")],
+            lyrics_lrc: vec![String::new(), lrc.into()],
+            lyrics: vec![LyricLine {
+                time: 0.0,
+                text: "cached current only".into(),
+            }],
+            track: Some(sample_track(0, "A")),
+            ..Default::default()
+        }));
+        let resp = handle_lyrics("/lyrics/1", &state);
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["data"]["index"], 1);
+        assert_eq!(resp["data"]["lrc"], lrc);
+        assert_eq!(resp["data"]["has_lyrics"], true);
+        assert!(resp["data"].get("lyrics").is_none() || resp["data"]["lyrics"].is_null());
+    }
+
+    #[test]
+    fn lyrics_empty_when_track_has_none() {
+        let state = Arc::new(Mutex::new(ApiSnapshot {
+            library: vec![sample_track(0, "A")],
+            lyrics_lrc: vec![String::new()],
+            ..Default::default()
+        }));
+        let resp = handle_lyrics("/lyrics/0", &state);
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["data"]["lrc"], "");
+        assert_eq!(resp["data"]["has_lyrics"], false);
     }
 }

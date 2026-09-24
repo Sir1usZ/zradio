@@ -178,12 +178,12 @@ curl -s http://localhost:18765/track/3 | jq
 {"ok": true, "data": {"index": 3, "has_cover": true}}
 ```
 
-### `/lyrics/:index` — 歌词
+### `/lyrics/:index` — 完整 LRC
 
-返回当前播放曲目的歌词（带时间戳）。
+任意曲目下标都返回完整 LRC 文本。没有歌词时 `lrc` 为空字符串。省略 index 时用正在播的那首。
 
 ```bash
-curl -s http://localhost:18765/lyrics/3 | jq
+curl -s http://localhost:18765/lyrics/3 | jq -r '.data.lrc'
 ```
 
 ```json
@@ -191,10 +191,8 @@ curl -s http://localhost:18765/lyrics/3 | jq
   "ok": true,
   "data": {
     "index": 3,
-    "lyrics": [
-      {"time": 0.0, "text": "Somehow I wake up"},
-      {"time": 4.5, "text": "I found my way back home"}
-    ]
+    "has_lyrics": true,
+    "lrc": "[00:00.00]Somehow I wake up\n[00:04.50]I found my way back home\n"
   }
 }
 ```

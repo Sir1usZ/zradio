@@ -2081,7 +2081,7 @@ impl App {
             })
             .collect();
 
-        // 当前歌词
+        // 当前歌词（时间戳行）+ 全库完整 LRC
         let lyrics: Vec<api::LyricLine> = current_idx
             .and_then(|idx| self.metas.get(idx))
             .and_then(|m| m.as_ref())
@@ -2095,6 +2095,15 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        let lyrics_lrc: Vec<String> = self
+            .metas
+            .iter()
+            .map(|slot| {
+                slot.as_ref()
+                    .map(|m| crate::meta::format_lrc(&m.lyrics))
+                    .unwrap_or_default()
+            })
+            .collect();
 
         // 偏好快照
         let prefs = Some(api::PrefsSnapshot {
@@ -2117,6 +2126,7 @@ impl App {
         snap.total_listen_secs = self.taste.total_listen_secs();
         snap.library = library;
         snap.lyrics = lyrics;
+        snap.lyrics_lrc = lyrics_lrc;
         snap.prefs = prefs;
     }
 
