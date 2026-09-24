@@ -156,7 +156,7 @@ enum LibRow {
     Group { name: String, tracks: Vec<usize> },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ContextTarget {
     Track(usize),
     Missing(PathBuf),
@@ -587,6 +587,23 @@ impl App {
             Some(RangeRow::Missing(path)) => Some(ContextTarget::Missing(path.clone())),
             None => None,
         }
+    }
+
+    fn playing_context_target(&self) -> Option<ContextTarget> {
+        self.player
+            .mixer
+            .lock()
+            .ok()
+            .and_then(|m| m.snapshot(0).current)
+            .map(ContextTarget::Track)
+    }
+
+    fn context_target_for_current_tab(&self) -> Option<ContextTarget> {
+        let playing = self.playing_context_target().and_then(|t| match t {
+            ContextTarget::Track(i) => Some(i),
+            ContextTarget::Missing(_) => None,
+        });
+        context_target_for_tab(self.tab, self.selected_context_target(), playing)
     }
 
     fn context_actions(&self) -> Vec<&'static str> {
@@ -1227,9 +1244,15 @@ impl App {
                 self.lib_group = None;
                 self.clamp_lib_row();
             }
-            KeyCode::Char('x') => match self.selected_context_target() {
+            KeyCode::Char('x') => match self.context_target_for_current_tab() {
                 Some(target) => self.open_context(target),
-                None => self.status = "没有可选曲目".into(),
+                None => {
+                    self.status = if self.tab == Tab::Player {
+                        "没有正在播放".into()
+                    } else {
+                        "没有可选曲目".into()
+                    };
+                }
             },
             KeyCode::Char('g') if self.tab == Tab::Player => {
                 self.overlay = Overlay::Eq;
@@ -3046,9 +3069,7 @@ impl App {
                 Tab::Music => {
                     "q/e tab  1全部 2-9列表  ←→切列表  x菜单  y库  :playlist  ^q退出".into()
                 }
-                Tab::Player => {
-                    "q/e tab  l歌词  g EQ  space  n/p  ←→seek  t设置  ^k帮助  ^q退出".into()
-                }
+                Tab::Player => "q/e tab  x当前曲  l歌词  g EQ  space  n/p  ←→seek  ^q退出".into(),
                 Tab::Me => "q/e tab  听歌时长/最爱  t设置  ^k帮助  ^q退出".into(),
             }
         })
@@ -3361,8 +3382,8 @@ impl App {
     }
 
     fn draw_help_modal(&self, frame: &mut ratatui::Frame<'_>) {
-        let text = "q/e 切栏   1全部 2-9列表  ←→切列表  x菜单\n空格 播放暂停   n/p 下一首上一首\nl 歌词   g 均衡器   t 设置   y 曲库\n:playlist 名字  新建   :playlist-rm 删当前\nEsc 关搜索/弹窗   Ctrl+Q 退出   播放器tab ←→ 快进快退";
-        let area = centered(frame.area(), 52, 10);
+        let text = "q/e 切栏   1全部 2-9列表  ←→切列表\n音乐tab x 高亮曲   播放器tab x 正在播\n空格 播放暂停   n/p 下一首上一首\nl 歌词   g 均衡器   t 设置   y 曲库\n:playlist 名字  新建   :playlist-rm 删当前\nEsc 关搜索/弹窗   Ctrl+Q 退出   播放器tab ←→ 快进快退";
+        let area = centered(frame.area(), 52, 11);
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(text)
@@ -3414,6 +3435,18 @@ fn esc_outcome(search_open: bool, local_open: bool) -> EscOutcome {
 
 fn visible_row(visible: &[usize], track_index: usize) -> Option<usize> {
     visible.iter().position(|&i| i == track_index)
+}
+
+fn context_target_for_tab(
+    tab: Tab,
+    highlighted: Option<ContextTarget>,
+    playing: Option<usize>,
+) -> Option<ContextTarget> {
+    match tab {
+        Tab::Music => highlighted,
+        Tab::Player => playing.map(ContextTarget::Track),
+        Tab::Me => None,
+    }
 }
 
 fn on_off(v: bool) -> &'static str {
@@ -3527,5 +3560,35 @@ mod tests {
         let visible = [4, 9, 12];
         assert_eq!(visible_row(&visible, 9), Some(1));
         assert_eq!(visible_row(&visible, 0), None);
+    }
+
+    #[test]
+    fn music_tab_x_uses_highlighted_row() {
+        let highlighted = Some(ContextTarget::Track(3));
+        assert_eq!(
+            context_target_for_tab(Tab::Music, highlighted.clone(), Some(0)),
+            highlighted
+        );
+    }
+
+    #[test]
+    fn player_tab_x_uses_playing_track() {
+        let highlighted = Some(ContextTarget::Track(3));
+        assert_eq!(
+            context_target_for_tab(Tab::Player, highlighted, Some(7)),
+            Some(ContextTarget::Track(7))
+        );
+        assert_eq!(
+            context_target_for_tab(Tab::Player, Some(ContextTarget::Track(3)), None),
+            None
+        );
+    }
+
+    #[test]
+    fn me_tab_x_does_nothing() {
+        assert_eq!(
+            context_target_for_tab(Tab::Me, Some(ContextTarget::Track(3)), Some(7)),
+            None
+        );
     }
 }

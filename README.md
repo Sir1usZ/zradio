@@ -21,7 +21,7 @@ Optional argument: a library directory.
 | `1` | All library (music tab) |
 | `2`–`9` | Jump user playlist (empty slot refuses) |
 | `←` / `→` | Cycle playlists (music) / seek 5s (player) |
-| `x` | Context menu (add / fetch / play / remove) |
+| `x` | Context menu: highlighted track (music) / now playing (player) |
 | `y` | Large library window (whole library, not play range) |
 | `j` `k` or arrows | Move |
 | Space | Play / pause |
