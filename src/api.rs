@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,6 +28,8 @@ pub struct ApiSnapshot {
     pub lyrics: Vec<LyricLine>,
     /// 全库完整 LRC 文本，下标对齐曲目序号；空字符串表示没有歌词
     pub lyrics_lrc: Vec<String>,
+    /// 封面缓存路径，下标对齐曲目序号；按需读盘，不进 /library/full
+    pub cover_paths: Vec<Option<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -161,6 +164,13 @@ fn handle_connection(
 
     if method == "OPTIONS" {
         return send_cors_preflight(&mut stream);
+    }
+
+    if method == "GET" && path.starts_with("/cover/") {
+        return match cover_bytes_for(path, state) {
+            Some((mime, bytes)) => send_bytes(&mut stream, 200, mime, &bytes),
+            None => send_json(&mut stream, 200, &err("cover not found")),
+        };
     }
 
     let response = route(method, path, &body, tx, state);
@@ -340,13 +350,17 @@ fn handle_track(path: &str, state: &SharedState) -> serde_json::Value {
                 "info": track,
                 "bpm": snap.snapshot.as_ref().and_then(|s| s.current_bpm),
                 "key": snap.snapshot.as_ref().and_then(|s| s.current_key.clone()),
+                "cover": cover_json_at(index, &snap),
             }));
         }
     }
 
     // 从完整资料库中查找
     if let Some(track) = snap.library.iter().find(|t| t.index == index) {
-        return ok(serde_json::json!({"info": track}));
+        return ok(serde_json::json!({
+            "info": track,
+            "cover": cover_json_at(index, &snap),
+        }));
     }
 
     err("track not found")
@@ -364,18 +378,30 @@ fn handle_cover(path: &str, state: &SharedState) -> serde_json::Value {
         Err(_) => return err("state lock"),
     };
 
-    if let Some(track) = snap
-        .library
-        .iter()
-        .find(|t| t.index == index.or(snap.track.as_ref().map(|t| t.index)).unwrap_or(0))
-    {
-        return ok(serde_json::json!({
-            "index": track.index,
-            "has_cover": track.has_cover,
-        }));
+    let idx = index.or(snap.track.as_ref().map(|t| t.index));
+    let Some(idx) = idx else {
+        return err("track not found");
+    };
+    match cover_bytes_at(idx, &snap) {
+        Some((mime, bytes)) => ok(serde_json::json!({
+            "index": idx,
+            "has_cover": true,
+            "mime": mime,
+            "data": encode_base64(&bytes),
+        })),
+        None => {
+            if snap.library.iter().any(|t| t.index == idx) {
+                ok(serde_json::json!({
+                    "index": idx,
+                    "has_cover": false,
+                    "mime": serde_json::Value::Null,
+                    "data": serde_json::Value::Null,
+                }))
+            } else {
+                err("track not found")
+            }
+        }
     }
-
-    err("track not found")
 }
 
 fn handle_lyrics(path: &str, state: &SharedState) -> serde_json::Value {
@@ -723,12 +749,103 @@ fn handle_search(body: &str, state: &SharedState) -> serde_json::Value {
 //  辅助函数
 // ══════════════════════════════════════════════════════════════════
 
+fn parse_index_suffix(path: &str, prefix: &str) -> Option<usize> {
+    path.trim_start_matches(prefix)
+        .split('/')
+        .next()
+        .and_then(|s| s.parse::<usize>().ok())
+}
+
+fn cover_mime(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "image/jpeg",
+    }
+}
+
+fn encode_base64(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn cover_bytes_at(index: usize, snap: &ApiSnapshot) -> Option<(&'static str, Vec<u8>)> {
+    let path = snap.cover_paths.get(index).and_then(|p| p.as_ref())?;
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some((cover_mime(path), bytes))
+}
+
+fn cover_json_at(index: usize, snap: &ApiSnapshot) -> serde_json::Value {
+    match cover_bytes_at(index, snap) {
+        Some((mime, bytes)) => serde_json::json!({
+            "mime": mime,
+            "data": encode_base64(&bytes),
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn cover_bytes_for(path: &str, state: &SharedState) -> Option<(&'static str, Vec<u8>)> {
+    let snap = state.lock().ok()?;
+    let idx = parse_index_suffix(path, "/cover/").or(snap.track.as_ref().map(|t| t.index))?;
+    cover_bytes_at(idx, &snap)
+}
+
 fn ok(data: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"ok": true, "data": data})
 }
 
 fn err(msg: impl Into<String>) -> serde_json::Value {
     serde_json::json!({"ok": false, "error": msg.into()})
+}
+
+fn send_bytes(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> std::io::Result<()> {
+    let status_text = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "Error",
+    };
+    let header = format!(
+        "HTTP/1.1 {status} {status_text}\r\n\
+         Content-Type: {mime}\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Content-Type\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body)?;
+    Ok(())
 }
 
 fn send_json(stream: &mut TcpStream, status: u16, body: &serde_json::Value) -> std::io::Result<()> {
@@ -917,5 +1034,80 @@ mod tests {
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["data"]["lrc"], "");
         assert_eq!(resp["data"]["has_lyrics"], false);
+    }
+
+    fn temp_cover(bytes: &[u8], ext: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "zradio-cover-{}-{}-{}.{}",
+            std::process::id(),
+            nanos,
+            bytes.len(),
+            ext
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn track_info_returns_album_cover() {
+        let jpeg = b"\xff\xd8\xfffakejpeg";
+        let path = temp_cover(jpeg, "jpg");
+        let mut info = sample_track(1, "B");
+        info.has_cover = true;
+        let state = Arc::new(Mutex::new(ApiSnapshot {
+            library: vec![sample_track(0, "A"), info],
+            cover_paths: vec![None, Some(path)],
+            ..Default::default()
+        }));
+        let resp = handle_track("/track/1", &state);
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["data"]["info"]["title"], "B");
+        assert_eq!(resp["data"]["cover"]["mime"], "image/jpeg");
+        assert_eq!(
+            resp["data"]["cover"]["data"].as_str().unwrap(),
+            "/9j/ZmFrZWpwZWc="
+        );
+    }
+
+    #[test]
+    fn encode_base64_pads() {
+        assert_eq!(encode_base64(b"\xff\xd8\xfffakejpeg"), "/9j/ZmFrZWpwZWc=");
+        assert_eq!(encode_base64(b"abc"), "YWJj");
+    }
+
+    #[test]
+    fn library_full_omits_cover_bytes() {
+        let path = temp_cover(b"\xff\xd8\xffsecret", "jpg");
+        let mut info = sample_track(0, "A");
+        info.has_cover = true;
+        let state = Arc::new(Mutex::new(ApiSnapshot {
+            library: vec![info],
+            cover_paths: vec![Some(path)],
+            ..Default::default()
+        }));
+        let resp = handle_library_full(&state);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("secret"));
+        assert!(!json.contains("image/jpeg"));
+        assert_eq!(resp["data"]["tracks"][0]["has_cover"], true);
+    }
+
+    #[test]
+    fn cover_endpoint_reads_file_bytes() {
+        let jpeg = b"\xff\xd8\xffcover";
+        let path = temp_cover(jpeg, "jpg");
+        let state = Arc::new(Mutex::new(ApiSnapshot {
+            library: vec![sample_track(2, "C")],
+            cover_paths: vec![None, None, Some(path)],
+            ..Default::default()
+        }));
+        let (mime, bytes) = cover_bytes_for("/cover/2", &state).expect("cover");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(bytes, jpeg);
+        assert!(cover_bytes_for("/cover/0", &state).is_none());
     }
 }

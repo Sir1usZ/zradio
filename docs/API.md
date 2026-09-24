@@ -155,7 +155,9 @@ curl -s http://localhost:18765/library/full | jq '.data.tracks[:5]'
 }
 ```
 
-### `/track/:index` — 曲目详情
+### `/track/:index` — 曲目详情（含封面）
+
+返回元数据，以及专辑封面（JPEG/PNG 的 base64）。没有封面时 `cover` 为 `null`。`/status` 和 `/library/full` 不带封面字节。
 
 ```bash
 curl -s http://localhost:18765/track/3 | jq
@@ -165,17 +167,20 @@ curl -s http://localhost:18765/track/3 | jq
 {
   "ok": true,
   "data": {
-    "info": { "index": 3, "title": "Levels", "artist": "Avicii", ... },
+    "info": { "index": 3, "title": "Levels", "artist": "Avicii", "has_cover": true, ... },
     "bpm": 128.0,
-    "key": "8A"
+    "key": "8A",
+    "cover": { "mime": "image/jpeg", "data": "/9j/..." }
   }
 }
 ```
 
-### `/cover/:index` — 封面信息
+### `/cover/:index` — 封面原图
 
-```json
-{"ok": true, "data": {"index": 3, "has_cover": true}}
+返回图片字节（`Content-Type: image/jpeg` 或 `image/png`），不是 JSON。没有封面时仍是 JSON 错误。
+
+```bash
+curl -s http://localhost:18765/cover/3 -o cover.jpg
 ```
 
 ### `/lyrics/:index` — 完整 LRC

@@ -2124,9 +2124,16 @@ impl App {
         snap.eq = eq;
         snap.taste_top = taste_top;
         snap.total_listen_secs = self.taste.total_listen_secs();
+        let cover_paths: Vec<Option<std::path::PathBuf>> = self
+            .metas
+            .iter()
+            .map(|slot| slot.as_ref().and_then(|m| m.cover_path.clone()))
+            .collect();
+
         snap.library = library;
         snap.lyrics = lyrics;
         snap.lyrics_lrc = lyrics_lrc;
+        snap.cover_paths = cover_paths;
         snap.prefs = prefs;
     }
 
