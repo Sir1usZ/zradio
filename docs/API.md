@@ -1,6 +1,6 @@
 # ZRadio Remote Control API
 
-HTTP JSON API，用于远程控制 ZRadio 播放器。监听 `0.0.0.0:18765`，支持 CORS，浏览器/手机/脚本可直接调用。
+HTTP JSON API，用于远程控制 ZRadio 播放器。监听 `0.0.0.0:18765`，支持 CORS。除 `GET /cover/:index` 返回图片字节外，其余响应都是 JSON。
 
 ## 快速开始
 
@@ -16,18 +16,24 @@ curl -X POST http://localhost:18765/control -d '{"action":"pause"}'
 
 # 下一曲
 curl -X POST http://localhost:18765/control -d '{"action":"next"}'
+
+# 当前曲完整 LRC
+curl -s http://localhost:18765/lyrics/3 | jq -r '.data.lrc'
+
+# 当前曲封面（图片字节）
+curl -s http://localhost:18765/cover/3 -o cover.jpg
 ```
 
 ## 基础信息
 
 - **地址:** `http://<host>:18765`
-- **协议:** HTTP/1.1 JSON
-- **CORS:** 完全开放（`Access-Control-Allow-Origin: *`）
-- **认证:** 无（仅限本地/可信网络使用）
+- **协议:** HTTP/1.1。默认 JSON；`GET /cover/:index` 成功时是图片字节
+- **CORS:** `Access-Control-Allow-Origin: *`
+- **认证:** 无（仅限本地/可信网络）
 
 ## 响应格式
 
-所有响应遵循统一格式：
+JSON 响应统一为：
 
 ```json
 {
@@ -51,7 +57,7 @@ curl -X POST http://localhost:18765/control -d '{"action":"next"}'
 
 ### `/status` — 完整状态
 
-返回播放状态、当前曲目、EQ、资料库、口味统计、偏好设置。
+返回播放状态、当前曲目、EQ、资料库、口味统计、偏好设置。`current_track` 只有 `has_cover` / `has_lyrics` 标记，不含封面字节和 LRC 文本。封面用 `/track/:index` 或 `/cover/:index`，歌词用 `/lyrics/:index`。
 
 ```bash
 curl -s http://localhost:18765/status | jq
@@ -129,7 +135,7 @@ curl -s http://localhost:18765/health | jq
 
 ### `/library/full` — 完整曲目列表
 
-返回所有曲目的标题、歌手、专辑、路径、是否有封面/歌词。
+返回所有曲目的标题、歌手、专辑、路径、是否有封面/歌词。不含封面字节，不含 LRC 文本。
 
 ```bash
 curl -s http://localhost:18765/library/full | jq '.data.tracks[:5]'
@@ -157,7 +163,7 @@ curl -s http://localhost:18765/library/full | jq '.data.tracks[:5]'
 
 ### `/track/:index` — 曲目详情（含封面）
 
-返回元数据，以及专辑封面（JPEG/PNG 的 base64）。没有封面时 `cover` 为 `null`。`/status` 和 `/library/full` 不带封面字节。
+返回该曲元数据，以及专辑封面的 base64。没有封面时 `cover` 为 `null`。正在播的那首额外带 `bpm` / `key`。`/status` 和 `/library/full` 不带封面字节。封面只在这首已经扫过 meta、磁盘上有缓存文件时才有。
 
 ```bash
 curl -s http://localhost:18765/track/3 | jq
@@ -167,25 +173,42 @@ curl -s http://localhost:18765/track/3 | jq
 {
   "ok": true,
   "data": {
-    "info": { "index": 3, "title": "Levels", "artist": "Avicii", "has_cover": true, ... },
+    "info": {
+      "index": 3,
+      "title": "Levels",
+      "artist": "Avicii",
+      "album": "True",
+      "path": "/home/xender/music/Avicii/True/Levels.mp3",
+      "has_cover": true,
+      "has_lyrics": true
+    },
     "bpm": 128.0,
     "key": "8A",
-    "cover": { "mime": "image/jpeg", "data": "/9j/..." }
+    "cover": { "mime": "image/jpeg", "data": "/9j/4AAQ..." }
   }
 }
 ```
 
+`cover.mime` 按缓存文件后缀：`jpg` → `image/jpeg`，`png` → `image/png`。`data` 是标准 base64（带 `=` 填充）。
+
 ### `/cover/:index` — 封面原图
 
-返回图片字节（`Content-Type: image/jpeg` 或 `image/png`），不是 JSON。没有封面时仍是 JSON 错误。
+成功时返回图片字节，不是 JSON。`Content-Type` 为 `image/jpeg` 或 `image/png`。可直接当 `<img src>`。路径必须带斜杠：`/cover/3`。`/cover/`（无数字）回落到正在播的那首。`/cover` 无斜杠会 `not found`。
+
+没有封面或下标无效时仍是 JSON，HTTP 仍是 200：
+
+```json
+{"ok": false, "error": "cover not found"}
+```
 
 ```bash
 curl -s http://localhost:18765/cover/3 -o cover.jpg
+file cover.jpg
 ```
 
 ### `/lyrics/:index` — 完整 LRC
 
-任意曲目下标都返回完整 LRC 文本。没有歌词时 `lrc` 为空字符串。省略 index 时用正在播的那首。
+任意曲目下标都返回完整 LRC 文本（由已解析的时间戳行重建，`[mm:ss.cc]text`）。不含 `[ti:]` / `[ar:]` 一类标签。没有歌词时 `lrc` 为空字符串、`has_lyrics` 为 `false`。路径必须带斜杠：`/lyrics/3`。`/lyrics/`（无数字）回落到正在播的那首。`/lyrics` 无斜杠会 `not found`。
 
 ```bash
 curl -s http://localhost:18765/lyrics/3 | jq -r '.data.lrc'
@@ -541,12 +564,21 @@ curl -X POST http://localhost:18765/search \
 
 ---
 
+## 手机 App 拿封面和歌词
+
+轮询 `GET /status` 只看播放进度和 `current_track.index`。不要把封面或 LRC 塞进这段轮询。
+
+1. 记下 `data.current_track.index`
+2. `GET /lyrics/{index}` 取完整 LRC（`data.lrc`）
+3. 封面二选一：`GET /cover/{index}` 拿原图，或 `GET /track/{index}` 拿 JSON + base64
+4. 切歌后再拉一次。`has_cover` / `has_lyrics` 为 false 时先 `POST /meta/scan`，等这首扫完再试
+
 ## 架构
 
 ```
 手机/浏览器/脚本
        │
-       ▼ HTTP JSON
+       ▼ HTTP（JSON；/cover 成功时是图片字节）
 ┌─────────────────┐
 │  API Server     │  0.0.0.0:18765
 │  (api.rs)       │

@@ -62,20 +62,26 @@ If `cava` is on `PATH`, bars use it; otherwise internal FFT.
 
 ## Remote Control API
 
-HTTP JSON API on port `18765`，手机/浏览器/脚本可远程控制播放器。
+HTTP API on port `18765`。控制、状态、歌词是 JSON；`GET /cover/:index` 成功时是图片字节。`/status` 和 `/library/full` 不含封面或 LRC。
 
 ```bash
-# 查看状态
+# 状态（无封面字节）
 curl -s http://localhost:18765/status | jq
+
+# 完整 LRC
+curl -s http://localhost:18765/lyrics/3 | jq -r '.data.lrc'
+
+# 封面原图
+curl -s http://localhost:18765/cover/3 -o cover.jpg
+
+# 曲目详情（含封面 base64）
+curl -s http://localhost:18765/track/3 | jq '.data.cover.mime'
 
 # 播放
 curl -X POST http://localhost:18765/control -d '{"action":"play"}'
-
-# 设置随机为口味加权
-curl -X POST http://localhost:18765/control -d '{"action":"set_shuffle","query":"taste"}'
 ```
 
-**[→ 完整 API 文档](docs/API.md)**
+完整接口见 [docs/API.md](docs/API.md)。
 
 ## License
 
