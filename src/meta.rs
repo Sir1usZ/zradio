@@ -131,6 +131,22 @@ pub fn load_meta(path: &Path, fallback_title: &str) -> TrackMeta {
     meta
 }
 
+pub fn format_lrc(lines: &[LyricLine]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        let total_cs = (line.time * 100.0).round() as i64;
+        let total_cs = total_cs.max(0);
+        let minutes = total_cs / 6000;
+        let seconds = (total_cs % 6000) / 100;
+        let centis = total_cs % 100;
+        out.push_str(&format!(
+            "[{minutes:02}:{seconds:02}.{centis:02}]{}\n",
+            line.text
+        ));
+    }
+    out
+}
+
 pub fn parse_lyrics(raw: &str) -> Vec<LyricLine> {
     let mut lines = Vec::new();
     for line in raw.lines() {
@@ -361,6 +377,13 @@ mod tests {
         assert!((lyrics[0].time - 12.5).abs() < 1e-3);
         assert_eq!(lyrics[0].text, "hello");
         assert!((lyrics[1].time - 63.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn format_lrc_writes_complete_file() {
+        let lyrics = parse_lyrics("[00:12.50]hello\n[01:03]world");
+        assert_eq!(format_lrc(&lyrics), "[00:12.50]hello\n[01:03.00]world\n");
+        assert_eq!(format_lrc(&[]), "");
     }
 
     #[test]
