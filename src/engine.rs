@@ -1201,6 +1201,26 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_copies_a_short_triggered_window() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.play_decoded(0, const_deck(48_000 * 10, 0.5));
+        let mut out = vec![0.0; 48_000];
+        mixer.fill(&mut out);
+        let snap = mixer.snapshot(0);
+        assert!(
+            snap.pcm.len() <= 2_000,
+            "UI snapshot must not copy the whole ring, got {}",
+            snap.pcm.len()
+        );
+        assert!(
+            snap.pcm.len() >= 1_800,
+            "40ms window at 48kHz should be ~1920, got {}",
+            snap.pcm.len()
+        );
+    }
+
+    #[test]
     fn loop_one_rewinds_instead_of_ending() {
         let mut mixer = Mixer::new(48_000, 2);
         mixer.set_tracks(two_tracks());

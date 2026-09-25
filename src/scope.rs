@@ -77,20 +77,47 @@ impl PcmRing {
     }
 
     pub fn snapshot(&self) -> PcmSnapshot {
-        let len = self.filled;
-        if len == 0 {
+        if self.filled == 0 {
             return PcmSnapshot {
                 samples: Vec::new(),
                 sample_rate: self.sample_rate,
             };
         }
-        let mut samples = vec![0.0; len];
-        let start = (self.pos + CAPACITY - len) & MASK;
-        let head = (CAPACITY - start).min(len);
-        samples[..head].copy_from_slice(&self.samples[start..start + head]);
-        samples[head..].copy_from_slice(&self.samples[..len - head]);
+        let window = window_len(self.sample_rate, self.filled);
+        if window < 2 {
+            return PcmSnapshot {
+                samples: self.copy_newest(self.filled),
+                sample_rate: self.sample_rate,
+            };
+        }
+        let search = ((self.sample_rate as f32 * TRIGGER_SEARCH_MS / 1000.0) as usize)
+            .min(self.filled.saturating_sub(window));
+        let mut buf = self.copy_newest(window + search);
+        let start = trigger_offset_slice(&buf, self.sample_rate, window);
+        if start > 0 {
+            buf.copy_within(start..start + window, 0);
+        }
+        buf.truncate(window);
         PcmSnapshot {
-            samples,
+            samples: buf,
+            sample_rate: self.sample_rate,
+        }
+    }
+
+    fn copy_newest(&self, n: usize) -> Vec<f32> {
+        let n = n.min(self.filled);
+        let mut samples = vec![0.0; n];
+        let start = (self.pos + CAPACITY - n) & MASK;
+        let head = (CAPACITY - start).min(n);
+        samples[..head].copy_from_slice(&self.samples[start..start + head]);
+        samples[head..].copy_from_slice(&self.samples[..n - head]);
+        samples
+    }
+
+    #[cfg(test)]
+    pub(crate) fn linearize(&self) -> PcmSnapshot {
+        PcmSnapshot {
+            samples: self.copy_newest(self.filled),
             sample_rate: self.sample_rate,
         }
     }
@@ -106,24 +133,31 @@ impl PcmSnapshot {
     }
 }
 
-fn window_frames(snap: &PcmSnapshot) -> usize {
-    if snap.sample_rate == 0 {
+fn window_len(sample_rate: u32, available: usize) -> usize {
+    if sample_rate == 0 {
         return 0;
     }
-    let by_time = (snap.sample_rate as f32 * WINDOW_MS / 1000.0) as usize;
-    by_time.min(snap.len())
+    ((sample_rate as f32 * WINDOW_MS / 1000.0) as usize).min(available)
+}
+
+fn window_frames(snap: &PcmSnapshot) -> usize {
+    window_len(snap.sample_rate, snap.len())
 }
 
 pub(crate) fn trigger_offset(snap: &PcmSnapshot, window: usize) -> usize {
-    if snap.len() < window {
+    trigger_offset_slice(&snap.samples, snap.sample_rate, window)
+}
+
+fn trigger_offset_slice(samples: &[f32], sample_rate: u32, window: usize) -> usize {
+    if samples.len() < window {
         return 0;
     }
-    let latest = snap.len() - window;
-    let search = ((snap.sample_rate as f32 * TRIGGER_SEARCH_MS / 1000.0) as usize).min(latest);
+    let latest = samples.len() - window;
+    let search = ((sample_rate as f32 * TRIGGER_SEARCH_MS / 1000.0) as usize).min(latest);
     let begin = latest - search;
 
     let mut peak = 0.0f32;
-    for &v in &snap.samples[begin..latest] {
+    for &v in &samples[begin..latest] {
         peak = peak.max(v.abs());
     }
     let hysteresis = (peak * TRIGGER_HYSTERESIS).max(TRIGGER_FLOOR);
@@ -131,7 +165,7 @@ pub(crate) fn trigger_offset(snap: &PcmSnapshot, window: usize) -> usize {
     let mut armed = false;
     let mut found = None;
     for i in begin..latest {
-        let v = snap.samples[i];
+        let v = samples[i];
         if v <= -hysteresis {
             armed = true;
         } else if armed && v >= 0.0 {
@@ -290,7 +324,7 @@ mod tests {
         for chunk in data.chunks(512) {
             ring.push(chunk, RATE);
         }
-        let snap = ring.snapshot();
+        let snap = ring.linearize();
         assert_eq!(snap.len(), CAPACITY);
         assert_eq!(snap.sample_rate, RATE);
         assert_eq!(snap.samples[0], (total - CAPACITY) as f32);
