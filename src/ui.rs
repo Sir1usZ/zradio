@@ -2978,11 +2978,16 @@ impl App {
         let pal = self.palette();
         let spec = crate::spectrum::Spectrum::from_levels(snap.spectrum_levels);
         let mode = self.prefs.visualize;
-        let rows = match mode {
-            crate::prefs::VisualizeMode::Oscilloscope => spec.scope_sized(area.height, area.width),
-            crate::prefs::VisualizeMode::Cnm => spec.cnm_sized(area.height, area.width),
-            _ => spec.bars_sized(area.height, area.width),
+        let pcm = if mode == crate::prefs::VisualizeMode::Oscilloscope {
+            self.player
+                .mixer
+                .try_lock()
+                .map(|m| m.pcm_snapshot())
+                .unwrap_or_default()
+        } else {
+            crate::scope::PcmSnapshot::default()
         };
+        let rows = visualize_rows(mode, &spec, &pcm, area.height, area.width);
         let peak = spec.peak();
         let h = area.height as usize;
         let buf = frame.buffer_mut();
@@ -2999,14 +3004,10 @@ impl App {
                 let x = area.x + col as u16;
                 let color = if ch == ' ' {
                     Color::Reset
-                } else if mode == crate::prefs::VisualizeMode::Cnm {
+                } else if mode == crate::prefs::VisualizeMode::Cnm
+                    || mode == crate::prefs::VisualizeMode::Oscilloscope
+                {
                     Color::Rgb(cnm_fg.0, cnm_fg.1, cnm_fg.2)
-                } else if mode == crate::prefs::VisualizeMode::Oscilloscope {
-                    if ch == '━' || ch == '─' {
-                        Palette::rgb(pal.peak)
-                    } else {
-                        Palette::rgb(pal.accent)
-                    }
                 } else if peak > 0.72 && from_bottom + 1 >= (peak * h as f32 * 1.8) as usize {
                     Palette::rgb(pal.peak)
                 } else if from_bottom <= 1 {
@@ -3602,6 +3603,20 @@ fn dup2_stderr(file: &std::fs::File) {
 #[cfg(not(unix))]
 fn dup2_stderr(_file: &std::fs::File) {}
 
+fn visualize_rows(
+    mode: crate::prefs::VisualizeMode,
+    spec: &crate::spectrum::Spectrum,
+    pcm: &crate::scope::PcmSnapshot,
+    height: u16,
+    width: u16,
+) -> Vec<String> {
+    match mode {
+        crate::prefs::VisualizeMode::Oscilloscope => crate::scope::rasterize(pcm, width, height),
+        crate::prefs::VisualizeMode::Cnm => spec.cnm_sized(height, width),
+        _ => spec.bars_sized(height, width),
+    }
+}
+
 fn stderr_log_path() -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -3689,5 +3704,39 @@ mod tests {
         assert!(event_needs_redraw(&Event::FocusGained));
         assert!(!event_needs_redraw(&Event::FocusLost));
         assert!(!event_needs_redraw(&Event::Paste("x".into())));
+    }
+
+    #[test]
+    fn oscilloscope_uses_pcm_not_fft_bands() {
+        let mut bands = [0.1; crate::spectrum::BANDS];
+        bands[0] = 0.9;
+        bands[23] = 0.8;
+        let spec = crate::spectrum::Spectrum::from_levels(bands);
+        let pcm = crate::scope::PcmSnapshot::default();
+        let rows = visualize_rows(
+            crate::prefs::VisualizeMode::Oscilloscope,
+            &spec,
+            &pcm,
+            8,
+            60,
+        );
+        let bars = spec.bars_sized(8, 60);
+        assert_ne!(rows, bars, "scope must not reuse bar columns");
+        let joined: String = rows.concat();
+        assert!(
+            !joined.contains('━') && !joined.contains('─'),
+            "scope should be braille PCM, got {joined:?}"
+        );
+        let lit: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.chars().any(|c| c != ' '))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            lit.len(),
+            1,
+            "silent PCM should draw one centered line, got {lit:?}"
+        );
     }
 }

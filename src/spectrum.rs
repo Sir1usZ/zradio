@@ -169,48 +169,6 @@ impl Spectrum {
         rows
     }
 
-    #[allow(clippy::needless_range_loop)]
-    pub fn scope_sized(&self, height: u16, width: u16) -> Vec<String> {
-        let h = height.max(1) as usize;
-        let w = width.max(1) as usize;
-        let mid = (h.saturating_sub(1)) / 2;
-        let mut rows = vec![" ".repeat(w).chars().collect::<Vec<char>>(); h];
-        let mut prev_row = mid;
-        for col in 0..w {
-            let band = sample_band(&self.bands, col, w);
-            let signed = (band - 0.35) * 2.2;
-            let offset = (signed * mid as f32).round() as i32;
-            let row = (mid as i32 - offset).clamp(0, h.saturating_sub(1) as i32) as usize;
-            let ch = if row == prev_row {
-                '━'
-            } else if row < prev_row {
-                '╱'
-            } else {
-                '╲'
-            };
-            rows[row][col] = ch;
-            if row != prev_row {
-                let (lo, hi) = if row < prev_row {
-                    (row + 1, prev_row)
-                } else {
-                    (prev_row + 1, row)
-                };
-                for cells in rows.iter_mut().take(hi).skip(lo) {
-                    if cells[col] == ' ' {
-                        cells[col] = '│';
-                    }
-                }
-            }
-            prev_row = row;
-        }
-        for cell in &mut rows[mid] {
-            if *cell == ' ' {
-                *cell = '─';
-            }
-        }
-        rows.into_iter().map(|r| r.into_iter().collect()).collect()
-    }
-
     pub fn levels(&self) -> [f32; BANDS] {
         self.bands
     }
@@ -359,24 +317,6 @@ mod tests {
         assert_ne!(rows, bars, "cnm must not reuse packed bars");
         let mid = &rows[rows.len() / 2];
         assert!(mid.contains(' '), "cnm bars should leave gaps, got {mid:?}");
-    }
-
-    #[test]
-    fn scope_is_a_waveform_not_columns() {
-        let mut bands = [0.1; BANDS];
-        bands[0] = 0.9;
-        bands[11] = 0.05;
-        bands[23] = 0.8;
-        let spec = Spectrum::from_levels(bands);
-        let scope = spec.scope_sized(5, 24);
-        let bars = spec.bars_sized(5, 24);
-        assert_eq!(scope.len(), 5);
-        assert_ne!(scope, bars, "scope must not reuse bar columns");
-        let mid = &scope[scope.len() / 2];
-        assert!(
-            mid.contains('━') || mid.contains('─') || mid.contains('╱') || mid.contains('╲'),
-            "scope should draw a midline waveform, got {mid:?}"
-        );
     }
 
     #[test]
