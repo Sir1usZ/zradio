@@ -39,7 +39,6 @@ pub struct Snapshot {
     pub current_bpm: Option<f32>,
     pub current_key: Option<String>,
     pub next_hint: Option<String>,
-    pub spectrum: Vec<String>,
     pub spectrum_levels: [f32; 24],
     pub shuffle: bool,
     pub loop_mode: LoopMode,
@@ -700,7 +699,6 @@ impl Mixer {
                 .analysis_at_current()
                 .and_then(|a| a.camelot.map(|c| c.label())),
             next_hint: self.next_hint(),
-            spectrum: self.spectrum.bars(if self.paused { 4 } else { 8 }),
             spectrum_levels: self.spectrum.levels(),
             shuffle: self.shuffle,
             loop_mode: self.loop_mode,
@@ -774,27 +772,44 @@ impl Mixer {
         if ch == 0 {
             return;
         }
+        let hop = 32;
+        let mut hop_i = 0usize;
+        let mut mono = [0.0f32; 512];
+        let mut mono_n = 0usize;
         for frame in out.chunks_mut(ch) {
             let stereo = self.next_stereo();
             let stereo = self.eq.process_stereo(stereo);
+            let left = stereo[0] * self.volume;
+            let right = stereo[1] * self.volume;
             match ch {
-                1 => frame[0] = (stereo[0] + stereo[1]) * 0.5 * self.volume,
+                1 => frame[0] = (left + right) * 0.5,
                 _ => {
-                    frame[0] = stereo[0] * self.volume;
+                    frame[0] = left;
                     if frame.len() > 1 {
-                        frame[1] = stereo[1] * self.volume;
+                        frame[1] = right;
                     }
                     for s in frame.iter_mut().skip(2) {
                         *s = 0.0;
                     }
                 }
             }
+            if hop_i == 0 {
+                self.spectrum.push_fft_frame(left);
+            }
+            hop_i += 1;
+            if hop_i == hop {
+                hop_i = 0;
+            }
+            if mono_n == mono.len() {
+                self.pcm.push(&mono, self.sample_rate);
+                mono_n = 0;
+            }
+            mono[mono_n] = (left + right) * 0.5;
+            mono_n += 1;
         }
-        let hop = (ch.max(1) * 32).max(1);
-        for sample in out.iter().step_by(hop) {
-            self.spectrum.push_fft_frame(*sample);
+        if mono_n > 0 {
+            self.pcm.push(&mono[..mono_n], self.sample_rate);
         }
-        self.pcm.push_interleaved(out, ch, self.sample_rate);
     }
 
     pub fn pcm_snapshot(&self) -> PcmSnapshot {

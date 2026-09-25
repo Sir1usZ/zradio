@@ -65,7 +65,7 @@ Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `
 ## Visualize
 
 - `bars` — packed columns
-- `scope` — real PCM oscilloscope (rising-edge trigger, single polyline)
+- `scope` — real PCM oscilloscope (rising-edge trigger, thin half-block line)
 - `cnm` — gapped density bars with a baseline and vertical gradient (look inspired by CNMPlayer, independently implemented)
 
 If `cava` is on `PATH`, bars use it; otherwise internal FFT.

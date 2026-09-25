@@ -180,14 +180,12 @@ fn sample_row(v: f32, height: usize) -> usize {
     ((1.0 - v) * 0.5 * span).round().clamp(0.0, span) as usize
 }
 
-fn stroke(prev: usize, row: usize) -> char {
-    if row == prev {
-        '━'
-    } else if row < prev {
-        '╱'
-    } else {
-        '╲'
-    }
+fn sample_half(v: f32, height: usize) -> (usize, char) {
+    let steps = (height * 2).saturating_sub(1) as f32;
+    let y = ((1.0 - v) * 0.5 * steps).round().clamp(0.0, steps) as usize;
+    let row = (y / 2).min(height.saturating_sub(1));
+    let ch = if y.is_multiple_of(2) { '▀' } else { '▄' };
+    (row, ch)
 }
 
 pub fn rasterize(snap: &PcmSnapshot, width: u16, height: u16) -> Vec<String> {
@@ -203,26 +201,13 @@ pub fn rasterize(snap: &PcmSnapshot, width: u16, height: u16) -> Vec<String> {
     let start = trigger_offset(snap, window);
     let samples = &snap.samples[start..start + window];
     let n = samples.len();
-    let mut prev = mid;
+    #[allow(clippy::needless_range_loop)]
     for col in 0..w {
         let begin = col * n / w;
         let end = ((col + 1) * n / w).clamp(begin + 1, n);
         let v = samples[begin..end].iter().copied().sum::<f32>() / (end - begin) as f32;
-        let row = sample_row(v, h);
-        grid[row][col] = stroke(prev, row);
-        if row != prev {
-            let (lo, hi) = if row < prev {
-                (row + 1, prev)
-            } else {
-                (prev + 1, row)
-            };
-            for cells in grid.iter_mut().take(hi).skip(lo) {
-                if cells[col] == ' ' {
-                    cells[col] = '│';
-                }
-            }
-        }
-        prev = row;
+        let (row, ch) = sample_half(v, h);
+        grid[row][col] = ch;
     }
     grid.into_iter().map(|r| r.into_iter().collect()).collect()
 }
@@ -321,6 +306,10 @@ mod tests {
         assert!(rows[lit[0]]
             .chars()
             .all(|c| c == '─' || c == '━' || c == '-'));
+        assert!(
+            !joined.contains('╱') && !joined.contains('╲') && !joined.contains('│'),
+            "scope must not fill triangles between samples"
+        );
     }
 
     #[test]
@@ -342,11 +331,42 @@ mod tests {
             Some(7),
             "bottom row untouched: {lit:?}"
         );
+        assert!(
+            !joined.contains('╱') && !joined.contains('╲') && !joined.contains('│'),
+            "scope must not fill triangles between samples"
+        );
         for col in 0..60 {
-            let any = rows
+            let lit_in_col = rows
                 .iter()
-                .any(|row| row.chars().nth(col).is_some_and(|c| c != ' '));
-            assert!(any, "column {col} is empty");
+                .filter(|row| row.chars().nth(col).is_some_and(|c| c != ' '))
+                .count();
+            assert_eq!(
+                lit_in_col, 1,
+                "column {col} should light exactly one cell, got {lit_in_col}"
+            );
+        }
+    }
+
+    #[test]
+    fn waveform_is_a_thin_twisted_line() {
+        let window = (RATE as f32 * WINDOW_MS / 1000.0) as usize;
+        let rows = rasterize(&snapshot_from(sine(440.0, 0.0, window * 4)), 40, 10);
+        let joined: String = rows.concat();
+        assert!(
+            !joined.contains('╱') && !joined.contains('╲') && !joined.contains('│'),
+            "twisted line must not use triangle connectors, got {joined:?}"
+        );
+        let half = joined.chars().filter(|c| *c == '▄' || *c == '▀').count();
+        assert!(
+            half > 0,
+            "waveform should use half-block dots, got {joined:?}"
+        );
+        for col in 0..40 {
+            let lit_in_col = rows
+                .iter()
+                .filter(|row| row.chars().nth(col).is_some_and(|c| c != ' '))
+                .count();
+            assert_eq!(lit_in_col, 1, "column {col} lit {lit_in_col} cells");
         }
     }
 

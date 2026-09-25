@@ -2996,11 +2996,7 @@ impl App {
                 let color = if ch == ' ' {
                     Color::Reset
                 } else if mode == crate::prefs::VisualizeMode::Oscilloscope {
-                    if ch == '━' || ch == '─' {
-                        Palette::rgb(pal.peak)
-                    } else {
-                        Palette::rgb(pal.accent)
-                    }
+                    Palette::rgb(pal.accent)
                 } else if mode == crate::prefs::VisualizeMode::Cnm {
                     Color::Rgb(cnm_fg.0, cnm_fg.1, cnm_fg.2)
                 } else if peak > 0.72 && from_bottom + 1 >= (peak * h as f32 * 1.8) as usize {
@@ -3725,11 +3721,15 @@ mod tests {
             "scope must be a single line, not braille, got {joined:?}"
         );
         assert!(
+            !joined.contains('╱') && !joined.contains('╲') && !joined.contains('│'),
+            "scope must not fill triangles, got {joined:?}"
+        );
+        assert!(
             joined.contains('━')
                 || joined.contains('─')
-                || joined.contains('╱')
-                || joined.contains('╲'),
-            "scope should draw a polyline, got {joined:?}"
+                || joined.contains('▄')
+                || joined.contains('▀'),
+            "scope should draw a thin twisted line, got {joined:?}"
         );
         let lit: Vec<usize> = rows
             .iter()
