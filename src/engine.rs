@@ -18,6 +18,7 @@ use crate::eq::Equalizer;
 use crate::library::Track;
 use crate::prefs::ShuffleMode;
 use crate::remix::RemixMode;
+use crate::scope::{PcmRing, PcmSnapshot};
 use crate::spectrum::Spectrum;
 
 const FADE_SECS: f32 = 6.0;
@@ -154,6 +155,7 @@ pub struct Mixer {
     taste_boosts: Vec<f32>,
     eq: Equalizer,
     playable: Option<Vec<usize>>,
+    pcm: PcmRing,
 }
 
 impl Mixer {
@@ -187,6 +189,7 @@ impl Mixer {
             taste_boosts: Vec::new(),
             eq: Equalizer::new(sample_rate, [0.0; 5]),
             playable: None,
+            pcm: PcmRing::new(),
         }
     }
 
@@ -350,6 +353,7 @@ impl Mixer {
             deck.seek_seconds(now + seconds, sr);
             self.status = format!("seek {seconds:+.0}s");
         }
+        self.pcm.reset();
         self.clear_ahead();
     }
 
@@ -359,6 +363,7 @@ impl Mixer {
             deck.seek_seconds(seconds, sr);
             self.status = format!("seek {seconds:.0}s");
         }
+        self.pcm.reset();
         self.clear_ahead();
     }
 
@@ -392,6 +397,7 @@ impl Mixer {
         self.current = Some(Deck::from_buf(buf));
         self.paused = false;
         self.done = false;
+        self.pcm.reset();
         self.status = self.play_status(index);
     }
 
@@ -786,6 +792,11 @@ impl Mixer {
         for sample in out.iter().step_by(hop) {
             self.spectrum.push_fft_frame(*sample);
         }
+        self.pcm.push_interleaved(out, ch, self.sample_rate);
+    }
+
+    pub fn pcm_snapshot(&self) -> PcmSnapshot {
+        self.pcm.snapshot()
     }
 
     pub fn refresh_spectrum(&mut self) {
@@ -1133,6 +1144,45 @@ mod tests {
         mixer.seek_by(4.0);
         mixer.seek_to(2.0);
         assert_eq!(mixer.current.as_ref().unwrap().pos, 48_000 * 2);
+    }
+
+    #[test]
+    fn fill_pushes_mixed_pcm_into_the_scope_ring() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.play_decoded(0, const_deck(100, 0.5));
+        let mut out = vec![0.0; 8];
+        mixer.fill(&mut out);
+        let snap = mixer.pcm_snapshot();
+        assert_eq!(snap.len(), 4);
+        assert_eq!(snap.sample_rate, 48_000);
+        for &v in &snap.samples {
+            assert!((v - 0.45).abs() < 1e-4, "got {v}");
+        }
+    }
+
+    #[test]
+    fn seek_resets_the_scope_ring() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.play_decoded(0, const_deck(48_000 * 10, 0.5));
+        let mut out = vec![0.0; 8];
+        mixer.fill(&mut out);
+        assert!(!mixer.pcm_snapshot().samples.is_empty());
+        mixer.seek_to(1.0);
+        assert_eq!(mixer.pcm_snapshot().len(), 0);
+    }
+
+    #[test]
+    fn play_decoded_resets_the_scope_ring() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.play_decoded(0, const_deck(48_000 * 10, 0.5));
+        let mut out = vec![0.0; 8];
+        mixer.fill(&mut out);
+        assert!(!mixer.pcm_snapshot().is_empty());
+        mixer.play_decoded(1, const_deck(48_000 * 10, 0.2));
+        assert_eq!(mixer.pcm_snapshot().len(), 0);
     }
 
     #[test]

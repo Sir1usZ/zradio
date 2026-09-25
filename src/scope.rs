@@ -15,7 +15,7 @@ pub struct PcmRing {
     sample_rate: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PcmSnapshot {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
@@ -51,6 +51,26 @@ impl PcmRing {
         self.filled = (self.filled + src.len()).min(CAPACITY);
     }
 
+    pub fn push_interleaved(&mut self, interleaved: &[f32], channels: usize, sample_rate: u32) {
+        if interleaved.is_empty() || channels == 0 {
+            return;
+        }
+        self.sample_rate = sample_rate;
+        let frames = interleaved.len() / channels;
+        let skip = frames.saturating_sub(CAPACITY);
+        for i in skip..frames {
+            let base = i * channels;
+            let mono = if channels == 1 {
+                interleaved[base]
+            } else {
+                (interleaved[base] + interleaved.get(base + 1).copied().unwrap_or(0.0)) * 0.5
+            };
+            self.samples[self.pos] = mono;
+            self.pos = (self.pos + 1) & MASK;
+            self.filled = (self.filled + 1).min(CAPACITY);
+        }
+    }
+
     pub fn reset(&mut self) {
         self.pos = 0;
         self.filled = 0;
@@ -80,14 +100,9 @@ impl PcmSnapshot {
     pub fn len(&self) -> usize {
         self.samples.len()
     }
-}
 
-impl Default for PcmSnapshot {
-    fn default() -> Self {
-        Self {
-            samples: Vec::new(),
-            sample_rate: 0,
-        }
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
     }
 }
 
@@ -214,7 +229,12 @@ pub fn rasterize(snap: &PcmSnapshot, width: u16, height: u16) -> Vec<String> {
         draw_flat_line(&mut grid, w_cells, h_cells);
     } else {
         let start = trigger_offset(snap, window);
-        draw_channel(&mut grid, w_cells, h_cells, &snap.samples[start..start + window]);
+        draw_channel(
+            &mut grid,
+            w_cells,
+            h_cells,
+            &snap.samples[start..start + window],
+        );
     }
     let mut rows = Vec::with_capacity(h_cells);
     for row in 0..h_cells {
