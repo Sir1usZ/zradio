@@ -2995,9 +2995,9 @@ impl App {
                 let x = area.x + col as u16;
                 let color = if ch == ' ' {
                     Color::Reset
-                } else if mode == crate::prefs::VisualizeMode::Oscilloscope {
-                    Palette::rgb(pal.accent)
-                } else if mode == crate::prefs::VisualizeMode::Cnm {
+                } else if mode == crate::prefs::VisualizeMode::Cnm
+                    || mode == crate::prefs::VisualizeMode::Oscilloscope
+                {
                     Color::Rgb(cnm_fg.0, cnm_fg.1, cnm_fg.2)
                 } else if peak > 0.72 && from_bottom + 1 >= (peak * h as f32 * 1.8) as usize {
                     Palette::rgb(pal.peak)
@@ -3715,21 +3715,17 @@ mod tests {
         assert_ne!(rows, bars, "scope must not reuse bar columns");
         let joined: String = rows.concat();
         assert!(
-            !joined
+            joined
                 .chars()
                 .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
-            "scope must be a single line, not braille, got {joined:?}"
+            "scope must be braille PCM, got {joined:?}"
         );
         assert!(
-            !joined.contains('╱') && !joined.contains('╲') && !joined.contains('│'),
-            "scope must not fill triangles, got {joined:?}"
-        );
-        assert!(
-            joined.contains('━')
-                || joined.contains('─')
-                || joined.contains('▄')
-                || joined.contains('▀'),
-            "scope should draw a thin twisted line, got {joined:?}"
+            !joined.contains('━')
+                && !joined.contains('─')
+                && !joined.contains('▄')
+                && !joined.contains('▀'),
+            "scope should not use box or half-block glyphs, got {joined:?}"
         );
         let lit: Vec<usize> = rows
             .iter()

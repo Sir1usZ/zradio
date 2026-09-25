@@ -175,41 +175,114 @@ fn trigger_offset_slice(samples: &[f32], sample_rate: u32, window: usize) -> usi
     found.unwrap_or(latest)
 }
 
-fn sample_row(v: f32, height: usize) -> usize {
-    let span = height.saturating_sub(1) as f32;
-    ((1.0 - v) * 0.5 * span).round().clamp(0.0, span) as usize
+fn sample_row(v: f32, h_px: i32) -> i32 {
+    let span = (h_px - 1) as f32;
+    ((1.0 - v) * 0.5 * span).round().clamp(0.0, span) as i32
 }
 
-fn sample_half(v: f32, height: usize) -> (usize, char) {
-    let steps = (height * 2).saturating_sub(1) as f32;
-    let y = ((1.0 - v) * 0.5 * steps).round().clamp(0.0, steps) as usize;
-    let row = (y / 2).min(height.saturating_sub(1));
-    let ch = if y.is_multiple_of(2) { '▀' } else { '▄' };
-    (row, ch)
+fn braille_bit(dx: usize, dy: usize) -> u8 {
+    match (dx, dy) {
+        (0, 0) => 0x01,
+        (0, 1) => 0x02,
+        (0, 2) => 0x04,
+        (0, 3) => 0x40,
+        (1, 0) => 0x08,
+        (1, 1) => 0x10,
+        (1, 2) => 0x20,
+        (1, 3) => 0x80,
+        _ => 0,
+    }
+}
+
+fn braille_from_bits(bits: u8) -> char {
+    char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
+}
+
+fn set_pixel(grid: &mut [u8], w_cells: usize, h_cells: usize, x: i32, y: i32) {
+    if x < 0 || y < 0 {
+        return;
+    }
+    let w_px = (w_cells * 2) as i32;
+    let h_px = (h_cells * 4) as i32;
+    if x >= w_px || y >= h_px {
+        return;
+    }
+    let cell_x = (x / 2) as usize;
+    let cell_y = (y / 4) as usize;
+    if cell_x >= w_cells || cell_y >= h_cells {
+        return;
+    }
+    let dx = (x % 2) as usize;
+    let dy = (y % 4) as usize;
+    grid[cell_y * w_cells + cell_x] |= braille_bit(dx, dy);
+}
+
+fn draw_channel(grid: &mut [u8], w_cells: usize, h_cells: usize, samples: &[f32]) {
+    let w_px = w_cells * 2;
+    let h_px = (h_cells * 4) as i32;
+    let n = samples.len();
+    if n == 0 || w_px == 0 {
+        return;
+    }
+    let mut prev: Option<(i32, i32)> = None;
+    for col in 0..w_px {
+        let begin = col * n / w_px;
+        let end = ((col + 1) * n / w_px).clamp(begin + 1, n);
+        let (mut lo, mut hi) = (samples[begin], samples[begin]);
+        for &v in &samples[begin..end] {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        let (top, bottom) = (sample_row(hi, h_px), sample_row(lo, h_px));
+        let (mut from, mut to) = (top, bottom);
+        if let Some((prev_top, prev_bottom)) = prev {
+            from = from.min(prev_bottom);
+            to = to.max(prev_top);
+        }
+        for y in from..=to {
+            set_pixel(grid, w_cells, h_cells, col as i32, y);
+        }
+        prev = Some((top, bottom));
+    }
+}
+
+fn draw_flat_line(grid: &mut [u8], w_cells: usize, h_cells: usize) {
+    let zero = sample_row(0.0, (h_cells * 4) as i32);
+    for col in 0..(w_cells * 2) as i32 {
+        set_pixel(grid, w_cells, h_cells, col, zero);
+    }
 }
 
 pub fn rasterize(snap: &PcmSnapshot, width: u16, height: u16) -> Vec<String> {
-    let w = width.max(1) as usize;
-    let h = height.max(1) as usize;
-    let mut grid = vec![vec![' '; w]; h];
-    let mid = sample_row(0.0, h);
+    let w_cells = width.max(1) as usize;
+    let h_cells = height.max(1) as usize;
+    let mut grid = vec![0u8; w_cells * h_cells];
     let window = window_frames(snap);
     if window < 2 {
-        grid[mid].fill('─');
-        return grid.into_iter().map(|r| r.into_iter().collect()).collect();
+        draw_flat_line(&mut grid, w_cells, h_cells);
+    } else {
+        let start = trigger_offset(snap, window);
+        draw_channel(
+            &mut grid,
+            w_cells,
+            h_cells,
+            &snap.samples[start..start + window],
+        );
     }
-    let start = trigger_offset(snap, window);
-    let samples = &snap.samples[start..start + window];
-    let n = samples.len();
-    #[allow(clippy::needless_range_loop)]
-    for col in 0..w {
-        let begin = col * n / w;
-        let end = ((col + 1) * n / w).clamp(begin + 1, n);
-        let v = samples[begin..end].iter().copied().sum::<f32>() / (end - begin) as f32;
-        let (row, ch) = sample_half(v, h);
-        grid[row][col] = ch;
+    let mut rows = Vec::with_capacity(h_cells);
+    for row in 0..h_cells {
+        let mut line = String::with_capacity(w_cells);
+        for col in 0..w_cells {
+            let bits = grid[row * w_cells + col];
+            if bits == 0 {
+                line.push(' ');
+            } else {
+                line.push(braille_from_bits(bits));
+            }
+        }
+        rows.push(line);
     }
-    grid.into_iter().map(|r| r.into_iter().collect()).collect()
+    rows
 }
 
 #[cfg(test)]
@@ -289,8 +362,8 @@ mod tests {
         assert!(rows.iter().all(|r| r.chars().count() == 60));
         let joined: String = rows.concat();
         assert!(
-            !joined.chars().any(is_braille),
-            "scope must be a single line, not braille"
+            joined.chars().any(is_braille),
+            "scope must be braille, got {joined:?}"
         );
         let lit = lit_rows(&rows);
         assert_eq!(
@@ -303,13 +376,7 @@ mod tests {
             "centered line should sit in the middle two rows, got {}",
             lit[0]
         );
-        assert!(rows[lit[0]]
-            .chars()
-            .all(|c| c == '─' || c == '━' || c == '-'));
-        assert!(
-            !joined.contains('╱') && !joined.contains('╲') && !joined.contains('│'),
-            "scope must not fill triangles between samples"
-        );
+        assert!(rows[lit[0]].chars().all(|c| c != ' '));
     }
 
     #[test]
@@ -319,10 +386,8 @@ mod tests {
         let rows = rasterize(&snap, 60, 8);
         let joined: String = rows.concat();
         assert!(
-            !joined
-                .chars()
-                .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
-            "scope must be a single line, not braille"
+            joined.chars().any(is_braille),
+            "scope must be braille, got {joined:?}"
         );
         let lit = lit_rows(&rows);
         assert_eq!(lit.first().copied(), Some(0), "top row untouched: {lit:?}");
@@ -331,42 +396,11 @@ mod tests {
             Some(7),
             "bottom row untouched: {lit:?}"
         );
-        assert!(
-            !joined.contains('╱') && !joined.contains('╲') && !joined.contains('│'),
-            "scope must not fill triangles between samples"
-        );
         for col in 0..60 {
-            let lit_in_col = rows
+            let any = rows
                 .iter()
-                .filter(|row| row.chars().nth(col).is_some_and(|c| c != ' '))
-                .count();
-            assert_eq!(
-                lit_in_col, 1,
-                "column {col} should light exactly one cell, got {lit_in_col}"
-            );
-        }
-    }
-
-    #[test]
-    fn waveform_is_a_thin_twisted_line() {
-        let window = (RATE as f32 * WINDOW_MS / 1000.0) as usize;
-        let rows = rasterize(&snapshot_from(sine(440.0, 0.0, window * 4)), 40, 10);
-        let joined: String = rows.concat();
-        assert!(
-            !joined.contains('╱') && !joined.contains('╲') && !joined.contains('│'),
-            "twisted line must not use triangle connectors, got {joined:?}"
-        );
-        let half = joined.chars().filter(|c| *c == '▄' || *c == '▀').count();
-        assert!(
-            half > 0,
-            "waveform should use half-block dots, got {joined:?}"
-        );
-        for col in 0..40 {
-            let lit_in_col = rows
-                .iter()
-                .filter(|row| row.chars().nth(col).is_some_and(|c| c != ' '))
-                .count();
-            assert_eq!(lit_in_col, 1, "column {col} lit {lit_in_col} cells");
+                .any(|row| row.chars().nth(col).is_some_and(|c| c != ' '));
+            assert!(any, "column {col} is empty");
         }
     }
 
