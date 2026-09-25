@@ -1150,6 +1150,7 @@ impl App {
                 EnableFocusChange
             )?;
         }
+        redirect_stderr_to_log();
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         let tick = Duration::from_millis(33);
         let mut last = Instant::now();
@@ -3570,6 +3571,43 @@ fn stall_needs_redraw(idle: Duration) -> bool {
 
 fn event_needs_redraw(event: &Event) -> bool {
     matches!(event, Event::Resize(_, _) | Event::FocusGained)
+}
+
+fn redirect_stderr_to_log() {
+    let path = stderr_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    dup2_stderr(&file);
+}
+
+#[cfg(unix)]
+fn dup2_stderr(file: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn dup2(oldfd: i32, newfd: i32) -> i32;
+    }
+    // SAFETY: fd 2 is stderr; replacing it with an opened log file keeps
+    // ALSA xrun text off the alternate screen.
+    let _ = unsafe { dup2(file.as_raw_fd(), 2) };
+}
+
+#[cfg(not(unix))]
+fn dup2_stderr(_file: &std::fs::File) {}
+
+fn stderr_log_path() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("zradio").join("alsa.log")
 }
 
 #[cfg(test)]
