@@ -4,11 +4,13 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
-use crossterm::event::EnableBracketedPaste;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event, KeyCode,
+    KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -1137,16 +1139,32 @@ impl App {
                 stdout,
                 EnterAlternateScreen,
                 EnableBracketedPaste,
+                EnableFocusChange,
                 crossterm::style::SetBackgroundColor(crossterm::style::Color::Reset)
             )?;
         } else {
-            execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+            execute!(
+                stdout,
+                EnterAlternateScreen,
+                EnableBracketedPaste,
+                EnableFocusChange
+            )?;
         }
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         let tick = Duration::from_millis(33);
         let mut last = Instant::now();
+        let mut last_wall = SystemTime::now();
         let result = loop {
+            let stalled = stall_needs_redraw(
+                SystemTime::now()
+                    .duration_since(last_wall)
+                    .unwrap_or_default(),
+            );
+            if stalled {
+                terminal.clear()?;
+            }
             terminal.draw(|frame| self.draw(frame))?;
+            last_wall = SystemTime::now();
             let timeout = tick.saturating_sub(last.elapsed());
             if event::poll(timeout)? {
                 match event::read()? {
@@ -1156,6 +1174,7 @@ impl App {
                         }
                     }
                     Event::Paste(text) => self.handle_paste(&text),
+                    other if event_needs_redraw(&other) => terminal.clear()?,
                     _ => {}
                 }
             }
@@ -1197,6 +1216,7 @@ impl App {
         execute!(
             io::stdout(),
             crossterm::event::DisableBracketedPaste,
+            DisableFocusChange,
             LeaveAlternateScreen
         )?;
         result
@@ -3544,6 +3564,14 @@ fn fmt_time(frames: usize, sample_rate: u32) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
+fn stall_needs_redraw(idle: Duration) -> bool {
+    idle >= Duration::from_millis(500)
+}
+
+fn event_needs_redraw(event: &Event) -> bool {
+    matches!(event, Event::Resize(_, _) | Event::FocusGained)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3607,5 +3635,21 @@ mod tests {
             context_target_for_tab(Tab::Me, Some(ContextTarget::Track(3)), Some(7)),
             None
         );
+    }
+
+    #[test]
+    fn sleep_stall_needs_full_redraw() {
+        assert!(!stall_needs_redraw(Duration::from_millis(33)));
+        assert!(!stall_needs_redraw(Duration::from_millis(499)));
+        assert!(stall_needs_redraw(Duration::from_millis(500)));
+        assert!(stall_needs_redraw(Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn resize_and_focus_need_full_redraw() {
+        assert!(event_needs_redraw(&Event::Resize(120, 40)));
+        assert!(event_needs_redraw(&Event::FocusGained));
+        assert!(!event_needs_redraw(&Event::FocusLost));
+        assert!(!event_needs_redraw(&Event::Paste("x".into())));
     }
 }
