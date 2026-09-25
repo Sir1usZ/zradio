@@ -18,6 +18,7 @@ pub mod prefs;
 pub mod progress;
 pub mod remix;
 pub mod remote_meta;
+pub mod scope;
 pub mod session;
 pub mod session_store;
 pub mod shell;
