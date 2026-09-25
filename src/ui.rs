@@ -2978,16 +2978,7 @@ impl App {
         let pal = self.palette();
         let spec = crate::spectrum::Spectrum::from_levels(snap.spectrum_levels);
         let mode = self.prefs.visualize;
-        let pcm = if mode == crate::prefs::VisualizeMode::Oscilloscope {
-            self.player
-                .mixer
-                .try_lock()
-                .map(|m| m.pcm_snapshot())
-                .unwrap_or_default()
-        } else {
-            crate::scope::PcmSnapshot::default()
-        };
-        let rows = visualize_rows(mode, &spec, &pcm, area.height, area.width);
+        let rows = visualize_rows(mode, &spec, &snap.pcm, area.height, area.width);
         let peak = spec.peak();
         let h = area.height as usize;
         let buf = frame.buffer_mut();

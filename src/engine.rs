@@ -43,6 +43,7 @@ pub struct Snapshot {
     pub spectrum_levels: [f32; 24],
     pub shuffle: bool,
     pub loop_mode: LoopMode,
+    pub pcm: crate::scope::PcmSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -703,6 +704,7 @@ impl Mixer {
             spectrum_levels: self.spectrum.levels(),
             shuffle: self.shuffle,
             loop_mode: self.loop_mode,
+            pcm: self.pcm.snapshot(),
         }
     }
 
@@ -1183,6 +1185,19 @@ mod tests {
         assert!(!mixer.pcm_snapshot().is_empty());
         mixer.play_decoded(1, const_deck(48_000 * 10, 0.2));
         assert_eq!(mixer.pcm_snapshot().len(), 0);
+    }
+
+    #[test]
+    fn snapshot_carries_pcm_so_the_ui_does_not_relock() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.play_decoded(0, const_deck(100, 0.5));
+        let mut out = vec![0.0; 8];
+        mixer.fill(&mut out);
+        let snap = mixer.snapshot(0);
+        assert_eq!(snap.pcm.len(), mixer.pcm_snapshot().len());
+        assert_eq!(snap.pcm.samples, mixer.pcm_snapshot().samples);
+        assert_eq!(snap.pcm.sample_rate, 48_000);
     }
 
     #[test]
