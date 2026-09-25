@@ -1,6 +1,22 @@
-# ZRadio
-
-Local-first TUI radio player. AutoMix, taste-weighted queue, lyrics, covers, and spectrum visualization.
+<div align="center">
+  <img src="docs/logo.svg" alt="ZRadio" width="128" height="128" />
+  <h1>ZRadio</h1>
+  <p>Local-first TUI radio player. AutoMix, taste-weighted queue, lyrics, covers, and spectrum visualization.</p>
+  <p>
+    <a href="https://www.rust-lang.org/">
+      <img alt="Rust" src="https://img.shields.io/badge/Rust-dea584?logo=rust&logoColor=black&style=for-the-badge" />
+    </a>
+    <a href="LICENSE">
+      <img alt="MIT License" src="https://img.shields.io/github/license/Sir1usZ/zradio?style=for-the-badge" />
+    </a>
+    <a href="https://github.com/Sir1usZ/zradio/stargazers">
+      <img alt="GitHub stars" src="https://img.shields.io/github/stars/Sir1usZ/zradio?style=for-the-badge" />
+    </a>
+    <a href="https://github.com/Sir1usZ/zradio">
+      <img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/Sir1usZ/zradio?style=for-the-badge" />
+    </a>
+  </p>
+</div>
 
 Default library: `~/音乐`.
 
@@ -62,27 +78,27 @@ If `cava` is on `PATH`, bars use it; otherwise internal FFT.
 
 ## Remote Control API
 
-HTTP API on port `18765`。控制、状态、歌词是 JSON；`GET /cover/:index` 成功时是图片字节。`/status` 和 `/library/full` 不含封面或 LRC。
+HTTP API on port `18765`. Control, status, and lyrics are JSON. `GET /cover/:index` returns image bytes on success. `/status` and `/library/full` do not include cover bytes or LRC text.
 
 ```bash
-# 状态（无封面字节）
+# status (no cover bytes)
 curl -s http://localhost:18765/status | jq
 
-# 完整 LRC
+# full LRC
 curl -s http://localhost:18765/lyrics/3 | jq -r '.data.lrc'
 
-# 封面原图
+# cover image
 curl -s http://localhost:18765/cover/3 -o cover.jpg
 
-# 曲目详情（含封面 base64）
+# track info (cover as base64)
 curl -s http://localhost:18765/track/3 | jq '.data.cover.mime'
 
-# 播放
+# play
 curl -X POST http://localhost:18765/control -d '{"action":"play"}'
 ```
 
-完整接口见 [docs/API.md](docs/API.md)。
+Full API: [docs/API.md](docs/API.md).
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See [LICENSE](LICENSE).

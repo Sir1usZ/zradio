@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="ZRadio">
+  <rect width="128" height="128" rx="28" fill="#232634"/>
+  <!-- radio arcs -->
+  <path d="M40 38c14-12 34-12 48 0" fill="none" stroke="#ca9ee6" stroke-width="5" stroke-linecap="round"/>
+  <path d="M50 48c8-7 20-7 28 0" fill="none" stroke="#8caaee" stroke-width="5" stroke-linecap="round"/>
+  <!-- cnm-style gapped bars -->
+  <g fill="#8caaee">
+    <rect x="26" y="78" width="8" height="22" rx="2"/>
+    <rect x="38" y="68" width="8" height="32" rx="2"/>
+    <rect x="50" y="58" width="8" height="42" rx="2" fill="#99d1db"/>
+    <rect x="62" y="50" width="8" height="50" rx="2" fill="#ca9ee6"/>
+    <rect x="74" y="62" width="8" height="38" rx="2" fill="#99d1db"/>
+    <rect x="86" y="72" width="8" height="28" rx="2"/>
+    <rect x="98" y="82" width="8" height="18" rx="2"/>
+  </g>
+  <rect x="22" y="104" width="84" height="3" rx="1.5" fill="#414559"/>
+</svg>
