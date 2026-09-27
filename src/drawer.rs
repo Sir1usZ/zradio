@@ -1,6 +1,6 @@
 use ratatui::layout::Rect;
 
-pub const DRAWER_MS: u64 = 180;
+pub const DRAWER_MS: u64 = 320;
 pub const DRAWER_SLOTS: usize = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +74,7 @@ impl DrawerAnim {
     }
 
     pub fn visual(self) -> f32 {
-        ease_out_cubic(self.progress)
+        ease_out_quad(self.progress)
     }
 
     pub fn is_visible(self) -> bool {
@@ -94,9 +94,9 @@ pub struct DrawerRow {
     pub active: bool,
 }
 
-pub fn ease_out_cubic(t: f32) -> f32 {
+pub fn ease_out_quad(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
-    1.0 - (1.0 - t).powi(3)
+    1.0 - (1.0 - t).powi(2)
 }
 
 pub fn drawer_open_height(frame_h: u16) -> u16 {
@@ -171,12 +171,13 @@ mod tests {
     }
 
     #[test]
-    fn ease_out_cubic_anchors_and_front_loads() {
-        assert_eq!(ease_out_cubic(0.0), 0.0);
-        assert_eq!(ease_out_cubic(1.0), 1.0);
-        assert!(ease_out_cubic(0.5) > 0.8);
-        assert!(ease_out_cubic(-1.0) == 0.0);
-        assert!(ease_out_cubic(2.0) == 1.0);
+    fn ease_out_quad_anchors_and_eases() {
+        assert_eq!(ease_out_quad(0.0), 0.0);
+        assert_eq!(ease_out_quad(1.0), 1.0);
+        let mid = ease_out_quad(0.5);
+        assert!(mid > 0.7 && mid < 0.8, "quad mid should be 0.75, got {mid}");
+        assert!(ease_out_quad(-1.0) == 0.0);
+        assert!(ease_out_quad(2.0) == 1.0);
     }
 
     #[test]
@@ -206,17 +207,17 @@ mod tests {
     }
 
     #[test]
-    fn tick_opens_in_about_180ms_with_ease() {
+    fn tick_opens_in_about_320ms_with_ease() {
         let mut anim = DrawerAnim::closed();
         anim.open();
         assert_eq!(anim.phase(), DrawerPhase::Opening);
-        anim.tick(90);
+        anim.tick(DRAWER_MS / 2);
         let mid = anim.visual();
         assert!(
-            mid > 0.5,
-            "ease-out should already be past halfway, got {mid}"
+            mid > 0.5 && mid < 0.9,
+            "ease-out quad at halfway should sit near 0.75, got {mid}"
         );
-        anim.tick(90);
+        anim.tick(DRAWER_MS / 2);
         assert_eq!(anim.phase(), DrawerPhase::Open);
         assert_eq!(anim.visual(), 1.0);
     }
@@ -227,10 +228,10 @@ mod tests {
         anim.open();
         anim.tick(DRAWER_MS);
         anim.close();
-        anim.tick(90);
+        anim.tick(DRAWER_MS / 2);
         assert_eq!(anim.phase(), DrawerPhase::Closing);
         assert!(anim.visual() < 1.0);
-        anim.tick(90);
+        anim.tick(DRAWER_MS / 2);
         assert_eq!(anim.phase(), DrawerPhase::Closed);
         assert_eq!(anim.visual(), 0.0);
         assert!(!anim.is_visible());
