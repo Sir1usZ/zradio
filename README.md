@@ -62,6 +62,8 @@ Playlists live in `~/.local/share/zradio/playlists.json`. Slot `1` is the whole 
 
 Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume.
 
+Missing tags / covers / lyrics fill from iTunes + lrclib, then Netease, QQ, and Kugou. Existing fields are kept. Lyrics land in a sidecar `lrc/` file; audio files are not rewritten. SPlayer is only for `?` search/download.
+
 ## Visualize
 
 - `bars` — packed columns

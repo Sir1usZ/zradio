@@ -910,53 +910,24 @@ impl App {
         let need_tags = meta.artist.trim().is_empty() || meta.album.trim().is_empty();
         let cover_on = meta.cover.is_none() && meta.cover_path.is_none() && self.prefs.cover_fetch;
         thread::spawn(move || {
-            let itunes = if need_tags || cover_on {
-                crate::remote_meta::fetch_itunes(&meta.title, &meta.artist, &meta.album)
+            let fill = if need_tags || cover_on || lyrics_on {
+                crate::remote_meta::fetch_remote(
+                    &meta.title,
+                    &meta.artist,
+                    &meta.album,
+                    lyrics_on,
+                    cover_on,
+                )
             } else {
-                None
-            };
-            let lyrics = if lyrics_on {
-                let artist = itunes
-                    .as_ref()
-                    .map(|h| h.artist.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(meta.artist.as_str());
-                let title = itunes
-                    .as_ref()
-                    .map(|h| h.title.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(meta.title.as_str());
-                crate::remote_meta::fetch_lyrics(title, artist)
-            } else {
-                None
-            };
-            let cover = if cover_on {
-                itunes
-                    .as_ref()
-                    .and_then(|h| h.artwork.as_deref())
-                    .and_then(crate::remote_meta::fetch_bytes)
-                    .or_else(|| {
-                        crate::remote_meta::fetch_cover(&meta.title, &meta.artist, &meta.album)
-                    })
-            } else {
-                None
+                crate::remote_meta::RemoteFill::default()
             };
             let _ = tx.send(RemoteMetaJob {
                 index,
-                lyrics,
-                cover,
-                artist: itunes
-                    .as_ref()
-                    .map(|h| h.artist.clone())
-                    .filter(|s| !s.is_empty()),
-                title: itunes
-                    .as_ref()
-                    .map(|h| h.title.clone())
-                    .filter(|s| !s.is_empty()),
-                album: itunes
-                    .as_ref()
-                    .map(|h| h.album.clone())
-                    .filter(|s| !s.is_empty()),
+                lyrics: fill.lyrics,
+                cover: fill.cover,
+                artist: fill.artist,
+                title: fill.title,
+                album: fill.album,
                 path,
             });
         });
