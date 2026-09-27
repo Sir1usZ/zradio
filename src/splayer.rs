@@ -187,9 +187,6 @@ pub fn login_status() -> Login {
             }
         }
     }
-    if cookie_header().is_none() {
-        return Login::anonymous();
-    }
     let login = fetch_login_status();
     if let Ok(mut guard) = cache.lock() {
         *guard = Some((Instant::now(), login.clone()));
@@ -547,21 +544,6 @@ mod tests {
         assert!(!login.logged_in);
         assert!(!login.vip);
         assert_eq!(login.name, "ANON");
-    }
-
-    #[test]
-    fn login_status_without_cookie_does_not_block() {
-        if cookie_header().is_some() {
-            return;
-        }
-        let started = Instant::now();
-        let login = login_status();
-        assert!(
-            started.elapsed().as_millis() < 200,
-            "login_status without cookie must not wait on HTTP, took {:?}",
-            started.elapsed()
-        );
-        assert!(!login.logged_in);
     }
 
     #[test]

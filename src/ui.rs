@@ -109,6 +109,50 @@ struct RemoteMetaJob {
     album: Option<String>,
 }
 
+#[derive(Default)]
+struct LoginPoller {
+    rx: Option<Receiver<splayer::Login>>,
+}
+
+impl LoginPoller {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn request(&mut self) -> bool {
+        self.request_with(splayer::login_status)
+    }
+
+    fn request_with<F>(&mut self, fetch: F) -> bool
+    where
+        F: FnOnce() -> splayer::Login + Send + 'static,
+    {
+        if self.rx.is_some() {
+            return false;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        thread::spawn(move || {
+            let _ = tx.send(fetch());
+        });
+        true
+    }
+
+    fn drain(&mut self) -> Option<splayer::Login> {
+        match self.rx.as_ref()?.try_recv() {
+            Ok(login) => {
+                self.rx = None;
+                Some(login)
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.rx = None;
+                None
+            }
+            Err(TryRecvError::Empty) => None,
+        }
+    }
+}
+
 pub struct App {
     tracks: Vec<Track>,
     list_state: ListState,
@@ -142,6 +186,7 @@ pub struct App {
     search_rx: Receiver<Result<Vec<splayer::Hit>, String>>,
     search_tx: std::sync::mpsc::Sender<Result<Vec<splayer::Hit>, String>>,
     login: splayer::Login,
+    login_poller: LoginPoller,
     local_filter: String,
     local_hits: Vec<usize>,
     local_idx: usize,
@@ -266,6 +311,8 @@ impl App {
         let (peek_tx, peek_rx) = mpsc::channel();
         let (remote_tx, remote_rx) = mpsc::channel();
         let (control_tx, control_rx) = mpsc::channel();
+        let mut login_poller = LoginPoller::new();
+        login_poller.request();
         // 新版 JSON API 替代旧 TCP 控制，监听 0.0.0.0:18765
         let api_state = api::new_shared_state();
         api::start(control_tx, Arc::clone(&api_state));
@@ -325,6 +372,7 @@ impl App {
             search_rx,
             search_tx,
             login: splayer::Login::anonymous(),
+            login_poller,
             local_filter: String::new(),
             local_hits: Vec::new(),
             local_idx: 0,
@@ -1300,8 +1348,11 @@ impl App {
                 self.drain_search();
                 self.drain_control();
                 self.drawer.tick(tick.as_millis() as u64);
+                if let Some(login) = self.login_poller.drain() {
+                    self.login = login;
+                }
                 if self.tick != 0 && self.tick.is_multiple_of(90) {
-                    self.login = splayer::login_status();
+                    self.login_poller.request();
                 }
                 if self.taste_dirty {
                     self.push_taste();
@@ -3991,6 +4042,39 @@ mod tests {
         assert_eq!(visible_window(20, Some(19), 0, 8), (12, 20));
         assert_eq!(visible_window(20, Some(10), 0, 8), (3, 11));
         assert_eq!(visible_window(20, Some(4), 2, 8), (2, 10));
+    }
+
+    #[test]
+    fn login_poller_runs_off_thread_and_deduplicates_requests() {
+        let mut poller = LoginPoller::new();
+        let caller = thread::current().id();
+        let worker = Arc::new(std::sync::Mutex::new(None));
+        let observed = Arc::clone(&worker);
+
+        assert!(poller.request_with(move || {
+            *observed.lock().unwrap() = Some(thread::current().id());
+            splayer::Login {
+                logged_in: true,
+                vip: false,
+                name: "ready".into(),
+            }
+        }));
+        assert!(!poller.request_with(splayer::Login::anonymous));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let login = loop {
+            if let Some(login) = poller.drain() {
+                break login;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background login probe timed out"
+            );
+            thread::yield_now();
+        };
+        assert_eq!(login.name, "ready");
+        assert_ne!(*worker.lock().unwrap(), Some(caller));
+        assert!(poller.request_with(splayer::Login::anonymous));
     }
 
     #[test]
