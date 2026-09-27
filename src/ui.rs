@@ -82,6 +82,17 @@ fn decode_request_is_current(
     inflight == Some(completed) && completed.track.matches(generation, tracks)
 }
 
+fn receive_batch<T>(rx: &Receiver<T>, limit: usize) -> Vec<T> {
+    let mut items = Vec::with_capacity(limit);
+    while items.len() < limit {
+        match rx.try_recv() {
+            Ok(item) => items.push(item),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+    items
+}
+
 struct DecodeJob {
     id: DecodeRequestId,
     transition: bool,
@@ -1183,42 +1194,37 @@ impl App {
 
     fn drain_peek(&mut self) {
         const PEEK_PER_TICK: usize = 24;
-        let mut n = 0;
-        while n < PEEK_PER_TICK {
-            match self.peek_rx.try_recv() {
-                Ok(job) => {
-                    if !job.id.matches(self.library_generation, &self.tracks) {
-                        continue;
-                    }
-                    let index = job.id.index;
-                    if index >= self.metas.len() {
-                        continue;
-                    }
-                    if apply_peek(&mut self.metas[index], job.meta) {
-                        if let Some(title) = self.metas[index]
-                            .as_ref()
-                            .map(|m| m.title.clone())
-                            .filter(|t| !t.is_empty())
-                        {
-                            if let Some(track) = self.tracks.get_mut(index) {
-                                track.title = title;
-                            }
-                        }
-                        n += 1;
-                        if self
-                            .metas
-                            .get(index)
-                            .and_then(|m| m.as_ref())
-                            .is_some_and(|m| self.wants_remote(m))
-                        {
-                            self.queue_meta(index);
-                        }
+        let mut changed = 0;
+        for job in receive_batch(&self.peek_rx, PEEK_PER_TICK) {
+            if !job.id.matches(self.library_generation, &self.tracks) {
+                continue;
+            }
+            let index = job.id.index;
+            if index >= self.metas.len() {
+                continue;
+            }
+            if apply_peek(&mut self.metas[index], job.meta) {
+                if let Some(title) = self.metas[index]
+                    .as_ref()
+                    .map(|m| m.title.clone())
+                    .filter(|t| !t.is_empty())
+                {
+                    if let Some(track) = self.tracks.get_mut(index) {
+                        track.title = title;
                     }
                 }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                changed += 1;
+                if self
+                    .metas
+                    .get(index)
+                    .and_then(|m| m.as_ref())
+                    .is_some_and(|m| self.wants_remote(m))
+                {
+                    self.queue_meta(index);
+                }
             }
         }
-        if n > 0 {
+        if changed > 0 {
             self.mark_meta_changed();
         }
     }
@@ -4075,6 +4081,18 @@ mod tests {
         assert_eq!(login.name, "ready");
         assert_ne!(*worker.lock().unwrap(), Some(caller));
         assert!(poller.request_with(splayer::Login::anonymous));
+    }
+
+    #[test]
+    fn receive_batch_limits_processed_messages() {
+        let (tx, rx) = mpsc::channel();
+        for value in 0..30 {
+            tx.send(value).unwrap();
+        }
+
+        assert_eq!(receive_batch(&rx, 24), (0..24).collect::<Vec<_>>());
+        assert_eq!(receive_batch(&rx, 24), (24..30).collect::<Vec<_>>());
+        assert!(receive_batch(&rx, 24).is_empty());
     }
 
     #[test]
