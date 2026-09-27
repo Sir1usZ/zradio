@@ -674,7 +674,9 @@ fn handle_control(body: &str, tx: &Sender<ControlCmd>, state: &SharedState) -> s
         _ => return err(format!("unknown action: {}", req.action)),
     };
 
-    let _ = tx.send(cmd);
+    if let Err(response) = enqueue_control(tx, cmd) {
+        return response;
+    }
     handle_status(state)
 }
 
@@ -683,17 +685,23 @@ fn handle_import(body: &str, tx: &Sender<ControlCmd>) -> serde_json::Value {
         Ok(r) => r,
         Err(e) => return err(format!("bad json: {e}")),
     };
-    let _ = tx.send(ControlCmd::Import(req.url.clone()));
+    if let Err(response) = enqueue_control(tx, ControlCmd::Import(req.url.clone())) {
+        return response;
+    }
     ok(serde_json::json!({"import": "started", "url": req.url}))
 }
 
 fn handle_library_scan(tx: &Sender<ControlCmd>) -> serde_json::Value {
-    let _ = tx.send(ControlCmd::RescanLibrary);
+    if let Err(response) = enqueue_control(tx, ControlCmd::RescanLibrary) {
+        return response;
+    }
     ok(serde_json::json!({"scan": "started"}))
 }
 
 fn handle_meta_scan(tx: &Sender<ControlCmd>) -> serde_json::Value {
-    let _ = tx.send(ControlCmd::MetaScan);
+    if let Err(response) = enqueue_control(tx, ControlCmd::MetaScan) {
+        return response;
+    }
     ok(serde_json::json!({"meta_scan": "started"}))
 }
 
@@ -702,12 +710,16 @@ fn handle_eq(body: &str, tx: &Sender<ControlCmd>) -> serde_json::Value {
         Ok(r) => r,
         Err(e) => return err(format!("bad json: {e}")),
     };
-    let _ = tx.send(ControlCmd::SetEq(req.band, req.db));
+    if let Err(response) = enqueue_control(tx, ControlCmd::SetEq(req.band, req.db)) {
+        return response;
+    }
     ok(serde_json::json!({"eq": "updated", "band": req.band, "db": req.db}))
 }
 
 fn handle_eq_reset(tx: &Sender<ControlCmd>) -> serde_json::Value {
-    let _ = tx.send(ControlCmd::ResetEq);
+    if let Err(response) = enqueue_control(tx, ControlCmd::ResetEq) {
+        return response;
+    }
     ok(serde_json::json!({"eq": "reset"}))
 }
 
@@ -826,6 +838,10 @@ fn err(msg: impl Into<String>) -> serde_json::Value {
     serde_json::json!({"ok": false, "error": msg.into()})
 }
 
+fn enqueue_control(tx: &Sender<ControlCmd>, cmd: ControlCmd) -> Result<(), serde_json::Value> {
+    tx.send(cmd).map_err(|_| err("control unavailable"))
+}
+
 fn send_bytes(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> std::io::Result<()> {
     let status_text = match status {
         200 => "OK",
@@ -901,6 +917,26 @@ mod tests {
         let resp = err("something broke");
         assert_eq!(resp["ok"], false);
         assert_eq!(resp["error"], "something broke");
+    }
+
+    #[test]
+    fn disconnected_control_handlers_report_unavailable() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let state = new_shared_state();
+        let responses = [
+            handle_control(r#"{"action":"play"}"#, &tx, &state),
+            handle_import(r#"{"url":"https://example.com/song"}"#, &tx),
+            handle_library_scan(&tx),
+            handle_meta_scan(&tx),
+            handle_eq(r#"{"band":2,"db":4.5}"#, &tx),
+            handle_eq_reset(&tx),
+        ];
+
+        for response in responses {
+            assert_eq!(response["ok"], false);
+            assert_eq!(response["error"], "control unavailable");
+        }
     }
 
     #[test]
