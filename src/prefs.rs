@@ -148,6 +148,7 @@ impl ShuffleMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Prefs {
     pub theme: ThemeName,
     pub transparent: bool,
@@ -161,6 +162,13 @@ pub struct Prefs {
     pub sort_mode: SortMode,
     #[serde(default)]
     pub shuffle_mode: ShuffleMode,
+    /// Optional browser remote. Off keeps the prefs file unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub web_remote: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Default for Prefs {
@@ -176,6 +184,7 @@ impl Default for Prefs {
             eq_db: [0.0; 5],
             sort_mode: SortMode::Path,
             shuffle_mode: ShuffleMode::Off,
+            web_remote: false,
         }
     }
 }
@@ -365,6 +374,20 @@ mod tests {
     fn empty_library_falls_back_to_music_dir() {
         let prefs = Prefs::default();
         assert!(prefs.library_path().ends_with("音乐"));
+    }
+
+    #[test]
+    fn web_remote_stays_off_unless_the_json_turns_it_on() {
+        let prefs = Prefs::default();
+        assert!(!prefs.web_remote);
+        let saved = serde_json::to_string(&prefs).unwrap();
+        assert!(
+            !saved.contains("web_remote"),
+            "an off plugin must not rewrite the prefs file, got {saved}"
+        );
+        let turned_on: Prefs =
+            serde_json::from_str(r#"{"web_remote":true,"theme":"frappe"}"#).unwrap();
+        assert!(turned_on.web_remote);
     }
 
     #[test]

@@ -30,6 +30,8 @@ pub struct ApiSnapshot {
     pub lyrics_lrc: Vec<String>,
     /// 封面缓存路径，下标对齐曲目序号；按需读盘，不进 /library/full
     pub cover_paths: Vec<Option<PathBuf>>,
+    /// 网页遥控器插件。关着时 `/` 仍是 not found。
+    pub web_remote: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -166,6 +168,15 @@ fn handle_connection(
         return send_cors_preflight(&mut stream);
     }
 
+    if method == "GET" && (path == "/" || path == "/index.html") && web_remote_enabled(state) {
+        return send_bytes(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            include_str!("web/index.html").as_bytes(),
+        );
+    }
+
     if method == "GET" && path.starts_with("/cover/") {
         return match cover_bytes_for(path, state) {
             Some((mime, bytes)) => send_bytes(&mut stream, 200, mime, &bytes),
@@ -208,6 +219,7 @@ fn route(
             // 偏好设置
             "/prefs" => handle_prefs(state),
             "/eq" => handle_get_eq(state),
+            "/" | "/index.html" if web_remote_enabled(state) => web_page(),
             _ => err("not found"),
         };
     }
@@ -667,6 +679,7 @@ fn handle_control(body: &str, tx: &Sender<ControlCmd>, state: &SharedState) -> s
         "toggle_lyrics_fetch" => ControlCmd::ToggleLyricsFetch,
         "toggle_cover_fetch" => ControlCmd::ToggleCoverFetch,
         "toggle_resume" => ControlCmd::ToggleResume,
+        "toggle_web_remote" => ControlCmd::ToggleWebRemote,
 
         // ── 资料库 ──
         "meta_scan" => ControlCmd::MetaScan,
@@ -828,6 +841,14 @@ fn cover_bytes_for(path: &str, state: &SharedState) -> Option<(&'static str, Vec
     let snap = state.lock().ok()?;
     let idx = parse_index_suffix(path, "/cover/").or(snap.track.as_ref().map(|t| t.index))?;
     cover_bytes_at(idx, &snap)
+}
+
+fn web_remote_enabled(state: &SharedState) -> bool {
+    state.lock().map(|snap| snap.web_remote).unwrap_or(false)
+}
+
+fn web_page() -> serde_json::Value {
+    ok(serde_json::json!({ "html": include_str!("web/index.html") }))
 }
 
 fn ok(data: serde_json::Value) -> serde_json::Value {
@@ -1007,6 +1028,26 @@ mod tests {
         let resp = handle_get_shuffle(&Arc::new(Mutex::new(ApiSnapshot::default())));
         assert_eq!(resp["ok"], true);
         assert!(resp["data"]["modes"].is_array());
+    }
+
+    #[test]
+    fn web_page_is_absent_until_the_plugin_is_enabled() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let state = new_shared_state();
+        let off = route("GET", "/", "", &tx, &state);
+        assert_eq!(off["ok"], false);
+        assert_eq!(off["error"], "not found");
+
+        state.lock().unwrap().web_remote = true;
+        let on = route("GET", "/", "", &tx, &state);
+        assert_eq!(on["ok"], true);
+        let html = on["data"]["html"].as_str().unwrap();
+        assert!(html.contains("id=\"mini\""), "player shell missing: {html}");
+        assert!(html.contains("/status"), "page must read the existing API");
+        assert!(
+            html.contains("/control"),
+            "page must post to the existing API"
+        );
     }
 
     #[test]

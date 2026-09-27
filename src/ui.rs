@@ -1633,10 +1633,10 @@ impl App {
                     self.overlay = Overlay::None;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.settings_idx = (self.settings_idx + 1) % 7;
+                    self.settings_idx = (self.settings_idx + 1) % 8;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.settings_idx = (self.settings_idx + 6) % 7;
+                    self.settings_idx = (self.settings_idx + 7) % 8;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => self.toggle_setting(),
                 _ => {}
@@ -1880,7 +1880,8 @@ impl App {
             3 => self.prefs.lyrics_fetch = !self.prefs.lyrics_fetch,
             4 => self.prefs.cover_fetch = !self.prefs.cover_fetch,
             5 => self.prefs.resume = !self.prefs.resume,
-            6 => self.overlay = Overlay::None,
+            6 => self.prefs.web_remote = !self.prefs.web_remote,
+            7 => self.overlay = Overlay::None,
             _ => {}
         }
         self.prefs.save();
@@ -2355,6 +2356,7 @@ impl App {
         snap.total_listen_secs = self.taste.total_listen_secs();
         snap.lyrics = lyrics;
         snap.prefs = prefs;
+        snap.web_remote = self.prefs.web_remote;
         if let Some(library) = library {
             snap.library = library;
         }
@@ -2676,6 +2678,11 @@ impl App {
                     self.prefs.resume = !self.prefs.resume;
                     self.prefs.save();
                     self.status = format!("resume {}", self.prefs.resume);
+                }
+                ControlCmd::ToggleWebRemote => {
+                    self.prefs.web_remote = !self.prefs.web_remote;
+                    self.prefs.save();
+                    self.status = format!("web_remote {}", self.prefs.web_remote);
                 }
 
                 // ── 保留兼容 ──
@@ -3421,6 +3428,7 @@ impl App {
             format!("拉歌词      {}", on_off(self.prefs.lyrics_fetch)),
             format!("拉封面      {}", on_off(self.prefs.cover_fetch)),
             format!("续播        {}", on_off(self.prefs.resume)),
+            format!("网页遥控    {}", on_off(self.prefs.web_remote)),
             "关闭".into(),
         ];
         let items: Vec<ListItem> = rows
@@ -3431,7 +3439,7 @@ impl App {
                 ListItem::new(format!("{mark}{row}"))
             })
             .collect();
-        let area = centered(frame.area(), 42, 12);
+        let area = centered(frame.area(), 42, 13);
         let pal = self.palette();
         frame.render_widget(Clear, area);
         frame.render_widget(

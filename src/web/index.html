@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZRadio</title>
+<style>
+  :root {
+    --paper: #fafafa;
+    --ink: #212121;
+    --muted: #757575;
+    --line: #e0e0e0;
+    --accent: #5c6bc0;
+    --on-accent: #fff;
+    --bar: #fff;
+    --row: 56px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font: 16px/1.4 "Roboto", "Noto Sans CJK SC", "Noto Sans", "Source Sans 3", sans-serif;
+  }
+  button, input { font: inherit; color: inherit; }
+  button { background: none; border: 0; padding: 0; cursor: pointer; }
+  button:focus-visible, #scrub:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    height: 56px;
+    padding: 0 16px;
+    background: var(--accent);
+    color: var(--on-accent);
+    box-shadow: 0 2px 4px rgba(0,0,0,.2);
+  }
+  header h1 { margin: 0; font-size: 20px; font-weight: 500; }
+  header span { opacity: .85; font-size: 13px; }
+
+  #list {
+    position: relative;
+    height: calc(100% - 56px - 64px);
+    overflow: auto;
+  }
+  #rows { position: relative; }
+  .row {
+    position: absolute;
+    left: 0; right: 0;
+    height: var(--row);
+    display: grid;
+    grid-template-columns: 56px 1fr;
+    align-items: center;
+    padding-right: 16px;
+    background: transparent;
+    text-align: left;
+    width: 100%;
+  }
+  .row:hover, .row.on { background: rgba(0,0,0,.04); }
+  .row .mark {
+    width: 4px;
+    height: 32px;
+    margin-left: 8px;
+    background: transparent;
+  }
+  .row.on .mark { background: var(--accent); }
+  .row b { display: block; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row small { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #empty {
+    padding: 48px 16px;
+    color: var(--muted);
+    text-align: center;
+  }
+
+  #mini {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    height: 64px;
+    display: grid;
+    grid-template-columns: 48px 1fr auto;
+    gap: 12px;
+    align-items: center;
+    padding: 0 8px 0 12px;
+    background: var(--bar);
+    box-shadow: 0 -2px 6px rgba(0,0,0,.16);
+    z-index: 3;
+  }
+  #mini img, #sheet img {
+    width: 48px; height: 48px;
+    object-fit: cover;
+    background: #eee;
+  }
+  #mini .meta { min-width: 0; text-align: left; }
+  #mini .meta b, #sheet h2 {
+    display: block;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #mini .meta small, #sheet .artist { color: var(--muted); }
+  .icon {
+    width: 48px; height: 48px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+  }
+  .icon.play {
+    background: var(--accent);
+    color: var(--on-accent);
+  }
+
+  #sheet {
+    position: fixed;
+    inset: 0;
+    z-index: 4;
+    background: var(--paper);
+    display: flex;
+    flex-direction: column;
+    transform: translateY(100%);
+    transition: transform 280ms cubic-bezier(.4,0,.2,1);
+  }
+  #sheet.open { transform: translateY(0); }
+  #sheet header {
+    background: transparent;
+    color: var(--ink);
+    box-shadow: none;
+  }
+  #sheet .stage {
+    flex: 1;
+    overflow: auto;
+    padding: 8px 24px 32px;
+  }
+  #sheet .cover {
+    width: min(72vw, 320px);
+    height: min(72vw, 320px);
+    margin: 8px auto 20px;
+    display: block;
+    object-fit: cover;
+    background: #eee;
+    box-shadow: 0 8px 16px rgba(0,0,0,.24);
+  }
+  #sheet h2 { margin: 0; font-size: 22px; }
+  #sheet .artist { margin: 4px 0 16px; }
+  #scrub {
+    width: 100%;
+    accent-color: var(--accent);
+    height: 24px;
+  }
+  .times {
+    display: flex;
+    justify-content: space-between;
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .transport {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    margin: 8px 0 20px;
+  }
+  .transport .play { width: 64px; height: 64px; }
+  #lyrics { margin: 0; padding: 0 0 24px; }
+  #lyrics p {
+    margin: 0;
+    padding: 8px 0;
+    color: var(--muted);
+    text-align: center;
+  }
+  #lyrics p.on { color: var(--ink); font-weight: 500; }
+  @media (prefers-reduced-motion: reduce) {
+    #sheet { transition: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>ZRadio</h1>
+  <span id="count"></span>
+</header>
+<div id="list"><div id="rows"></div><p id="empty" hidden>库是空的</p></div>
+<footer id="mini">
+  <button id="open" class="meta" type="button">
+    <img id="mini-cover" alt="" width="48" height="48" hidden>
+  </button>
+  <button id="open-meta" class="meta" type="button">
+    <b id="mini-title">没在播</b>
+    <small id="mini-artist"></small>
+  </button>
+  <button id="mini-play" class="icon play" type="button" aria-label="播放">▶</button>
+</footer>
+<section id="sheet" hidden>
+  <header>
+    <button id="close" class="icon" type="button" aria-label="收起">↓</button>
+    <h1>正在播放</h1>
+  </header>
+  <div class="stage">
+    <img id="cover" class="cover" alt="" hidden>
+    <h2 id="title">没在播</h2>
+    <p class="artist" id="artist"></p>
+    <input id="scrub" type="range" min="0" max="1000" value="0" aria-label="进度">
+    <div class="times"><span id="pos">0:00</span><span id="dur">0:00</span></div>
+    <div class="transport">
+      <button id="prev" class="icon" type="button" aria-label="上一首">⏮</button>
+      <button id="play" class="icon play" type="button" aria-label="播放">▶</button>
+      <button id="next" class="icon" type="button" aria-label="下一首">⏭</button>
+    </div>
+    <div id="lyrics"></div>
+  </div>
+</section>
+<script>
+const STATUS = "/status";
+const CONTROL = "/control";
+const ROW = 56;
+const list = document.getElementById("list");
+const rows = document.getElementById("rows");
+const empty = document.getElementById("empty");
+const sheet = document.getElementById("sheet");
+
+let tracks = [];
+let current = null;
+let paused = true;
+let position = 0;
+let duration = 0;
+let stamped = 0;
+let lyrics = [];
+let lyricIndex = -1;
+let libraryTotal = -1;
+let seeking = false;
+
+function clock(secs) {
+  if (!Number.isFinite(secs) || secs < 0) secs = 0;
+  const s = Math.floor(secs);
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+
+async function post(body) {
+  const res = await fetch(CONTROL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const json = await res.json();
+  if (json.ok) apply(json.data);
+}
+
+function paintList() {
+  const total = tracks.length;
+  empty.hidden = total !== 0;
+  rows.style.height = total * ROW + "px";
+  const start = Math.max(0, Math.floor(list.scrollTop / ROW) - 6);
+  const end = Math.min(total, Math.ceil((list.scrollTop + list.clientHeight) / ROW) + 6);
+  const html = [];
+  for (let i = start; i < end; i++) {
+    const t = tracks[i];
+    const on = current && current.index === t.index ? " on" : "";
+    html.push(
+      `<button class="row${on}" style="top:${i * ROW}px" data-i="${t.index}" type="button">` +
+      `<span class="mark"></span><span><b>${esc(t.title || "未命名")}</b>` +
+      `<small>${esc(t.artist || "")}</small></span></button>`
+    );
+  }
+  rows.innerHTML = html.join("");
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function shownPosition() {
+  if (paused || seeking) return position;
+  return position + (performance.now() - stamped) / 1000;
+}
+
+function paintPlayer() {
+  const title = current ? (current.title || "未命名") : "没在播";
+  const artist = current ? (current.artist || "") : "";
+  document.getElementById("mini-title").textContent = title;
+  document.getElementById("mini-artist").textContent = artist;
+  document.getElementById("title").textContent = title;
+  document.getElementById("artist").textContent = artist;
+  const mark = paused ? "▶" : "❚❚";
+  document.getElementById("mini-play").textContent = mark;
+  document.getElementById("play").textContent = mark;
+  document.getElementById("mini-play").setAttribute("aria-label", paused ? "播放" : "暂停");
+  document.getElementById("play").setAttribute("aria-label", paused ? "播放" : "暂停");
+  const pos = shownPosition();
+  document.getElementById("pos").textContent = clock(pos);
+  document.getElementById("dur").textContent = clock(duration);
+  if (!seeking && duration > 0) {
+    document.getElementById("scrub").value = String(Math.min(1000, (pos / duration) * 1000));
+  }
+  const cover = current && current.has_cover ? "/cover/" + current.index : "";
+  for (const id of ["mini-cover", "cover"]) {
+    const img = document.getElementById(id);
+    if (cover && img.getAttribute("src") !== cover) {
+      img.hidden = false;
+      img.src = cover;
+    }
+    if (!cover) {
+      img.removeAttribute("src");
+      img.hidden = true;
+    }
+  }
+  paintLyrics(pos);
+}
+
+function paintLyrics(pos) {
+  if (!lyrics.length) return;
+  let idx = 0;
+  for (let i = 0; i < lyrics.length; i++) {
+    if (lyrics[i].time <= pos) idx = i;
+  }
+  if (idx === lyricIndex) return;
+  lyricIndex = idx;
+  const box = document.getElementById("lyrics");
+  const nodes = box.children;
+  for (let i = 0; i < nodes.length; i++) nodes[i].classList.toggle("on", i === idx);
+  const line = nodes[idx];
+  if (line && sheet.classList.contains("open")) {
+    line.scrollIntoView({ block: "center" });
+  }
+}
+
+function apply(data) {
+  const play = data.playback || {};
+  paused = !!play.paused;
+  position = Number(play.position_secs) || 0;
+  duration = Number(play.duration_secs) || 0;
+  stamped = performance.now();
+  const next = data.current_track || null;
+  const changed = (current && current.index) !== (next && next.index);
+  current = next;
+  paintPlayer();
+  paintList();
+  if (changed) loadLyrics();
+}
+
+async function loadLibrary() {
+  const res = await fetch("/library/full");
+  const json = await res.json();
+  if (!json.ok) return;
+  tracks = json.data.tracks || [];
+  libraryTotal = json.data.total;
+  document.getElementById("count").textContent = libraryTotal + " 首";
+  paintList();
+}
+
+function parseLrc(text) {
+  const out = [];
+  for (const line of String(text).split("\n")) {
+    const m = line.match(/^\[(\d+):(\d+(?:\.\d+)?)\](.*)$/);
+    if (!m) continue;
+    out.push({ time: Number(m[1]) * 60 + Number(m[2]), text: m[3] });
+  }
+  return out;
+}
+
+async function loadLyrics() {
+  lyrics = [];
+  lyricIndex = -1;
+  const box = document.getElementById("lyrics");
+  box.innerHTML = "";
+  if (!current || !current.has_lyrics) return;
+  const res = await fetch("/lyrics/" + current.index);
+  const json = await res.json();
+  if (!json.ok) return;
+  lyrics = parseLrc(json.data.lrc || "");
+  box.innerHTML = lyrics.map((l) => `<p>${esc(l.text)}</p>`).join("");
+  paintLyrics(shownPosition());
+}
+
+function tintFrom(img) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 16;
+  canvas.height = 16;
+  const g = canvas.getContext("2d", { willReadFrequently: true });
+  g.drawImage(img, 0, 0, 16, 16);
+  const data = g.getImageData(0, 0, 16, 16).data;
+  let best = null;
+  let score = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], gv = data[i + 1], b = data[i + 2];
+    const max = Math.max(r, gv, b), min = Math.min(r, gv, b);
+    const sat = max === 0 ? 0 : (max - min) / max;
+    const weight = sat * max;
+    if (weight > score) {
+      score = weight;
+      best = [r, gv, b];
+    }
+  }
+  if (!best || score < 20) return;
+  const [r, gv, b] = best;
+  const accent = `rgb(${r} ${gv} ${b})`;
+  document.documentElement.style.setProperty("--accent", accent);
+  const light = (0.2126 * r + 0.7152 * gv + 0.0722 * b) / 255 > 0.6;
+  document.documentElement.style.setProperty("--on-accent", light ? "#212121" : "#fff");
+}
+
+document.getElementById("cover").addEventListener("load", (e) => tintFrom(e.target));
+
+list.addEventListener("scroll", paintList);
+rows.addEventListener("click", (e) => {
+  const row = e.target.closest(".row");
+  if (!row) return;
+  post({ action: "play", index: Number(row.dataset.i) });
+});
+
+function openSheet() {
+  sheet.hidden = false;
+  requestAnimationFrame(() => sheet.classList.add("open"));
+}
+function closeSheet() {
+  sheet.classList.remove("open");
+  setTimeout(() => { if (!sheet.classList.contains("open")) sheet.hidden = true; }, 300);
+}
+document.getElementById("open").addEventListener("click", openSheet);
+document.getElementById("open-meta").addEventListener("click", openSheet);
+document.getElementById("close").addEventListener("click", closeSheet);
+document.getElementById("mini-play").addEventListener("click", () => post({ action: "toggle" }));
+document.getElementById("play").addEventListener("click", () => post({ action: "toggle" }));
+document.getElementById("prev").addEventListener("click", () => post({ action: "prev" }));
+document.getElementById("next").addEventListener("click", () => post({ action: "next" }));
+
+const scrub = document.getElementById("scrub");
+scrub.addEventListener("pointerdown", () => { seeking = true; });
+scrub.addEventListener("change", () => {
+  seeking = false;
+  if (duration > 0) post({ action: "seek_to", value: (scrub.value / 1000) * duration });
+});
+
+async function poll() {
+  try {
+    const res = await fetch(STATUS);
+    const json = await res.json();
+    if (json.ok) {
+      apply(json.data);
+      const total = json.data.library && json.data.library.total;
+      if (total !== libraryTotal) loadLibrary();
+    }
+  } catch (_) {}
+}
+
+setInterval(() => {
+  if (!paused) paintPlayer();
+}, 250);
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>

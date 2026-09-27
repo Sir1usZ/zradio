@@ -82,6 +82,8 @@ If `cava` is on `PATH`, bars use it; otherwise internal FFT.
 
 HTTP API on port `18765`. Control, status, and lyrics are JSON. `GET /cover/:index` returns image bytes on success. `/status` and `/library/full` do not include cover bytes or LRC text.
 
+The browser remote is off until you turn on `网页遥控` in settings (`t`). Then open `http://<host>:18765/`. Audio stays on this machine; the page only drives the API. Turning it off omits `web_remote` from the prefs file again.
+
 ```bash
 # status (no cover bytes)
 curl -s http://localhost:18765/status | jq
