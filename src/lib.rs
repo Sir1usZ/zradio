@@ -6,6 +6,7 @@ pub mod cava;
 pub mod control;
 pub mod cover;
 pub mod decode;
+pub mod drawer;
 pub mod dsp;
 pub mod engine;
 pub mod eq;
