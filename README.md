@@ -34,14 +34,14 @@ Optional argument: a library directory.
 | Key | Action |
 |---|---|
 | `q` / `e` | Previous / next tab |
-| `1` | All library (music tab) |
-| `2`–`9` | Jump user playlist (empty slot refuses) |
-| `←` / `→` | Cycle playlists (music) / seek 5s (player) |
+| `p` / `Alt+P` | Toggle bottom playlist drawer |
+| `1`–`9` | Jump slot inside the drawer (empty slot refuses) |
+| `←` / `→` | Seek 5s (player tab) |
 | `x` | Context menu: highlighted track (music) / now playing (player) |
 | `y` | Large library window (whole library, not play range) |
 | `j` `k` or arrows | Move |
 | Space | Play / pause |
-| `n` / `p` | Next / previous (current list) |
+| `n` / `b` | Next / previous (current list) |
 | `l` | Lyrics (player tab) |
 | `g` | EQ |
 | `t` | Settings |
@@ -58,7 +58,7 @@ Optional argument: a library directory.
 | `Esc` | Close search / overlay (does not quit) |
 | `Ctrl+Q` | Quit |
 
-Playlists live in `~/.local/share/zradio/playlists.json`. Slot `1` is the whole library; slots `2`–`9` are user lists. The current list is the play range for `n` / shuffle / loop. Missing files stay in the JSON, render gray, and are skipped.
+Playlists live in `~/.local/share/zradio/playlists.json`. Slot `1` is the whole library; slots `2`–`9` are user lists. The music tab shows the current list only; `p` slides a 9-slot picker up from the bottom. The current list is the play range for `n` / shuffle / loop. Missing files stay in the JSON, render gray, and are skipped.
 
 Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume.
 
