@@ -34,8 +34,15 @@ fn scan_dir(dir: &Path, out: &mut Vec<Track>) -> anyhow::Result<()> {
         if name.starts_with('.') {
             continue;
         }
-        if path.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
             scan_dir(&path, out)?;
+            continue;
+        }
+        if !file_type.is_file() {
             continue;
         }
         let ext = path
@@ -74,21 +81,38 @@ pub fn title_from_path(path: &Path) -> String {
 
 pub fn sort_indices(tracks: &[Track], metas: &[Option<TrackMeta>], mode: SortMode) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..tracks.len()).collect();
-    idx.sort_by(|&a, &b| match mode {
-        SortMode::Path => tracks[a].path.cmp(&tracks[b].path),
-        SortMode::Title => title_key(tracks, metas, a)
-            .cmp(&title_key(tracks, metas, b))
-            .then_with(|| tracks[a].path.cmp(&tracks[b].path)),
-        SortMode::Artist => artist_key(metas, a)
-            .cmp(&artist_key(metas, b))
-            .then_with(|| title_key(tracks, metas, a).cmp(&title_key(tracks, metas, b)))
-            .then_with(|| tracks[a].path.cmp(&tracks[b].path)),
-        SortMode::Album => album_key(metas, a)
-            .cmp(&album_key(metas, b))
-            .then_with(|| artist_key(metas, a).cmp(&artist_key(metas, b)))
-            .then_with(|| title_key(tracks, metas, a).cmp(&title_key(tracks, metas, b)))
-            .then_with(|| tracks[a].path.cmp(&tracks[b].path)),
-    });
+    match mode {
+        SortMode::Path => idx.sort_by(|&a, &b| tracks[a].path.cmp(&tracks[b].path)),
+        mode => {
+            let keys: Vec<(String, String, String)> = (0..tracks.len())
+                .map(|i| {
+                    (
+                        album_key(metas, i),
+                        artist_key(metas, i),
+                        title_key(tracks, metas, i),
+                    )
+                })
+                .collect();
+            idx.sort_by(|&a, &b| match mode {
+                SortMode::Title => keys[a]
+                    .2
+                    .cmp(&keys[b].2)
+                    .then_with(|| tracks[a].path.cmp(&tracks[b].path)),
+                SortMode::Artist => keys[a]
+                    .1
+                    .cmp(&keys[b].1)
+                    .then_with(|| keys[a].2.cmp(&keys[b].2))
+                    .then_with(|| tracks[a].path.cmp(&tracks[b].path)),
+                SortMode::Album => keys[a]
+                    .0
+                    .cmp(&keys[b].0)
+                    .then_with(|| keys[a].1.cmp(&keys[b].1))
+                    .then_with(|| keys[a].2.cmp(&keys[b].2))
+                    .then_with(|| tracks[a].path.cmp(&tracks[b].path)),
+                SortMode::Path => unreachable!(),
+            });
+        }
+    }
     idx
 }
 
