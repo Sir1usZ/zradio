@@ -53,14 +53,37 @@ pub fn peek_tags(path: &Path, fallback_title: &str) -> TrackMeta {
 }
 
 pub fn apply_peek(slot: &mut Option<TrackMeta>, peeked: TrackMeta) -> bool {
-    if slot
-        .as_ref()
-        .is_some_and(|m| !m.lyrics.is_empty() || m.cover.is_some())
-    {
-        return false;
+    let Some(existing) = slot.as_mut() else {
+        *slot = Some(peeked);
+        return true;
+    };
+
+    let mut changed = false;
+    changed |= fill_empty_text(&mut existing.title, peeked.title);
+    changed |= fill_empty_text(&mut existing.artist, peeked.artist);
+    changed |= fill_empty_text(&mut existing.album, peeked.album);
+    if existing.lyrics.is_empty() && !peeked.lyrics.is_empty() {
+        existing.lyrics = peeked.lyrics;
+        changed = true;
     }
-    *slot = Some(peeked);
-    true
+    if existing.cover_path.is_none() && peeked.cover_path.is_some() {
+        existing.cover_path = peeked.cover_path;
+        changed = true;
+    }
+    if existing.cover.is_none() && peeked.cover.is_some() {
+        existing.cover = peeked.cover;
+        changed = true;
+    }
+    changed
+}
+
+fn fill_empty_text(dst: &mut String, src: String) -> bool {
+    if dst.trim().is_empty() && !src.trim().is_empty() {
+        *dst = src;
+        true
+    } else {
+        false
+    }
 }
 
 pub fn needs_remote(meta: &TrackMeta) -> bool {
@@ -551,6 +574,30 @@ mod tests {
         ));
         assert_eq!(slot.as_ref().unwrap().artist, "Avicii");
         assert_eq!(slot.as_ref().unwrap().lyrics.len(), 1);
+    }
+
+    #[test]
+    fn apply_peek_fills_only_missing_fields() {
+        let mut slot = Some(TrackMeta {
+            title: "Remote title".into(),
+            artist: "Remote artist".into(),
+            ..TrackMeta::default()
+        });
+
+        assert!(apply_peek(
+            &mut slot,
+            TrackMeta {
+                title: "Filename fallback".into(),
+                artist: "Local artist".into(),
+                album: "Local album".into(),
+                ..TrackMeta::default()
+            }
+        ));
+
+        let merged = slot.as_ref().unwrap();
+        assert_eq!(merged.title, "Remote title");
+        assert_eq!(merged.artist, "Remote artist");
+        assert_eq!(merged.album, "Local album");
     }
 
     #[test]
