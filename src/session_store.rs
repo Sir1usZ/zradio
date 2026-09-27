@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::library::Track;
+use crate::storage::write_json_atomic;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionState {
@@ -32,12 +33,7 @@ impl SessionState {
             path: track.display().to_string(),
             position_secs: secs.max(0.0),
         };
-        if let Some(parent) = path().parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = fs::write(path(), json);
-        }
+        let _ = write_json_atomic(&path(), &state);
     }
 }
 

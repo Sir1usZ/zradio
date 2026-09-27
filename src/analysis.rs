@@ -8,6 +8,7 @@ use rustfft::FftPlanner;
 use serde::{Deserialize, Serialize};
 
 use crate::decode::AudioBuf;
+use crate::storage::write_json_atomic;
 
 const ANALYSIS_VERSION: u32 = 2;
 const ENV_HZ: f32 = 50.0;
@@ -354,11 +355,7 @@ impl AnalysisStore {
         if !self.dirty {
             return;
         }
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&self.cache) {
-            let _ = fs::write(&self.path, json);
+        if write_json_atomic(&self.path, &self.cache).is_ok() {
             self.dirty = false;
         }
     }
@@ -381,6 +378,27 @@ fn cache_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_flush_keeps_analysis_dirty_for_retry() {
+        let path = std::env::temp_dir().join(format!(
+            "zradio-analysis-failed-flush-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        let mut store = AnalysisStore {
+            path: path.clone(),
+            cache: AnalysisCache::default(),
+            dirty: true,
+        };
+
+        store.flush();
+
+        assert!(store.dirty);
+        drop(store);
+        fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn camelot_maps_c_major_and_a_minor() {

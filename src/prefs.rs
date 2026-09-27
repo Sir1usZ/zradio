@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 
+use crate::storage::write_json_atomic;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeName {
@@ -189,12 +191,7 @@ impl Prefs {
 
     pub fn save(&self) {
         let path = prefs_path();
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, json);
-        }
+        let _ = write_json_atomic(&path, self);
     }
 
     pub fn library_path(&self) -> PathBuf {

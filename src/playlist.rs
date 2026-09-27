@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::library::Track;
+use crate::storage::write_json_atomic;
 
 pub const MAX_LISTS: usize = 8;
 
@@ -66,11 +67,7 @@ impl PlaylistStore {
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), PlaylistError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|_| PlaylistError::WriteFailed)?;
-        }
-        let json = serde_json::to_string_pretty(self).map_err(|_| PlaylistError::WriteFailed)?;
-        fs::write(path, json).map_err(|_| PlaylistError::WriteFailed)
+        write_json_atomic(path, self).map_err(|_| PlaylistError::WriteFailed)
     }
 
     fn clamped(mut self) -> Self {

@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::library::Track;
+use crate::storage::write_json_atomic;
 
 const LISTEN_RATIO: f32 = 0.8;
 const SKIP_RATIO: f32 = 0.4;
@@ -163,11 +164,7 @@ impl TasteStore {
         if !self.dirty || self.path.as_os_str().is_empty() {
             return;
         }
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&self.cache) {
-            let _ = std::fs::write(&self.path, json);
+        if write_json_atomic(&self.path, &self.cache).is_ok() {
             self.dirty = false;
         }
     }
@@ -241,6 +238,26 @@ fn data_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_flush_keeps_taste_dirty_for_retry() {
+        let path =
+            std::env::temp_dir().join(format!("zradio-taste-failed-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        let mut store = TasteStore {
+            path: path.clone(),
+            cache: TasteCache::default(),
+            dirty: true,
+            last_complete: None,
+        };
+
+        store.flush();
+
+        assert!(store.dirty);
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn replay_outranks_single_listen() {

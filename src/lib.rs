@@ -25,6 +25,7 @@ pub mod session_store;
 pub mod shell;
 pub mod spectrum;
 pub mod splayer;
+pub(crate) mod storage;
 pub mod taste;
 pub mod ui;
 
