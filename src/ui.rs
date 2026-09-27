@@ -29,6 +29,9 @@ use crate::cava::CavaFeed;
 use crate::control::ControlCmd;
 use crate::cover;
 use crate::decode::AudioBuf;
+use crate::drawer::{
+    drawer_open_height, drawer_rect, drawer_rows, list_title, wrap_idx, DrawerAnim, DRAWER_SLOTS,
+};
 use crate::dsp::MixMode;
 use crate::engine::{load_track, Player, Snapshot};
 use crate::eq::Equalizer;
@@ -133,6 +136,8 @@ pub struct App {
     context_idx: usize,
     context_target: ContextTarget,
     context_from: Overlay,
+    drawer: DrawerAnim,
+    drawer_idx: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +312,8 @@ impl App {
             context_idx: 0,
             context_target: ContextTarget::Track(0),
             context_from: Overlay::None,
+            drawer: DrawerAnim::closed(),
+            drawer_idx: 0,
         };
         app.push_taste();
         if let Ok(mut mixer) = app.player.mixer.lock() {
@@ -380,15 +387,6 @@ impl App {
                 }
             }
             Err(err) => self.status = err.as_status(),
-        }
-    }
-
-    fn cycle_playlist(&mut self, delta: i32) {
-        self.playlists.cycle(delta);
-        if self.persist_playlists() {
-            self.apply_play_range();
-        } else {
-            self.sync_playable();
         }
     }
 
@@ -630,25 +628,42 @@ impl App {
     }
 
     fn slot_title(&self) -> String {
-        let mut parts = Vec::new();
-        for slot in 1..=9 {
-            let mark = if self.playlists.active + 1 == slot {
-                "▸"
-            } else {
-                " "
-            };
-            if slot == 1 {
-                parts.push(format!("{mark}{slot} · 全部"));
-                continue;
-            }
-            let list_idx = slot - 2;
-            if let Some(list) = self.playlists.lists.get(list_idx) {
-                parts.push(format!("{mark}{slot} ♪ {}", list.name));
-            } else {
-                parts.push(format!("{mark}{slot} · —"));
-            }
+        let slot = self.playlists.active + 1;
+        let name = self.playlists.slot_name(slot);
+        let n = if self.playlists.active == 0 {
+            self.tracks.len()
+        } else {
+            self.range_rows().len()
+        };
+        list_title(slot, &name, n)
+    }
+
+    fn drawer_names(&self) -> Vec<String> {
+        self.playlists
+            .lists
+            .iter()
+            .map(|list| list.name.clone())
+            .collect()
+    }
+
+    fn toggle_playlist_drawer(&mut self) {
+        if self.drawer.is_interactive() {
+            self.drawer.close();
+            self.status = "播放列表".into();
+            return;
         }
-        format!(" {} ", parts.join("  "))
+        self.drawer_idx = self.playlists.active.min(DRAWER_SLOTS - 1);
+        self.drawer.open();
+        self.status = "播放列表  j/k 选  enter 切  p/esc 关".into();
+    }
+
+    fn play_prev(&mut self) {
+        let prev = self.player.mixer.lock().expect("mixer").prev_index();
+        if let Some(i) = prev {
+            self.play_index(i, true);
+        } else {
+            self.status = "列表空".into();
+        }
     }
 
     fn selected_present(&self) -> Option<usize> {
@@ -1160,6 +1175,7 @@ impl App {
                 self.drain_import();
                 self.drain_search();
                 self.drain_control();
+                self.drawer.tick(tick.as_millis() as u64);
                 if self.tick.is_multiple_of(90) {
                     self.login = splayer::login_status();
                 }
@@ -1218,6 +1234,9 @@ impl App {
         if self.overlay != Overlay::None {
             return self.handle_overlay_key(key);
         }
+        if self.drawer.is_interactive() {
+            return self.handle_drawer_key(key);
+        }
         match key.code {
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.save_session();
@@ -1253,9 +1272,7 @@ impl App {
                 self.command = Some("open ".into());
                 self.status = "open 本地文件夹".into();
             }
-            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' && self.tab == Tab::Music => {
-                self.jump_slot(c.to_digit(10).unwrap_or(1) as usize);
-            }
+            KeyCode::Char('p') | KeyCode::Char('P') => self.toggle_playlist_drawer(),
             KeyCode::Char('q') => {
                 self.tab = self.tab.prev();
                 self.status = format!("tab {}", self.tab.label());
@@ -1350,14 +1367,7 @@ impl App {
                     self.status = "列表空".into();
                 }
             }
-            KeyCode::Char('p') => {
-                let prev = self.player.mixer.lock().expect("mixer").prev_index();
-                if let Some(i) = prev {
-                    self.play_index(i, true);
-                } else {
-                    self.status = "列表空".into();
-                }
-            }
+            KeyCode::Char('b') | KeyCode::Char('B') => self.play_prev(),
             KeyCode::Char('m') => {
                 let mut mixer = self.player.mixer.lock().expect("mixer");
                 mixer.cycle_mix();
@@ -1390,23 +1400,15 @@ impl App {
                 mixer.cycle_loop();
                 self.status = mixer.snapshot(self.selected()).status;
             }
-            KeyCode::Left => {
-                if self.tab == Tab::Music {
-                    self.cycle_playlist(-1);
-                } else if self.tab == Tab::Player {
-                    let mut mixer = self.player.mixer.lock().expect("mixer");
-                    mixer.seek_by(-5.0);
-                    self.status = mixer.snapshot(self.selected()).status;
-                }
+            KeyCode::Left if self.tab == Tab::Player => {
+                let mut mixer = self.player.mixer.lock().expect("mixer");
+                mixer.seek_by(-5.0);
+                self.status = mixer.snapshot(self.selected()).status;
             }
-            KeyCode::Right => {
-                if self.tab == Tab::Music {
-                    self.cycle_playlist(1);
-                } else if self.tab == Tab::Player {
-                    let mut mixer = self.player.mixer.lock().expect("mixer");
-                    mixer.seek_by(5.0);
-                    self.status = mixer.snapshot(self.selected()).status;
-                }
+            KeyCode::Right if self.tab == Tab::Player => {
+                let mut mixer = self.player.mixer.lock().expect("mixer");
+                mixer.seek_by(5.0);
+                self.status = mixer.snapshot(self.selected()).status;
             }
             _ => {}
         }
@@ -1486,6 +1488,45 @@ impl App {
             Overlay::None => {}
         }
         false
+    }
+
+    fn handle_drawer_key(&mut self, key: event::KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.save_session();
+                return true;
+            }
+            KeyCode::Esc | KeyCode::Char('p') | KeyCode::Char('P') => self.drawer.close(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.drawer_idx = wrap_idx(self.drawer_idx, 1, DRAWER_SLOTS);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.drawer_idx = wrap_idx(self.drawer_idx, -1, DRAWER_SLOTS);
+            }
+            KeyCode::Enter => {
+                let slot = self.drawer_idx + 1;
+                self.jump_slot(slot);
+                if !self.drawer_rows_empty(slot) {
+                    self.drawer.close();
+                }
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let slot = c.to_digit(10).unwrap_or(1) as usize;
+                self.drawer_idx = (slot - 1).min(DRAWER_SLOTS - 1);
+                self.jump_slot(slot);
+                if !self.drawer_rows_empty(slot) {
+                    self.drawer.close();
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn drawer_rows_empty(&self, slot: usize) -> bool {
+        drawer_rows(self.playlists.active, &self.drawer_names())
+            .get(slot.saturating_sub(1))
+            .is_some_and(|row| row.empty)
     }
 
     fn handle_library_key(&mut self, key: event::KeyEvent) {
@@ -2553,6 +2594,59 @@ impl App {
             Overlay::ContextAdd => self.draw_context_add(frame),
             Overlay::None => {}
         }
+        if self.drawer.is_visible() {
+            self.draw_playlist_drawer(frame);
+        }
+    }
+
+    fn draw_playlist_drawer(&self, frame: &mut ratatui::Frame<'_>) {
+        let pal = self.palette();
+        let frame_area = frame.area();
+        let open_h = drawer_open_height(frame_area.height);
+        let area = drawer_rect(frame_area, self.drawer.visual(), open_h);
+        if area.height == 0 {
+            return;
+        }
+        if area.y > frame_area.y {
+            let dim = Rect {
+                x: frame_area.x,
+                y: frame_area.y,
+                width: frame_area.width,
+                height: area.y.saturating_sub(frame_area.y),
+            };
+            frame.render_widget(Clear, dim);
+            frame.render_widget(
+                Block::default().style(Style::default().bg(pal.scrim())),
+                dim,
+            );
+        }
+        frame.render_widget(Clear, area);
+        let rows = drawer_rows(self.playlists.active, &self.drawer_names());
+        let lines: Vec<Line> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let mark = if i == self.drawer_idx { "▸" } else { " " };
+                let cur = if row.active { "  当前" } else { "" };
+                let style = if row.empty {
+                    pal.dim_style()
+                } else if i == self.drawer_idx {
+                    pal.highlight()
+                } else {
+                    pal.text_style()
+                };
+                Line::from(Span::styled(
+                    format!("{mark} {}  {}{cur}", row.slot, row.name),
+                    style,
+                ))
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(pal.text_style())
+                .block(self.overlay_block(" 播放列表 ", Style::default().cyan())),
+            area,
+        );
     }
 
     fn draw_music(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect, snap: &Snapshot) {
@@ -3068,10 +3162,12 @@ impl App {
         } else {
             match self.tab {
                 Tab::Music => {
-                    "q/e tab  1全部 2-9列表  ←→切列表  x菜单  y库  :playlist  ^q退出".into()
+                    "q/e tab  p列表  b上一曲  n下一曲  x菜单  y库  :playlist  ^q退出".into()
                 }
-                Tab::Player => "q/e tab  x当前曲  l歌词  g EQ  space  n/p  ←→seek  ^q退出".into(),
-                Tab::Me => "q/e tab  听歌时长/最爱  t设置  ^k帮助  ^q退出".into(),
+                Tab::Player => {
+                    "q/e tab  p列表  x当前曲  l歌词  g EQ  space  n/b  ←→seek  ^q退出".into()
+                }
+                Tab::Me => "q/e tab  p列表  听歌时长/最爱  t设置  ^k帮助  ^q退出".into(),
             }
         })
         .alignment(Alignment::Center)
@@ -3383,7 +3479,7 @@ impl App {
     }
 
     fn draw_help_modal(&self, frame: &mut ratatui::Frame<'_>) {
-        let text = "q/e 切栏   1全部 2-9列表  ←→切列表\n音乐tab x 高亮曲   播放器tab x 正在播\n空格 播放暂停   n/p 下一首上一首\nl 歌词   g 均衡器   t 设置   y 曲库\n:playlist 名字  新建   :playlist-rm 删当前\nEsc 关搜索/弹窗   Ctrl+Q 退出   播放器tab ←→ 快进快退";
+        let text = "q/e 切栏   p 播放列表   b 上一曲   n 下一曲\n音乐tab x 高亮曲   播放器tab x 正在播\n空格 播放暂停   列表里 1-9 / enter 切换\nl 歌词   g 均衡器   t 设置   y 曲库\n:playlist 名字  新建   :playlist-rm 删当前\nEsc 关搜索/弹窗   Ctrl+Q 退出   播放器tab ←→ 快进快退";
         let area = centered(frame.area(), 52, 11);
         frame.render_widget(Clear, area);
         frame.render_widget(
