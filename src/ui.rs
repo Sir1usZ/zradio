@@ -174,6 +174,10 @@ pub struct App {
     context_from: Overlay,
     drawer: DrawerAnim,
     drawer_idx: usize,
+    range_cache: Vec<RangeRow>,
+    sorted_idx: Vec<usize>,
+    api_dirty: bool,
+    taste_dirty: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,7 +324,7 @@ impl App {
             search_idx: 0,
             search_rx,
             search_tx,
-            login: splayer::login_status(),
+            login: splayer::Login::anonymous(),
             local_filter: String::new(),
             local_hits: Vec::new(),
             local_idx: 0,
@@ -352,7 +356,12 @@ impl App {
             context_from: Overlay::None,
             drawer: DrawerAnim::closed(),
             drawer_idx: 0,
+            range_cache: Vec::new(),
+            sorted_idx: Vec::new(),
+            api_dirty: true,
+            taste_dirty: false,
         };
+        app.rebuild_range_cache();
         app.push_taste();
         if let Ok(mut mixer) = app.player.mixer.lock() {
             mixer.set_eq_db(app.prefs.eq_db);
@@ -410,11 +419,8 @@ impl App {
         self.local_idx = 0;
         self.music_mode = MusicMode::Library;
         self.sync_playable();
-        let n = if self.local_filter.is_empty() {
-            self.range_rows().len()
-        } else {
-            self.local_hits.len()
-        };
+        self.rebuild_range_cache();
+        let n = self.range_rows().len();
         self.list_state.select(if n == 0 { None } else { Some(0) });
         self.status = self.range_status();
     }
@@ -521,23 +527,32 @@ impl App {
         }
     }
 
-    fn range_rows(&self) -> Vec<RangeRow> {
-        if self.playlists.active == 0 {
-            return sort_indices(&self.tracks, &self.metas, self.prefs.sort_mode)
-                .into_iter()
+    fn range_rows(&self) -> &[RangeRow] {
+        &self.range_cache
+    }
+
+    fn rebuild_range_cache(&mut self) {
+        self.sorted_idx = sort_indices(&self.tracks, &self.metas, self.prefs.sort_mode);
+        self.range_cache = if self.playlists.active == 0 {
+            self.sorted_idx
+                .iter()
+                .copied()
                 .map(RangeRow::Present)
-                .collect();
-        }
-        let Some(list) = self.playlists.current_list() else {
-            return Vec::new();
+                .collect()
+        } else {
+            match self.playlists.current_list() {
+                Some(list) => list
+                    .paths
+                    .iter()
+                    .map(|p| match self.tracks.iter().position(|t| &t.path == p) {
+                        Some(i) => RangeRow::Present(i),
+                        None => RangeRow::Missing(p.clone()),
+                    })
+                    .collect(),
+                None => Vec::new(),
+            }
         };
-        list.paths
-            .iter()
-            .map(|p| match self.tracks.iter().position(|t| &t.path == p) {
-                Some(i) => RangeRow::Present(i),
-                None => RangeRow::Missing(p.clone()),
-            })
-            .collect()
+        self.api_dirty = true;
     }
 
     fn lib_rows(&self) -> Vec<LibRow> {
@@ -551,22 +566,21 @@ impl App {
             return tracks.into_iter().map(LibRow::Track).collect();
         }
         match self.browse_kind {
-            BrowseKind::All => sort_indices(&self.tracks, &self.metas, self.prefs.sort_mode)
-                .into_iter()
-                .map(LibRow::Track)
-                .collect(),
+            BrowseKind::All => self.sorted_idx.iter().copied().map(LibRow::Track).collect(),
             BrowseKind::Tagged => {
                 let tagged = browse::tagged_indices(&self.metas);
-                sort_indices(&self.tracks, &self.metas, self.prefs.sort_mode)
-                    .into_iter()
+                self.sorted_idx
+                    .iter()
+                    .copied()
                     .filter(|i| tagged.contains(i))
                     .map(LibRow::Track)
                     .collect()
             }
             BrowseKind::Untagged => {
                 let untagged = browse::untagged_indices(&self.metas);
-                sort_indices(&self.tracks, &self.metas, self.prefs.sort_mode)
-                    .into_iter()
+                self.sorted_idx
+                    .iter()
+                    .copied()
                     .filter(|i| untagged.contains(i))
                     .map(LibRow::Track)
                     .collect()
@@ -967,8 +981,7 @@ impl App {
         if queue_remote {
             self.queue_meta(index);
         }
-        self.refresh_artists();
-        self.push_taste();
+        self.mark_meta_changed();
         let mut mixer = self.player.mixer.lock().expect("mixer");
         if job.transition && mixer.mix().uses_fade() {
             mixer.start_transition(index, buf, job.skip);
@@ -1089,8 +1102,7 @@ impl App {
             }
         }
         if changed {
-            self.refresh_artists();
-            self.push_taste();
+            self.mark_meta_changed();
         }
     }
 
@@ -1122,8 +1134,9 @@ impl App {
     }
 
     fn drain_peek(&mut self) {
+        const PEEK_PER_TICK: usize = 24;
         let mut n = 0;
-        loop {
+        while n < PEEK_PER_TICK {
             match self.peek_rx.try_recv() {
                 Ok(job) => {
                     if !job.id.matches(self.library_generation, &self.tracks) {
@@ -1154,14 +1167,19 @@ impl App {
                         }
                     }
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
         if n > 0 {
-            self.refresh_artists();
-            self.push_taste();
+            self.mark_meta_changed();
         }
+    }
+
+    fn mark_meta_changed(&mut self) {
+        self.refresh_artists();
+        self.rebuild_range_cache();
+        self.taste_dirty = true;
+        self.api_dirty = true;
     }
 
     fn refresh_artists(&mut self) {
@@ -1282,8 +1300,12 @@ impl App {
                 self.drain_search();
                 self.drain_control();
                 self.drawer.tick(tick.as_millis() as u64);
-                if self.tick.is_multiple_of(90) {
+                if self.tick != 0 && self.tick.is_multiple_of(90) {
                     self.login = splayer::login_status();
+                }
+                if self.taste_dirty {
+                    self.push_taste();
+                    self.taste_dirty = false;
                 }
                 self.drain_mpris();
                 self.publish_mpris();
@@ -1674,6 +1696,7 @@ impl App {
             KeyCode::Char('.') => {
                 self.prefs.sort_mode = self.prefs.sort_mode.next();
                 self.prefs.save();
+                self.rebuild_range_cache();
                 self.clamp_lib_row();
                 self.status = format!("sort {}", self.prefs.sort_mode.label());
             }
@@ -1845,7 +1868,7 @@ impl App {
     }
 
     fn pump_meta_queue(&mut self) {
-        const META_PARALLEL: usize = 6;
+        const META_PARALLEL: usize = 2;
         while self.meta_inflight.len() < META_PARALLEL {
             let Some(index) = self.meta_queue.pop_front() else {
                 break;
@@ -1976,7 +1999,7 @@ impl App {
                 }
                 self.sync_playable();
                 self.spawn_peek();
-                self.refresh_artists();
+                self.mark_meta_changed();
                 self.list_state.select(if self.tracks.is_empty() {
                     None
                 } else {
@@ -2001,7 +2024,7 @@ impl App {
                 }
                 self.sync_playable();
                 self.spawn_peek();
-                self.refresh_artists();
+                self.mark_meta_changed();
                 self.list_state.select(if self.tracks.is_empty() {
                     None
                 } else {
@@ -2109,7 +2132,7 @@ impl App {
                 mixer.set_tracks(self.tracks.clone());
             }
             self.sync_playable();
-            self.refresh_artists();
+            self.mark_meta_changed();
             self.tracks.len() - 1
         };
         self.search_hits.clear();
@@ -2153,15 +2176,12 @@ impl App {
     }
 
     /// 将当前播放状态同步到 API 共享状态，供远程客户端读取
-    fn update_api_state(&self) {
-        let Ok(mut snap) = self.api_state.lock() else {
-            return;
+    fn update_api_state(&mut self) {
+        let (snapshot, eq) = match self.player.mixer.lock() {
+            Ok(mixer) => (Some(mixer.snapshot(0)), mixer.eq_db()),
+            Err(_) => (None, [0.0; 5]),
         };
 
-        // 播放快照
-        let snapshot = self.player.mixer.lock().ok().map(|m| m.snapshot(0));
-
-        // 当前曲目元数据
         let current_idx = snapshot.as_ref().and_then(|s| s.current);
         let track = current_idx.and_then(|idx| {
             let track = self.tracks.get(idx)?;
@@ -2179,16 +2199,6 @@ impl App {
             })
         });
 
-        // EQ
-        let eq = self
-            .player
-            .mixer
-            .lock()
-            .ok()
-            .map(|m| m.eq_db())
-            .unwrap_or([0.0; 5]);
-
-        // Taste 排行
         let taste_top: Vec<api::TasteEntry> = self
             .taste
             .top_tracks(10)
@@ -2200,28 +2210,6 @@ impl App {
             })
             .collect();
 
-        // 完整资料库（每 tick 重建，开销可接受）
-        let library: Vec<api::TrackInfo> = self
-            .tracks
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let meta = self.metas.get(i).and_then(|m| m.as_ref());
-                api::TrackInfo {
-                    index: i,
-                    title: meta
-                        .map(|m| m.title.clone())
-                        .unwrap_or_else(|| t.title.clone()),
-                    artist: meta.map(|m| m.artist.clone()).unwrap_or_default(),
-                    album: meta.map(|m| m.album.clone()).unwrap_or_default(),
-                    path: t.path.display().to_string(),
-                    has_cover: meta.is_some_and(|m| m.cover.is_some() || m.cover_path.is_some()),
-                    has_lyrics: meta.is_some_and(|m| !m.lyrics.is_empty()),
-                }
-            })
-            .collect();
-
-        // 当前歌词（时间戳行）+ 全库完整 LRC
         let lyrics: Vec<api::LyricLine> = current_idx
             .and_then(|idx| self.metas.get(idx))
             .and_then(|m| m.as_ref())
@@ -2235,17 +2223,7 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        let lyrics_lrc: Vec<String> = self
-            .metas
-            .iter()
-            .map(|slot| {
-                slot.as_ref()
-                    .map(|m| crate::meta::format_lrc(&m.lyrics))
-                    .unwrap_or_default()
-            })
-            .collect();
 
-        // 偏好快照
         let prefs = Some(api::PrefsSnapshot {
             theme: self.prefs.theme.label().into(),
             transparent: self.prefs.transparent,
@@ -2258,23 +2236,78 @@ impl App {
             shuffle_mode: self.prefs.shuffle_mode.label().into(),
         });
 
+        let rebuild_library = self.api_dirty;
+        let library = if rebuild_library {
+            Some(
+                self.tracks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let meta = self.metas.get(i).and_then(|m| m.as_ref());
+                        api::TrackInfo {
+                            index: i,
+                            title: meta
+                                .map(|m| m.title.clone())
+                                .unwrap_or_else(|| t.title.clone()),
+                            artist: meta.map(|m| m.artist.clone()).unwrap_or_default(),
+                            album: meta.map(|m| m.album.clone()).unwrap_or_default(),
+                            path: t.path.display().to_string(),
+                            has_cover: meta
+                                .is_some_and(|m| m.cover.is_some() || m.cover_path.is_some()),
+                            has_lyrics: meta.is_some_and(|m| !m.lyrics.is_empty()),
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        let lyrics_lrc = if rebuild_library {
+            Some(
+                self.metas
+                    .iter()
+                    .map(|slot| {
+                        slot.as_ref()
+                            .map(|m| crate::meta::format_lrc(&m.lyrics))
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        let cover_paths = if rebuild_library {
+            Some(
+                self.metas
+                    .iter()
+                    .map(|slot| slot.as_ref().and_then(|m| m.cover_path.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+
+        let Ok(mut snap) = self.api_state.lock() else {
+            return;
+        };
         snap.snapshot = snapshot;
         snap.track = track;
         snap.tracks_total = self.tracks.len();
         snap.eq = eq;
         snap.taste_top = taste_top;
         snap.total_listen_secs = self.taste.total_listen_secs();
-        let cover_paths: Vec<Option<std::path::PathBuf>> = self
-            .metas
-            .iter()
-            .map(|slot| slot.as_ref().and_then(|m| m.cover_path.clone()))
-            .collect();
-
-        snap.library = library;
         snap.lyrics = lyrics;
-        snap.lyrics_lrc = lyrics_lrc;
-        snap.cover_paths = cover_paths;
         snap.prefs = prefs;
+        if let Some(library) = library {
+            snap.library = library;
+        }
+        if let Some(lyrics_lrc) = lyrics_lrc {
+            snap.lyrics_lrc = lyrics_lrc;
+        }
+        if let Some(cover_paths) = cover_paths {
+            snap.cover_paths = cover_paths;
+        }
+        self.api_dirty = false;
     }
 
     fn drain_control(&mut self) {
@@ -2529,6 +2562,7 @@ impl App {
                         let keep = self.selected();
                         self.prefs.sort_mode = target;
                         self.prefs.save();
+                        self.rebuild_range_cache();
                         self.sync_list_cursor(keep);
                         self.status = format!("sort {}", self.prefs.sort_mode.label());
                     }
@@ -3006,32 +3040,48 @@ impl App {
 
     fn draw_list(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect, snap: &Snapshot) {
         let pal = self.palette();
-        let extras: Vec<String> = {
-            let mixer = self.player.mixer.lock().expect("mixer");
-            self.tracks
+        let inner_h = area.height.saturating_sub(2).max(1) as usize;
+        let selected = self.list_state.selected();
+        let offset = self.list_state.offset();
+        let (start, end, window_sel) = if !self.local_filter.is_empty() {
+            let (start, end) = visible_window(self.local_hits.len(), selected, offset, inner_h);
+            *self.list_state.offset_mut() = start;
+            (start, end, selected.map(|s| s.saturating_sub(start)))
+        } else {
+            let (start, end) = visible_window(self.range_rows().len(), selected, offset, inner_h);
+            *self.list_state.offset_mut() = start;
+            (start, end, selected.map(|s| s.saturating_sub(start)))
+        };
+        let visible_idx: Vec<usize> = if !self.local_filter.is_empty() {
+            self.local_hits[start..end].to_vec()
+        } else {
+            self.range_rows()[start..end]
                 .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    mixer
-                        .analysis_at(i)
-                        .map(|a| {
-                            format!(
-                                "  {} {}",
-                                a.bpm
-                                    .map(|b| format!("{b:.0}"))
-                                    .unwrap_or_else(|| "--".into()),
-                                a.camelot.map(|c| c.label()).unwrap_or_else(|| "--".into())
-                            )
-                        })
-                        .unwrap_or_default()
+                .filter_map(|row| match row {
+                    RangeRow::Present(i) => Some(*i),
+                    RangeRow::Missing(_) => None,
                 })
                 .collect()
         };
-        let items: Vec<ListItem> = if !self.local_filter.is_empty() {
-            self.local_hits
+        let extras: Vec<(usize, String)> = {
+            let mixer = self.player.mixer.lock().expect("mixer");
+            visible_idx
                 .iter()
+                .map(|&i| (i, analysis_label(mixer.analysis_at(i))))
+                .collect()
+        };
+        let extra_at = |i: usize| -> String {
+            extras
+                .iter()
+                .find(|(idx, _)| *idx == i)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default()
+        };
+        let items: Vec<ListItem> = if !self.local_filter.is_empty() {
+            let hits = self.local_hits[start..end].to_vec();
+            hits.iter()
                 .map(|&i| {
-                    let extra = extras.get(i).cloned().unwrap_or_default();
+                    let extra = extra_at(i);
                     let (text, playing) = self.track_row_text(i, snap, &extra);
                     let mut item = ListItem::new(text);
                     if playing {
@@ -3041,12 +3091,12 @@ impl App {
                 })
                 .collect()
         } else {
-            self.range_rows()
-                .into_iter()
+            let rows = self.range_rows()[start..end].to_vec();
+            rows.iter()
                 .map(|row| match row {
                     RangeRow::Present(i) => {
-                        let extra = extras.get(i).cloned().unwrap_or_default();
-                        let (text, playing) = self.track_row_text(i, snap, &extra);
+                        let extra = extra_at(*i);
+                        let (text, playing) = self.track_row_text(*i, snap, &extra);
                         let mut item = ListItem::new(text);
                         if playing {
                             item = item.style(Style::default().magenta());
@@ -3082,7 +3132,9 @@ impl App {
             .style(pal.text_style())
             .highlight_style(pal.highlight())
             .highlight_symbol("▶ ");
-        frame.render_stateful_widget(list, area, &mut self.list_state);
+        let mut window_state = ListState::default();
+        window_state.select(window_sel);
+        frame.render_stateful_widget(list, area, &mut window_state);
     }
 
     fn draw_lyrics(
@@ -3641,6 +3693,41 @@ fn visible_row(visible: &[usize], track_index: usize) -> Option<usize> {
     visible.iter().position(|&i| i == track_index)
 }
 
+fn visible_window(
+    len: usize,
+    selected: Option<usize>,
+    offset: usize,
+    height: usize,
+) -> (usize, usize) {
+    if len == 0 || height == 0 {
+        return (0, 0);
+    }
+    let height = height.min(len);
+    let mut start = offset.min(len.saturating_sub(height));
+    if let Some(sel) = selected {
+        if sel < start {
+            start = sel;
+        } else if sel >= start + height {
+            start = sel + 1 - height;
+        }
+    }
+    (start, start + height)
+}
+
+fn analysis_label(analysis: Option<&TrackAnalysis>) -> String {
+    analysis
+        .map(|a| {
+            format!(
+                "  {} {}",
+                a.bpm
+                    .map(|b| format!("{b:.0}"))
+                    .unwrap_or_else(|| "--".into()),
+                a.camelot.map(|c| c.label()).unwrap_or_else(|| "--".into())
+            )
+        })
+        .unwrap_or_default()
+}
+
 fn context_target_for_tab(
     tab: Tab,
     highlighted: Option<ContextTarget>,
@@ -3894,6 +3981,16 @@ mod tests {
         let visible = [4, 9, 12];
         assert_eq!(visible_row(&visible, 9), Some(1));
         assert_eq!(visible_row(&visible, 0), None);
+    }
+
+    #[test]
+    fn visible_window_keeps_selection_in_view() {
+        assert_eq!(visible_window(0, None, 0, 10), (0, 0));
+        assert_eq!(visible_window(3, Some(1), 0, 10), (0, 3));
+        assert_eq!(visible_window(20, Some(0), 5, 8), (0, 8));
+        assert_eq!(visible_window(20, Some(19), 0, 8), (12, 20));
+        assert_eq!(visible_window(20, Some(10), 0, 8), (3, 11));
+        assert_eq!(visible_window(20, Some(4), 2, 8), (2, 10));
     }
 
     #[test]
