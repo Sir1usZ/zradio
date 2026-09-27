@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::meta::TrackMeta;
@@ -15,12 +16,25 @@ const EXTENSIONS: &[&str] = &[
 
 pub fn scan_library(root: &Path) -> anyhow::Result<Vec<Track>> {
     let mut tracks = Vec::new();
-    scan_dir(root, &mut tracks)?;
+    let mut visited = HashSet::new();
+    scan_dir(root, &mut tracks, &mut visited)?;
     tracks.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(tracks)
 }
 
-fn scan_dir(dir: &Path, out: &mut Vec<Track>) -> anyhow::Result<()> {
+fn scan_dir(
+    dir: &Path,
+    out: &mut Vec<Track>,
+    visited: &mut HashSet<PathBuf>,
+) -> anyhow::Result<()> {
+    let canonical = match std::fs::canonicalize(dir) {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if !visited.insert(canonical) {
+        return Ok(());
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -39,10 +53,22 @@ fn scan_dir(dir: &Path, out: &mut Vec<Track>) -> anyhow::Result<()> {
             Err(_) => continue,
         };
         if file_type.is_dir() {
-            scan_dir(&path, out)?;
+            scan_dir(&path, out, visited)?;
             continue;
         }
-        if !file_type.is_file() {
+        let is_file = if file_type.is_symlink() {
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => {
+                    scan_dir(&path, out, visited)?;
+                    continue;
+                }
+                Ok(metadata) => metadata.is_file(),
+                Err(_) => false,
+            }
+        } else {
+            file_type.is_file()
+        };
+        if !is_file {
             continue;
         }
         let ext = path
@@ -165,6 +191,31 @@ mod tests {
         assert_eq!(titles, ["Song One", "outro"]);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_library_follows_symlinked_audio_without_looping() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("zradio-scan-symlink-{}", std::process::id()));
+        let root = base.join("library");
+        let source = base.join("source");
+        let album = source.join("album");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&album).unwrap();
+        fs::write(source.join("linked.flac"), b"x").unwrap();
+        fs::write(album.join("inside.mp3"), b"x").unwrap();
+        symlink(source.join("linked.flac"), root.join("linked.flac")).unwrap();
+        symlink(&album, root.join("linked-album")).unwrap();
+        symlink(&root, album.join("back-to-library")).unwrap();
+
+        let tracks = scan_library(&root).unwrap();
+        let titles: Vec<_> = tracks.iter().map(|track| track.title.as_str()).collect();
+        assert_eq!(titles, ["inside", "linked"]);
+
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
