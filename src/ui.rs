@@ -51,28 +51,62 @@ use crate::shell::{format_listen_time, Tab};
 use crate::splayer;
 use crate::taste::TasteStore;
 
-struct DecodeJob {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TrackJobId {
+    generation: u64,
     index: usize,
+    path: PathBuf,
+}
+
+impl TrackJobId {
+    fn matches(&self, generation: u64, tracks: &[Track]) -> bool {
+        self.generation == generation
+            && tracks
+                .get(self.index)
+                .is_some_and(|track| track.path == self.path)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodeRequestId {
+    track: TrackJobId,
+    serial: u64,
+}
+
+fn decode_request_is_current(
+    completed: &DecodeRequestId,
+    inflight: Option<&DecodeRequestId>,
+    generation: u64,
+    tracks: &[Track],
+) -> bool {
+    inflight == Some(completed) && completed.track.matches(generation, tracks)
+}
+
+struct DecodeJob {
+    id: DecodeRequestId,
     transition: bool,
     skip: bool,
     buf: AudioBuf,
     analysis: TrackAnalysis,
-    path: PathBuf,
+}
+
+struct DecodeFailure {
+    id: DecodeRequestId,
+    error: String,
 }
 
 struct PeekJob {
-    index: usize,
+    id: TrackJobId,
     meta: TrackMeta,
 }
 
 struct RemoteMetaJob {
-    index: usize,
+    id: TrackJobId,
     lyrics: Option<String>,
     cover: Option<Vec<u8>>,
     artist: Option<String>,
     title: Option<String>,
     album: Option<String>,
-    path: PathBuf,
 }
 
 pub struct App {
@@ -83,9 +117,11 @@ pub struct App {
     decoding: bool,
     prefetch_attempt: Option<usize>,
     analysis: AnalysisStore,
-    decode_rx: Receiver<Result<DecodeJob, (usize, String)>>,
-    decode_tx: std::sync::mpsc::Sender<Result<DecodeJob, (usize, String)>>,
-    inflight: Option<usize>,
+    decode_rx: Receiver<Result<DecodeJob, DecodeFailure>>,
+    decode_tx: std::sync::mpsc::Sender<Result<DecodeJob, DecodeFailure>>,
+    inflight: Option<DecodeRequestId>,
+    next_decode_serial: u64,
+    library_generation: u64,
     metas: Vec<Option<TrackMeta>>,
     peek_rx: Receiver<PeekJob>,
     peek_tx: std::sync::mpsc::Sender<PeekJob>,
@@ -126,7 +162,7 @@ pub struct App {
     pending_seek: Option<f32>,
     browse_kind: BrowseKind,
     meta_queue: VecDeque<usize>,
-    meta_inflight: HashSet<usize>,
+    meta_inflight: HashSet<TrackJobId>,
     /// 远程控制 API 共享状态
     api_state: api::SharedState,
     playlists: PlaylistStore,
@@ -263,6 +299,8 @@ impl App {
             decode_rx,
             decode_tx,
             inflight: None,
+            next_decode_serial: 0,
+            library_generation: 0,
             metas,
             peek_rx,
             peek_tx,
@@ -328,6 +366,24 @@ impl App {
 
     fn selected(&self) -> usize {
         self.selected_present().unwrap_or(0)
+    }
+
+    fn track_job_id(&self, index: usize) -> Option<TrackJobId> {
+        self.tracks.get(index).map(|track| TrackJobId {
+            generation: self.library_generation,
+            index,
+            path: track.path.clone(),
+        })
+    }
+
+    fn invalidate_library_jobs(&mut self) {
+        self.library_generation = self.library_generation.wrapping_add(1);
+        self.decoding = false;
+        self.inflight = None;
+        self.prefetch_attempt = None;
+        self.pending_seek = None;
+        self.meta_queue.clear();
+        self.meta_inflight.clear();
     }
 
     fn persist_playlists(&mut self) -> bool {
@@ -547,7 +603,10 @@ impl App {
     }
 
     fn enqueue_one_meta(&mut self, index: usize) {
-        if self.meta_inflight.contains(&index) || self.meta_queue.contains(&index) {
+        let inflight = self
+            .track_job_id(index)
+            .is_some_and(|id| self.meta_inflight.contains(&id));
+        if inflight || self.meta_queue.contains(&index) {
             self.meta_queue.retain(|&i| i != index);
             self.meta_queue.push_front(index);
             self.status = "补全排队".into();
@@ -805,8 +864,17 @@ impl App {
         let Some(track) = self.tracks.get(index).cloned() else {
             return;
         };
+        self.next_decode_serial = self.next_decode_serial.wrapping_add(1);
+        let id = DecodeRequestId {
+            track: TrackJobId {
+                generation: self.library_generation,
+                index,
+                path: track.path.clone(),
+            },
+            serial: self.next_decode_serial,
+        };
         self.decoding = true;
-        self.inflight = Some(index);
+        self.inflight = Some(id.clone());
         self.status = format!("decode {}", track.title);
         let rate = self.player.sample_rate;
         let ch = self.player.channels;
@@ -816,27 +884,43 @@ impl App {
             let result = load_track(&track.path, rate, ch).map(|buf| {
                 let analysis = cached.unwrap_or_else(|| analyze_buffer(&buf));
                 DecodeJob {
-                    index,
+                    id: id.clone(),
                     transition,
                     skip,
                     buf,
                     analysis,
-                    path: track.path,
                 }
             });
-            let _ = tx.send(result.map_err(|err| (index, err.to_string())));
+            let _ = tx.send(result.map_err(|err| DecodeFailure {
+                id,
+                error: err.to_string(),
+            }));
         });
     }
 
     fn drain_decode(&mut self) {
         loop {
             match self.decode_rx.try_recv() {
-                Ok(Ok(job)) => self.take_decode(job),
-                Ok(Err((index, err))) => {
-                    if self.inflight == Some(index) {
+                Ok(Ok(job)) => {
+                    if decode_request_is_current(
+                        &job.id,
+                        self.inflight.as_ref(),
+                        self.library_generation,
+                        &self.tracks,
+                    ) {
+                        self.take_decode(job);
+                    }
+                }
+                Ok(Err(failure)) => {
+                    if decode_request_is_current(
+                        &failure.id,
+                        self.inflight.as_ref(),
+                        self.library_generation,
+                        &self.tracks,
+                    ) {
                         self.decoding = false;
                         self.inflight = None;
-                        self.status = format!("fail {err}");
+                        self.status = format!("fail {}", failure.error);
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -846,7 +930,9 @@ impl App {
     }
 
     fn take_decode(&mut self, mut job: DecodeJob) {
-        if let Ok(meta) = std::fs::metadata(&job.path) {
+        let index = job.id.track.index;
+        let path = &job.id.track.path;
+        if let Ok(meta) = std::fs::metadata(path) {
             job.analysis.mtime = meta
                 .modified()
                 .ok()
@@ -855,42 +941,42 @@ impl App {
                 .unwrap_or(0);
             job.analysis.size = meta.len();
         }
-        self.analysis.insert(&job.path, job.analysis.clone());
+        self.analysis.insert(path, job.analysis.clone());
         let remix = self.player.mixer.lock().expect("mixer").remix();
         let buf = apply_remix(&job.buf, remix);
         let mut mixer = self.player.mixer.lock().expect("mixer");
-        mixer.set_analysis(job.index, job.analysis);
+        mixer.set_analysis(index, job.analysis);
         let meta = load_meta(
-            &job.path,
+            path,
             &self
                 .tracks
-                .get(job.index)
+                .get(index)
                 .map(|t| t.title.clone())
                 .unwrap_or_default(),
         );
-        mixer.set_track_title(job.index, meta.title.clone());
-        if let Some(track) = self.tracks.get_mut(job.index) {
+        mixer.set_track_title(index, meta.title.clone());
+        if let Some(track) = self.tracks.get_mut(index) {
             track.title = meta.title.clone();
         }
-        if job.index >= self.metas.len() {
-            self.metas.resize(job.index + 1, None);
+        if index >= self.metas.len() {
+            self.metas.resize(index + 1, None);
         }
-        self.metas[job.index] = Some(meta.clone());
+        self.metas[index] = Some(meta.clone());
         let queue_remote = self.wants_remote(&meta);
         drop(mixer);
         if queue_remote {
-            self.queue_meta(job.index);
+            self.queue_meta(index);
         }
         self.refresh_artists();
         self.push_taste();
         let mut mixer = self.player.mixer.lock().expect("mixer");
         if job.transition && mixer.mix().uses_fade() {
-            mixer.start_transition(job.index, buf, job.skip);
+            mixer.start_transition(index, buf, job.skip);
         } else {
-            mixer.play_decoded(job.index, buf);
+            mixer.play_decoded(index, buf);
         }
         if let Some(secs) = self.pending_seek.take() {
-            let snap = mixer.snapshot(job.index);
+            let snap = mixer.snapshot(index);
             let duration = if snap.sample_rate == 0 {
                 0.0
             } else {
@@ -899,9 +985,9 @@ impl App {
             mixer.seek_to(crate::session_store::resume_seek(secs, duration));
         }
         self.last_taste = None;
-        self.status = mixer.snapshot(job.index).status;
+        self.status = mixer.snapshot(index).status;
         drop(mixer);
-        if self.inflight == Some(job.index) {
+        if self.inflight.as_ref() == Some(&job.id) {
             self.decoding = false;
             self.inflight = None;
         }
@@ -913,13 +999,16 @@ impl App {
     }
 
     fn queue_meta(&mut self, index: usize) {
-        if self.meta_inflight.contains(&index) || self.meta_queue.contains(&index) {
+        let Some(id) = self.track_job_id(index) else {
+            return;
+        };
+        if self.meta_inflight.contains(&id) || self.meta_queue.contains(&index) {
             return;
         }
         self.meta_queue.push_back(index);
     }
 
-    fn spawn_remote_meta(&self, index: usize, path: PathBuf, meta: TrackMeta) {
+    fn spawn_remote_meta(&self, id: TrackJobId, meta: TrackMeta) {
         let tx = self.remote_tx.clone();
         let lyrics_on = meta.lyrics.is_empty() && self.prefs.lyrics_fetch;
         let need_tags = meta.artist.trim().is_empty() || meta.album.trim().is_empty();
@@ -937,13 +1026,12 @@ impl App {
                 crate::remote_meta::RemoteFill::default()
             };
             let _ = tx.send(RemoteMetaJob {
-                index,
+                id,
                 lyrics: fill.lyrics,
                 cover: fill.cover,
                 artist: fill.artist,
                 title: fill.title,
                 album: fill.album,
-                path,
             });
         });
     }
@@ -951,14 +1039,19 @@ impl App {
     fn drain_remote_meta(&mut self) {
         let mut changed = false;
         while let Ok(job) = self.remote_rx.try_recv() {
-            self.meta_inflight.remove(&job.index);
-            if job.index >= self.metas.len() {
+            if !job.id.matches(self.library_generation, &self.tracks)
+                || !self.meta_inflight.remove(&job.id)
+            {
                 continue;
             }
-            if self.metas[job.index].is_none() {
-                self.metas[job.index] = Some(TrackMeta::default());
+            let index = job.id.index;
+            if index >= self.metas.len() {
+                continue;
             }
-            let Some(slot) = self.metas[job.index].as_mut() else {
+            if self.metas[index].is_none() {
+                self.metas[index] = Some(TrackMeta::default());
+            }
+            let Some(slot) = self.metas[index].as_mut() else {
                 continue;
             };
             if slot.artist.trim().is_empty() {
@@ -970,7 +1063,7 @@ impl App {
             if slot.title.trim().is_empty() {
                 if let Some(title) = job.title.filter(|s| !s.trim().is_empty()) {
                     slot.title = title.clone();
-                    if let Some(track) = self.tracks.get_mut(job.index) {
+                    if let Some(track) = self.tracks.get_mut(index) {
                         track.title = title;
                     }
                     changed = true;
@@ -983,12 +1076,12 @@ impl App {
                 }
             }
             if let Some(raw) = job.lyrics {
-                crate::remote_meta::save_sidecar_lrc(&job.path, &raw);
+                crate::remote_meta::save_sidecar_lrc(&job.id.path, &raw);
                 slot.lyrics = crate::meta::parse_lyrics(&raw);
                 changed = true;
             }
             if let Some(bytes) = job.cover {
-                if let Some((cover_path, cover)) = crate::meta::cache_cover(&job.path, &bytes) {
+                if let Some((cover_path, cover)) = crate::meta::cache_cover(&job.id.path, &bytes) {
                     slot.cover_path = Some(cover_path);
                     slot.cover = cover;
                     changed = true;
@@ -1002,17 +1095,26 @@ impl App {
     }
 
     fn spawn_peek(&self) {
-        let tracks: Vec<(usize, PathBuf, String)> = self
+        let tracks: Vec<(TrackJobId, String)> = self
             .tracks
             .iter()
             .enumerate()
-            .map(|(i, t)| (i, t.path.clone(), t.title.clone()))
+            .map(|(index, track)| {
+                (
+                    TrackJobId {
+                        generation: self.library_generation,
+                        index,
+                        path: track.path.clone(),
+                    },
+                    track.title.clone(),
+                )
+            })
             .collect();
         let tx = self.peek_tx.clone();
         thread::spawn(move || {
-            for (index, path, title) in tracks {
-                let meta = peek_tags(&path, &title);
-                if tx.send(PeekJob { index, meta }).is_err() {
+            for (id, title) in tracks {
+                let meta = peek_tags(&id.path, &title);
+                if tx.send(PeekJob { id, meta }).is_err() {
                     break;
                 }
             }
@@ -1024,27 +1126,31 @@ impl App {
         loop {
             match self.peek_rx.try_recv() {
                 Ok(job) => {
-                    if job.index >= self.metas.len() {
-                        self.metas.resize(job.index + 1, None);
+                    if !job.id.matches(self.library_generation, &self.tracks) {
+                        continue;
                     }
-                    if apply_peek(&mut self.metas[job.index], job.meta) {
-                        if let Some(title) = self.metas[job.index]
+                    let index = job.id.index;
+                    if index >= self.metas.len() {
+                        continue;
+                    }
+                    if apply_peek(&mut self.metas[index], job.meta) {
+                        if let Some(title) = self.metas[index]
                             .as_ref()
                             .map(|m| m.title.clone())
                             .filter(|t| !t.is_empty())
                         {
-                            if let Some(track) = self.tracks.get_mut(job.index) {
+                            if let Some(track) = self.tracks.get_mut(index) {
                                 track.title = title;
                             }
                         }
                         n += 1;
                         if self
                             .metas
-                            .get(job.index)
+                            .get(index)
                             .and_then(|m| m.as_ref())
                             .is_some_and(|m| self.wants_remote(m))
                         {
-                            self.queue_meta(job.index);
+                            self.queue_meta(index);
                         }
                     }
                 }
@@ -1719,7 +1825,10 @@ impl App {
     fn enqueue_missing_meta(&mut self) -> usize {
         let mut n = 0;
         for i in 0..self.tracks.len() {
-            if self.meta_inflight.contains(&i) || self.meta_queue.contains(&i) {
+            let inflight = self
+                .track_job_id(i)
+                .is_some_and(|id| self.meta_inflight.contains(&id));
+            if inflight || self.meta_queue.contains(&i) {
                 continue;
             }
             let missing = self
@@ -1741,25 +1850,25 @@ impl App {
             let Some(index) = self.meta_queue.pop_front() else {
                 break;
             };
-            if self.meta_inflight.contains(&index) {
-                continue;
-            }
-            let Some(track) = self.tracks.get(index) else {
+            let Some(id) = self.track_job_id(index) else {
                 continue;
             };
+            if self.meta_inflight.contains(&id) {
+                continue;
+            }
             let meta = self
                 .metas
                 .get(index)
                 .and_then(|m| m.clone())
                 .unwrap_or_else(|| TrackMeta {
-                    title: track.title.clone(),
+                    title: self.tracks[index].title.clone(),
                     ..TrackMeta::default()
                 });
             if !self.wants_remote(&meta) {
                 continue;
             }
-            self.meta_inflight.insert(index);
-            self.spawn_remote_meta(index, track.path.clone(), meta);
+            self.meta_inflight.insert(id.clone());
+            self.spawn_remote_meta(id, meta);
         }
         if !self.meta_inflight.is_empty() {
             self.job = Some(format!(
@@ -1856,12 +1965,11 @@ impl App {
     fn open_folder(&mut self, root: PathBuf) {
         match scan_library(&root) {
             Ok(tracks) => {
+                self.invalidate_library_jobs();
                 self.prefs.set_library(&root);
                 self.prefs.save();
                 self.tracks = tracks;
                 self.metas = vec![None; self.tracks.len()];
-                self.meta_queue.clear();
-                self.meta_inflight.clear();
                 if let Ok(mut mixer) = self.player.mixer.lock() {
                     mixer.set_tracks(self.tracks.clone());
                     mixer.set_shuffle_mode(self.prefs.shuffle_mode);
@@ -1884,10 +1992,9 @@ impl App {
         let root = self.prefs.library_path();
         match scan_library(&root) {
             Ok(tracks) => {
+                self.invalidate_library_jobs();
                 self.tracks = tracks;
                 self.metas = vec![None; self.tracks.len()];
-                self.meta_queue.clear();
-                self.meta_inflight.clear();
                 if let Ok(mut mixer) = self.player.mixer.lock() {
                     mixer.set_tracks(self.tracks.clone());
                     mixer.set_shuffle_mode(self.prefs.shuffle_mode);
@@ -3686,6 +3793,77 @@ fn stderr_log_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job_track(path: &str) -> Track {
+        Track {
+            path: PathBuf::from(path),
+            title: path.into(),
+        }
+    }
+
+    #[test]
+    fn track_job_accepts_current_generation_index_and_path() {
+        let tracks = vec![job_track("/new/a.flac")];
+        let job = TrackJobId {
+            generation: 7,
+            index: 0,
+            path: PathBuf::from("/new/a.flac"),
+        };
+
+        assert!(job.matches(7, &tracks));
+    }
+
+    #[test]
+    fn track_job_rejects_stale_generation() {
+        let tracks = vec![job_track("/new/a.flac")];
+        let job = TrackJobId {
+            generation: 6,
+            index: 0,
+            path: PathBuf::from("/new/a.flac"),
+        };
+
+        assert!(!job.matches(7, &tracks));
+    }
+
+    #[test]
+    fn track_job_rejects_reused_index_with_different_path() {
+        let tracks = vec![job_track("/new/a.flac")];
+        let job = TrackJobId {
+            generation: 7,
+            index: 0,
+            path: PathBuf::from("/old/a.flac"),
+        };
+
+        assert!(!job.matches(7, &tracks));
+    }
+
+    #[test]
+    fn track_job_rejects_superseded_decode_request() {
+        let tracks = vec![job_track("/new/a.flac")];
+        let track = TrackJobId {
+            generation: 7,
+            index: 0,
+            path: PathBuf::from("/new/a.flac"),
+        };
+        let completed = DecodeRequestId {
+            track: track.clone(),
+            serial: 10,
+        };
+        let latest = DecodeRequestId { track, serial: 11 };
+
+        assert!(!decode_request_is_current(
+            &completed,
+            Some(&latest),
+            7,
+            &tracks
+        ));
+        assert!(decode_request_is_current(
+            &latest,
+            Some(&latest),
+            7,
+            &tracks
+        ));
+    }
 
     #[test]
     fn overlay_panel_is_smaller_than_scrim() {
