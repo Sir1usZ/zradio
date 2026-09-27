@@ -361,12 +361,9 @@ fn store_cover(
     mime: Option<&str>,
 ) -> Option<(PathBuf, Option<crate::cover::CoverArt>)> {
     let cache = cover_cache_dir()?;
-    let ext = match mime.unwrap_or("") {
-        "image/png" => "png",
-        _ => "jpg",
-    };
+    let ext = cover_extension(data, mime);
     let stem = src.file_stem()?.to_string_lossy();
-    let out = cache.join(format!("{stem}.{ext}"));
+    let out = cache.join(cover_cache_name(src, ext));
     fs::write(&out, data).ok()?;
     if let Some(dir) = src.parent() {
         let folder = dir.join("cover");
@@ -374,6 +371,48 @@ fn store_cover(
         let _ = fs::write(folder.join(format!("{stem}.{ext}")), data);
     }
     Some((out, crate::cover::CoverArt::from_bytes(data)))
+}
+
+fn cover_extension(data: &[u8], mime: Option<&str>) -> &'static str {
+    match mime.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("image/png") => return "png",
+        Some("image/gif") => return "gif",
+        Some("image/webp") => return "webp",
+        Some("image/jpeg" | "image/jpg") => return "jpg",
+        _ => {}
+    }
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        "gif"
+    } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        "jpg"
+    }
+}
+
+fn cover_cache_name(src: &Path, ext: &str) -> String {
+    let stem: String = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cover")
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in src.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{stem}-{hash:016x}.{ext}")
 }
 
 fn cover_cache_dir() -> Option<PathBuf> {
@@ -392,6 +431,28 @@ pub fn file_url(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cover_cache_names_distinguish_equal_stems_in_different_folders() {
+        let first = cover_cache_name(Path::new("/music/album-a/song.mp3"), "jpg");
+        let second = cover_cache_name(Path::new("/music/album-b/song.mp3"), "jpg");
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("song-"));
+        assert!(first.ends_with(".jpg"));
+    }
+
+    #[test]
+    fn cover_cache_type_uses_signature_when_mime_is_missing() {
+        let png = b"\x89PNG\r\n\x1a\nrest";
+        let gif = b"GIF89arest";
+        let webp = b"RIFF\x08\x00\x00\x00WEBPrest";
+
+        assert_eq!(cover_extension(png, None), "png");
+        assert_eq!(cover_extension(gif, None), "gif");
+        assert_eq!(cover_extension(webp, None), "webp");
+        assert_eq!(cover_extension(png, Some("image/jpeg")), "jpg");
+    }
 
     #[test]
     fn parse_lrc_times_and_text() {
