@@ -136,6 +136,16 @@ pub struct Login {
     pub name: String,
 }
 
+impl Login {
+    pub fn anonymous() -> Self {
+        Self {
+            logged_in: false,
+            vip: false,
+            name: "ANON".into(),
+        }
+    }
+}
+
 fn cookie_header() -> Option<String> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
     let db = home.join(".config/SPlayer/Cookies");
@@ -176,6 +186,9 @@ pub fn login_status() -> Login {
                 return login.clone();
             }
         }
+    }
+    if cookie_header().is_none() {
+        return Login::anonymous();
     }
     let login = fetch_login_status();
     if let Ok(mut guard) = cache.lock() {
@@ -526,6 +539,29 @@ mod tests {
     #[test]
     fn encode_spaces() {
         assert_eq!(urlencoding("SOS Avicii"), "SOS%20Avicii");
+    }
+
+    #[test]
+    fn anonymous_login_is_offline() {
+        let login = Login::anonymous();
+        assert!(!login.logged_in);
+        assert!(!login.vip);
+        assert_eq!(login.name, "ANON");
+    }
+
+    #[test]
+    fn login_status_without_cookie_does_not_block() {
+        if cookie_header().is_some() {
+            return;
+        }
+        let started = Instant::now();
+        let login = login_status();
+        assert!(
+            started.elapsed().as_millis() < 200,
+            "login_status without cookie must not wait on HTTP, took {:?}",
+            started.elapsed()
+        );
+        assert!(!login.logged_in);
     }
 
     #[test]
