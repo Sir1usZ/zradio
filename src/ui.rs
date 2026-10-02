@@ -2879,7 +2879,7 @@ impl App {
         let fg = if t >= 0.85 {
             pal.text_style().add_modifier(Modifier::BOLD)
         } else if t >= 0.35 {
-            pal.accent_style()
+            pal.accent_style().add_modifier(Modifier::BOLD)
         } else {
             pal.dim_style()
         };

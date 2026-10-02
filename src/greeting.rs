@@ -3,9 +3,9 @@ use ratatui::layout::Rect;
 use crate::drawer::ease_out_quad;
 
 pub const FADE_IN_MS: u64 = 400;
-pub const HOLD_MS: u64 = 6000;
+pub const HOLD_MS: u64 = 5000;
 pub const FADE_OUT_MS: u64 = 600;
-pub const GREET_HEIGHT: u16 = 3;
+pub const GREET_HEIGHT: u16 = 5;
 
 pub const fn total_ms() -> u64 {
     FADE_IN_MS + HOLD_MS + FADE_OUT_MS
@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn hold_keeps_greeting_up_for_six_seconds() {
+    fn hold_keeps_greeting_up_for_five_seconds() {
         let mut anim = GreetingAnim::new();
         anim.tick(FADE_IN_MS + HOLD_MS - 1);
         assert!(anim.is_visible());
