@@ -11,6 +11,7 @@ pub mod dsp;
 pub mod engine;
 pub mod eq;
 pub mod fetch;
+pub mod greeting;
 pub mod library;
 pub mod meta;
 pub mod mpris;

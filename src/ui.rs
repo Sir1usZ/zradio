@@ -36,6 +36,7 @@ use crate::dsp::MixMode;
 use crate::engine::{load_track, Player, Snapshot};
 use crate::eq::Equalizer;
 use crate::fetch::{self, looks_like_media_url};
+use crate::greeting::{greeting_line, local_hour, music_split, system_name, GreetingAnim};
 use crate::library::{scan_library, sort_indices, track_from_path, Track};
 use crate::meta::{
     apply_peek, load_meta, lyric_fill, lyric_progress, lyric_window, needs_fetch, peek_tags,
@@ -230,6 +231,8 @@ pub struct App {
     context_from: Overlay,
     drawer: DrawerAnim,
     drawer_idx: usize,
+    greeting: GreetingAnim,
+    greeting_text: String,
     range_cache: Vec<RangeRow>,
     sorted_idx: Vec<usize>,
     api_dirty: bool,
@@ -415,6 +418,8 @@ impl App {
             context_from: Overlay::None,
             drawer: DrawerAnim::closed(),
             drawer_idx: 0,
+            greeting: GreetingAnim::new(),
+            greeting_text: greeting_line(local_hour(), &system_name()),
             range_cache: Vec::new(),
             sorted_idx: Vec::new(),
             api_dirty: true,
@@ -1354,6 +1359,7 @@ impl App {
                 self.drain_search();
                 self.drain_control();
                 self.drawer.tick(tick.as_millis() as u64);
+                self.greeting.tick(tick.as_millis() as u64);
                 if let Some(login) = self.login_poller.drain() {
                     self.login = login;
                 }
@@ -2852,10 +2858,38 @@ impl App {
             self.draw_search(frame, area);
             return;
         }
+        let list_area = if self.greeting.is_visible() && self.music_mode == MusicMode::Library {
+            let (greet_area, list_area) = music_split(area, self.greeting.visual());
+            if greet_area.height > 0 {
+                self.draw_greeting(frame, greet_area);
+            }
+            list_area
+        } else {
+            area
+        };
         match self.music_mode {
-            MusicMode::Library => self.draw_list(frame, area, snap),
+            MusicMode::Library => self.draw_list(frame, list_area, snap),
             MusicMode::Artists => self.draw_artists(frame, area),
         }
+    }
+
+    fn draw_greeting(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let pal = self.palette();
+        let t = self.greeting.opacity();
+        let fg = if t >= 0.85 {
+            pal.text_style().add_modifier(Modifier::BOLD)
+        } else if t >= 0.35 {
+            pal.accent_style()
+        } else {
+            pal.dim_style()
+        };
+        let pad = area.height.saturating_sub(1) / 2;
+        let mut lines = vec![Line::from(""); pad as usize];
+        lines.push(Line::from(Span::styled(
+            format!("  {}", self.greeting_text),
+            fg,
+        )));
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn draw_artists(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
