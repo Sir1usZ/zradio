@@ -4,11 +4,22 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::control::ControlCmd;
 use crate::engine::Snapshot;
+
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+
+fn request_body_size_allowed(content_length: usize) -> bool {
+    content_length <= MAX_REQUEST_BODY_BYTES
+}
+
+fn request_read_timeout() -> Duration {
+    Duration::from_secs(5)
+}
 
 // ── 共享状态：App 每个 tick 更新，API 线程读取 ────────────────────
 
@@ -129,6 +140,7 @@ fn handle_connection(
     state: &SharedState,
 ) -> std::io::Result<()> {
     let reader = stream.try_clone()?;
+    reader.set_read_timeout(Some(request_read_timeout()))?;
     let mut buf_reader = BufReader::new(reader);
 
     let mut request_line = String::new();
@@ -152,6 +164,10 @@ fn handle_connection(
         if let Some(val) = trimmed.strip_prefix("content-length:") {
             content_length = val.trim().parse().unwrap_or(0);
         }
+    }
+
+    if !request_body_size_allowed(content_length) {
+        return send_json(&mut stream, 413, &err("request body too large"));
     }
 
     let body = if content_length > 0 {
@@ -842,13 +858,18 @@ fn enqueue_control(tx: &Sender<ControlCmd>, cmd: ControlCmd) -> Result<(), serde
     tx.send(cmd).map_err(|_| err("control unavailable"))
 }
 
-fn send_bytes(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> std::io::Result<()> {
-    let status_text = match status {
+fn http_status_text(status: u16) -> &'static str {
+    match status {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        413 => "Payload Too Large",
         _ => "Error",
-    };
+    }
+}
+
+fn send_bytes(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> std::io::Result<()> {
+    let status_text = http_status_text(status);
     let header = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: {mime}\r\n\
@@ -866,12 +887,7 @@ fn send_bytes(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> s
 
 fn send_json(stream: &mut TcpStream, status: u16, body: &serde_json::Value) -> std::io::Result<()> {
     let json = serde_json::to_vec(body).unwrap_or_default();
-    let status_text = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        _ => "Error",
-    };
+    let status_text = http_status_text(status);
     let header = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: application/json; charset=utf-8\r\n\
@@ -904,6 +920,18 @@ fn send_cors_preflight(stream: &mut TcpStream) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_body_limit_allows_64_kib_and_rejects_more() {
+        assert!(request_body_size_allowed(65_536));
+        assert!(!request_body_size_allowed(65_537));
+        assert_eq!(http_status_text(413), "Payload Too Large");
+    }
+
+    #[test]
+    fn request_reads_have_a_five_second_inactivity_timeout() {
+        assert_eq!(request_read_timeout(), std::time::Duration::from_secs(5));
+    }
 
     #[test]
     fn ok_response_structure() {
