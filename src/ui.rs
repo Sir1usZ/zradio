@@ -94,11 +94,7 @@ fn receive_batch<T>(rx: &Receiver<T>, limit: usize) -> Vec<T> {
     items
 }
 
-fn advance_animations(
-    drawer: &mut DrawerAnim,
-    greeting: &mut GreetingAnim,
-    elapsed: Duration,
-) {
+fn advance_animations(drawer: &mut DrawerAnim, greeting: &mut GreetingAnim, elapsed: Duration) {
     let dt_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     drawer.tick(dt_ms);
     greeting.tick(dt_ms);
