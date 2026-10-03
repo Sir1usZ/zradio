@@ -27,6 +27,17 @@ fn collect_reader_metadata(
     (last_path, last_err)
 }
 
+fn finish_reader_metadata(
+    readers: Vec<JoinHandle<()>>,
+    meta_rx: Receiver<DownloadMeta>,
+    timed_out: bool,
+) -> Option<(String, String)> {
+    if timed_out {
+        return None;
+    }
+    Some(collect_reader_metadata(readers, meta_rx))
+}
+
 pub fn looks_like_media_url(raw: &str) -> bool {
     let s = raw.trim();
     s.contains("youtube.com/")
@@ -177,10 +188,9 @@ pub fn download_audio(
             }
         }
     };
-    let (last_path, last_err) = collect_reader_metadata(readers, meta_rx);
-    if timed_out {
+    let Some((last_path, last_err)) = finish_reader_metadata(readers, meta_rx, timed_out) else {
         anyhow::bail!("yt-dlp hung. login youtube.com in Chrome, then retry");
-    }
+    };
     if !status.success() {
         anyhow::bail!("{}", short_err(&last_err));
     }
@@ -344,5 +354,26 @@ mod tests {
 
         assert_eq!(path, "/tmp/delayed-song.mp3");
         assert_eq!(err, "reader finished");
+    }
+
+    #[test]
+    fn timed_out_download_does_not_wait_for_reader_threads() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (meta_tx, meta_rx) = std::sync::mpsc::channel();
+        let (_release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let reader_finished = Arc::clone(&finished);
+        let reader = std::thread::spawn(move || {
+            let _ = release_rx.recv_timeout(std::time::Duration::from_millis(200));
+            reader_finished.store(true, Ordering::SeqCst);
+            let _ = meta_tx.send((None, None));
+        });
+
+        let metadata = finish_reader_metadata(vec![reader], meta_rx, true);
+
+        assert!(metadata.is_none());
+        assert!(!finished.load(Ordering::SeqCst));
     }
 }
