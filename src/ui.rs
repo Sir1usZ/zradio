@@ -94,6 +94,42 @@ fn receive_batch<T>(rx: &Receiver<T>, limit: usize) -> Vec<T> {
     items
 }
 
+struct CleanupGuard<F: FnOnce()> {
+    cleanup: Option<F>,
+}
+
+impl<F: FnOnce()> CleanupGuard<F> {
+    fn new(cleanup: F) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for CleanupGuard<F> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+fn restore_terminal() -> io::Result<()> {
+    let raw_result = disable_raw_mode();
+    let screen_result = execute!(
+        io::stdout(),
+        crossterm::event::DisableBracketedPaste,
+        DisableFocusChange,
+        LeaveAlternateScreen
+    );
+    raw_result?;
+    screen_result
+}
+
 struct DecodeJob {
     id: DecodeRequestId,
     transition: bool,
@@ -1302,6 +1338,9 @@ impl App {
 
     pub fn run(mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
+        let mut cleanup = CleanupGuard::new(|| {
+            let _ = restore_terminal();
+        });
         let mut stdout = stdout();
         if self.prefs.transparent {
             execute!(
@@ -1391,13 +1430,8 @@ impl App {
         };
         self.save_session();
         self.taste.flush();
-        disable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            crossterm::event::DisableBracketedPaste,
-            DisableFocusChange,
-            LeaveAlternateScreen
-        )?;
+        restore_terminal()?;
+        cleanup.disarm();
         result
     }
 
@@ -3971,6 +4005,21 @@ fn stderr_log_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_guard_runs_on_early_return_and_can_be_disarmed() {
+        let cleanup_count = std::cell::Cell::new(0);
+        {
+            let _guard = CleanupGuard::new(|| cleanup_count.set(cleanup_count.get() + 1));
+        }
+        assert_eq!(cleanup_count.get(), 1);
+
+        {
+            let mut guard = CleanupGuard::new(|| cleanup_count.set(cleanup_count.get() + 1));
+            guard.disarm();
+        }
+        assert_eq!(cleanup_count.get(), 1);
+    }
 
     fn job_track(path: &str) -> Track {
         Track {
