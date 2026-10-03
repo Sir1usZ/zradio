@@ -408,7 +408,7 @@ fn cover_cache_name(src: &Path, ext: &str) -> String {
         })
         .collect();
     let mut hash = 0xcbf29ce484222325u64;
-    for byte in src.to_string_lossy().as_bytes() {
+    for byte in src.as_os_str().as_encoded_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -440,6 +440,22 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with("song-"));
         assert!(first.ends_with(".jpg"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cover_cache_names_preserve_non_utf8_path_identity() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = PathBuf::from(OsString::from_vec(b"/music/\x80/song.mp3".to_vec()));
+        let second = PathBuf::from(OsString::from_vec(b"/music/\x81/song.mp3".to_vec()));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+
+        assert_ne!(
+            cover_cache_name(&first, "jpg"),
+            cover_cache_name(&second, "jpg")
+        );
     }
 
     #[test]
