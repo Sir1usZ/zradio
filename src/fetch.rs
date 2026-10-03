@@ -1,7 +1,31 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread::JoinHandle;
+
+type DownloadMeta = (Option<String>, Option<String>);
+
+fn collect_reader_metadata(
+    readers: Vec<JoinHandle<()>>,
+    meta_rx: Receiver<DownloadMeta>,
+) -> (String, String) {
+    for reader in readers {
+        let _ = reader.join();
+    }
+
+    let mut last_path = String::new();
+    let mut last_err = String::new();
+    for (path, err) in meta_rx.try_iter() {
+        if let Some(path) = path {
+            last_path = path;
+        }
+        if let Some(err) = err {
+            last_err = err;
+        }
+    }
+    (last_path, last_err)
+}
 
 pub fn looks_like_media_url(raw: &str) -> bool {
     let s = raw.trim();
@@ -100,11 +124,12 @@ pub fn download_audio(
     }
     cmd.arg(&url);
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let (meta_tx, meta_rx) = std::sync::mpsc::channel::<(Option<String>, Option<String>)>();
+    let (meta_tx, meta_rx) = std::sync::mpsc::channel::<DownloadMeta>();
+    let mut readers = Vec::with_capacity(2);
     if let Some(stderr) = child.stderr.take() {
         let progress = progress.clone();
         let meta_tx = meta_tx.clone();
-        std::thread::spawn(move || {
+        readers.push(std::thread::spawn(move || {
             let mut last_path = None;
             let mut last_err = None;
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
@@ -124,11 +149,11 @@ pub fn download_audio(
                 }
             }
             let _ = meta_tx.send((last_path, last_err));
-        });
+        }));
     }
     if let Some(stdout) = child.stdout.take() {
         let meta_tx = meta_tx.clone();
-        std::thread::spawn(move || {
+        readers.push(std::thread::spawn(move || {
             let mut last_path = None;
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if looks_like_path(&line) {
@@ -136,31 +161,25 @@ pub fn download_audio(
                 }
             }
             let _ = meta_tx.send((last_path, None));
-        });
+        }));
     }
+    drop(meta_tx);
     let started = std::time::Instant::now();
-    let status = loop {
+    let (status, timed_out) = loop {
         match child.try_wait()? {
-            Some(status) => break status,
+            Some(status) => break (status, false),
             None => {
                 if started.elapsed().as_secs() > 90 {
                     let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!("yt-dlp hung. login youtube.com in Chrome, then retry");
+                    break (child.wait()?, true);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }
     };
-    let mut last_path = String::new();
-    let mut last_err = String::new();
-    while let Ok((path, err)) = meta_rx.try_recv() {
-        if let Some(path) = path {
-            last_path = path;
-        }
-        if let Some(err) = err {
-            last_err = err;
-        }
+    let (last_path, last_err) = collect_reader_metadata(readers, meta_rx);
+    if timed_out {
+        anyhow::bail!("yt-dlp hung. login youtube.com in Chrome, then retry");
     }
     if !status.success() {
         anyhow::bail!("{}", short_err(&last_err));
@@ -307,5 +326,23 @@ mod tests {
         if bin.is_file() {
             assert!(ytdlp_ready());
         }
+    }
+
+    #[test]
+    fn metadata_collection_waits_for_delayed_reader_threads() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            tx.send((
+                Some("/tmp/delayed-song.mp3".to_string()),
+                Some("reader finished".to_string()),
+            ))
+            .unwrap();
+        });
+
+        let (path, err) = collect_reader_metadata(vec![reader], rx);
+
+        assert_eq!(path, "/tmp/delayed-song.mp3");
+        assert_eq!(err, "reader finished");
     }
 }
