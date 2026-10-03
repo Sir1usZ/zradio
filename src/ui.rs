@@ -36,7 +36,10 @@ use crate::dsp::MixMode;
 use crate::engine::{load_track, Player, Snapshot};
 use crate::eq::Equalizer;
 use crate::fetch::{self, looks_like_media_url};
-use crate::greeting::{greeting_line, local_hour, music_split, system_name, GreetingAnim};
+use crate::greeting::{
+    greeting_line, greeting_origin, local_hour, music_split, scaled_span, system_name,
+    GreetingAnim, GREET_SCALE,
+};
 use crate::library::{scan_library, sort_indices, track_from_path, Track};
 use crate::meta::{
     apply_peek, load_meta, lyric_fill, lyric_progress, lyric_window, needs_fetch, peek_tags,
@@ -2883,13 +2886,28 @@ impl App {
         } else {
             pal.dim_style()
         };
-        let pad = area.height.saturating_sub(1) / 2;
-        let mut lines = vec![Line::from(""); pad as usize];
-        lines.push(Line::from(Span::styled(
-            format!("  {}", self.greeting_text),
-            fg,
-        )));
-        frame.render_widget(Paragraph::new(lines), area);
+        let scale = if area.height >= GREET_SCALE as u16 {
+            GREET_SCALE
+        } else {
+            1
+        };
+        let (x, y) = greeting_origin(area, scale);
+        let text = if scale > 1 {
+            scaled_span(&self.greeting_text, scale)
+        } else {
+            format!("  {}", self.greeting_text)
+        };
+        let dest = Rect {
+            x,
+            y,
+            width: area.width.saturating_sub(x.saturating_sub(area.x)),
+            height: (scale as u16).max(1),
+        }
+        .intersection(area);
+        if dest.width == 0 || dest.height == 0 {
+            return;
+        }
+        frame.render_widget(Paragraph::new(Line::from(Span::styled(text, fg))), dest);
     }
 
     fn draw_artists(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
