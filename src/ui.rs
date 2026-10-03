@@ -97,6 +97,16 @@ fn receive_batch<T>(rx: &Receiver<T>, limit: usize) -> Vec<T> {
     items
 }
 
+fn advance_animations(
+    drawer: &mut DrawerAnim,
+    greeting: &mut GreetingAnim,
+    elapsed: Duration,
+) {
+    let dt_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    drawer.tick(dt_ms);
+    greeting.tick(dt_ms);
+}
+
 struct CleanupGuard<F: FnOnce()> {
     cleanup: Option<F>,
 }
@@ -1411,7 +1421,9 @@ impl App {
                     _ => {}
                 }
             }
-            if last.elapsed() >= tick {
+            let elapsed = last.elapsed();
+            if elapsed >= tick {
+                last = Instant::now();
                 self.tick = self.tick.wrapping_add(1);
                 self.drain_decode();
                 self.drain_peek();
@@ -1425,8 +1437,7 @@ impl App {
                 self.drain_import();
                 self.drain_search();
                 self.drain_control();
-                self.drawer.tick(tick.as_millis() as u64);
-                self.greeting.tick(tick.as_millis() as u64);
+                advance_animations(&mut self.drawer, &mut self.greeting, elapsed);
                 if let Some(login) = self.login_poller.drain() {
                     self.login = login;
                 }
@@ -1456,7 +1467,6 @@ impl App {
                         }
                     }
                 }
-                last = Instant::now();
             }
         };
         self.save_session();
@@ -4063,6 +4073,18 @@ mod tests {
             guard.disarm();
         }
         assert_eq!(cleanup_count.get(), 1);
+    }
+
+    #[test]
+    fn animations_advance_by_the_full_elapsed_duration() {
+        let mut drawer = DrawerAnim::closed();
+        drawer.open();
+        let mut greeting = GreetingAnim::new();
+
+        advance_animations(&mut drawer, &mut greeting, Duration::from_secs(8));
+
+        assert_eq!(drawer.phase(), crate::drawer::DrawerPhase::Open);
+        assert!(!greeting.is_visible());
     }
 
     fn job_track(path: &str) -> Track {
