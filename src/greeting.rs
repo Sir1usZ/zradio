@@ -6,6 +6,7 @@ pub const FADE_IN_MS: u64 = 400;
 pub const HOLD_MS: u64 = 5000;
 pub const FADE_OUT_MS: u64 = 600;
 pub const GREET_HEIGHT: u16 = 5;
+pub const GREET_SCALE: u8 = 2;
 
 pub const fn total_ms() -> u64 {
     FADE_IN_MS + HOLD_MS + FADE_OUT_MS
@@ -109,6 +110,36 @@ pub fn music_split(area: Rect, visual: f32) -> (Rect, Rect) {
         height: area.height.saturating_sub(greet_h),
     };
     (greet, list)
+}
+
+pub fn scaled_span(text: &str, scale: u8) -> String {
+    let scale = scale.clamp(1, 7);
+    if scale <= 1 || text.is_empty() {
+        return text.to_string();
+    }
+    format!("\x1b]66;s={scale};{text}\x07")
+}
+
+pub fn scaled_cell_width(text: &str, scale: u8) -> u16 {
+    let scale = scale.clamp(1, 7) as u16;
+    text.chars()
+        .map(|c| if c.is_ascii() { 1 } else { 2 })
+        .sum::<u16>()
+        .saturating_mul(scale)
+}
+
+pub fn greeting_origin(area: Rect, scale: u8) -> (u16, u16) {
+    let scale = scale.max(1) as u16;
+    let x = area
+        .x
+        .saturating_add(2)
+        .min(area.x.saturating_add(area.width.saturating_sub(1)));
+    let y = if area.height <= scale {
+        area.y
+    } else {
+        area.y + (area.height - scale) / 2
+    };
+    (x, y)
 }
 
 fn nonempty(value: Option<&str>) -> Option<String> {
@@ -286,5 +317,32 @@ mod tests {
         let (greet, list) = music_split(empty, 1.0);
         assert_eq!(greet.height, 0);
         assert_eq!(list, empty);
+    }
+
+    #[test]
+    fn scaled_span_wraps_text_in_kitty_osc66() {
+        assert_eq!(scaled_span("hi", 1), "hi");
+        assert_eq!(scaled_span("", 2), "");
+        assert_eq!(scaled_span("早上好", 2), "\x1b]66;s=2;早上好\x07");
+    }
+
+    #[test]
+    fn scaled_cell_width_counts_cjk_double_width() {
+        assert_eq!(scaled_cell_width("ab", 2), 4);
+        assert_eq!(scaled_cell_width("早上好", 2), 12);
+        assert_eq!(scaled_cell_width("早上好，xender", 2), 28);
+    }
+
+    #[test]
+    fn greeting_origin_is_left_and_vertically_centered() {
+        let area = Rect {
+            x: 0,
+            y: 6,
+            width: 80,
+            height: 5,
+        };
+        let (x, y) = greeting_origin(area, 2);
+        assert_eq!(x, 2);
+        assert_eq!(y, 7);
     }
 }
