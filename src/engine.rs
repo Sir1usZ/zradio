@@ -23,6 +23,45 @@ use crate::spectrum::Spectrum;
 
 const FADE_SECS: f32 = 6.0;
 
+struct StreamErrorLog {
+    last: Option<String>,
+    repeats: u64,
+}
+
+impl StreamErrorLog {
+    fn new() -> Self {
+        Self {
+            last: None,
+            repeats: 0,
+        }
+    }
+
+    fn push(&mut self, err: impl ToString) -> Vec<String> {
+        let msg = err.to_string();
+        match self.last.as_deref() {
+            Some(last) if last == msg => {
+                self.repeats = self.repeats.saturating_add(1);
+                Vec::new()
+            }
+            Some(last) => {
+                let mut out = Vec::new();
+                if self.repeats > 1 {
+                    out.push(format!("audio stream: {last} (×{})", self.repeats));
+                }
+                out.push(format!("audio stream: {msg}"));
+                self.last = Some(msg);
+                self.repeats = 1;
+                out
+            }
+            None => {
+                self.last = Some(msg.clone());
+                self.repeats = 1;
+                vec![format!("audio stream: {msg}")]
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub current: Option<usize>,
@@ -1003,7 +1042,14 @@ fn build_stream<T>(
 where
     T: Sample + cpal::FromSample<f32> + cpal::SizedSample,
 {
-    let err_fn = |err| eprintln!("audio stream: {err}");
+    let log = Mutex::new(StreamErrorLog::new());
+    let err_fn = move |err| {
+        if let Ok(mut log) = log.lock() {
+            for line in log.push(err) {
+                eprintln!("{line}");
+            }
+        }
+    };
     let mut tmp = Vec::new();
     let stream = device.build_output_stream(
         config,
@@ -1473,5 +1519,38 @@ mod tests {
         mixer.cycle_loop();
         assert_eq!(mixer.next_index(), Some(2));
         assert_eq!(mixer.prev_index(), Some(3));
+    }
+
+    #[test]
+    fn stream_error_log_prints_the_first_pollerr_only() {
+        let mut log = StreamErrorLog::new();
+        assert_eq!(
+            log.push("A backend-specific error has occurred: `alsa::poll()` returned POLLERR"),
+            vec![
+                "audio stream: A backend-specific error has occurred: `alsa::poll()` returned POLLERR"
+                    .to_string()
+            ]
+        );
+        assert!(log
+            .push("A backend-specific error has occurred: `alsa::poll()` returned POLLERR")
+            .is_empty());
+        assert!(log
+            .push("A backend-specific error has occurred: `alsa::poll()` returned POLLERR")
+            .is_empty());
+    }
+
+    #[test]
+    fn stream_error_log_summarizes_repeats_when_the_error_changes() {
+        let mut log = StreamErrorLog::new();
+        log.push("POLLERR");
+        log.push("POLLERR");
+        log.push("POLLERR");
+        assert_eq!(
+            log.push("underrun occurred"),
+            vec![
+                "audio stream: POLLERR (×3)".to_string(),
+                "audio stream: underrun occurred".to_string(),
+            ]
+        );
     }
 }
