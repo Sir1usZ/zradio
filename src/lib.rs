@@ -1,3 +1,5 @@
+#[cfg(unix)]
+pub(crate) mod alsa_log;
 pub mod analysis;
 pub mod api;
 pub mod automix;
