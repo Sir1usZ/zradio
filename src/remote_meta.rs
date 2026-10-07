@@ -26,22 +26,88 @@ fn query_artist_title(artist: &str, title: &str) -> (String, String) {
     if artist.is_empty() {
         return split_artist_title(title);
     }
-    if title.contains(" - ") && title.to_lowercase().starts_with(&artist.to_lowercase()) {
+    if looks_like_combined_title(title, artist) {
         return split_artist_title(title);
     }
     (artist.to_string(), title.to_string())
 }
 
+fn looks_like_combined_title(title: &str, artist: &str) -> bool {
+    let lower = title.to_lowercase();
+    let artist = artist.to_lowercase();
+    lower.starts_with(&artist)
+        && [" - ", " － ", " — ", " – ", "-", "－", "—", "–"]
+            .into_iter()
+            .any(|sep| title.contains(sep))
+}
+
 fn split_artist_title(raw: &str) -> (String, String) {
-    let raw = raw.trim();
-    if let Some((a, t)) = raw.split_once(" - ") {
-        let a = a.trim();
-        let t = t.trim();
-        if !a.is_empty() && !t.is_empty() {
+    let raw = strip_track_number(raw.trim());
+    const SEPS: &[&str] = &[" - ", " － ", " — ", " – ", "－", "—", "–", "-"];
+    for sep in SEPS {
+        if let Some((a, t)) = raw.split_once(sep) {
+            let a = a.trim();
+            let t = t.trim();
+            if a.is_empty() || t.is_empty() {
+                continue;
+            }
+            if *sep == "-" && !has_cjk(a) && !has_cjk(t) {
+                continue;
+            }
             return (a.to_string(), t.to_string());
         }
     }
     (String::new(), raw.to_string())
+}
+
+fn strip_track_number(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 {
+        return raw.to_string();
+    }
+    let rest = raw[i..].trim_start();
+    let rest = rest
+        .strip_prefix('.')
+        .or_else(|| rest.strip_prefix('、'))
+        .or_else(|| rest.strip_prefix('-'))
+        .unwrap_or(rest)
+        .trim_start();
+    if rest.is_empty() {
+        raw.to_string()
+    } else {
+        rest.to_string()
+    }
+}
+
+fn has_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(
+            c,
+            '\u{4E00}'..='\u{9FFF}'
+                | '\u{3400}'..='\u{4DBF}'
+                | '\u{F900}'..='\u{FAFF}'
+                | '\u{3040}'..='\u{30FF}'
+                | '\u{AC00}'..='\u{D7AF}'
+        )
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagSourceOrder {
+    CnFirst,
+    ItunesFirst,
+}
+
+fn tag_source_order(title: &str, artist: &str) -> TagSourceOrder {
+    if has_cjk(title) || has_cjk(artist) {
+        TagSourceOrder::CnFirst
+    } else {
+        TagSourceOrder::ItunesFirst
+    }
 }
 
 fn pick_lyrics(body: &str) -> Option<String> {
@@ -211,8 +277,10 @@ fn gather_hit(title: &str, artist: &str, album: &str) -> RemoteHit {
         album: album.trim().to_string(),
         ..RemoteHit::default()
     };
-    if let Some(itunes) = fetch_itunes(&title, &artist, album) {
-        fill_missing(&mut hit, itunes.into());
+    if tag_source_order(&title, &artist) == TagSourceOrder::ItunesFirst {
+        if let Some(itunes) = fetch_itunes(&title, &artist, album) {
+            fill_missing(&mut hit, itunes.into());
+        }
     }
     if hit_incomplete(&hit) {
         if let Some(netease) = fetch_netease_hit(&title, &artist) {
@@ -227,6 +295,11 @@ fn gather_hit(title: &str, artist: &str, album: &str) -> RemoteHit {
     if hit_incomplete(&hit) {
         if let Some(kugou) = fetch_kugou_hit(&title, &artist) {
             fill_missing(&mut hit, kugou);
+        }
+    }
+    if hit_incomplete(&hit) && tag_source_order(&title, &artist) == TagSourceOrder::CnFirst {
+        if let Some(itunes) = fetch_itunes(&title, &artist, album) {
+            fill_missing(&mut hit, itunes.into());
         }
     }
     hit
@@ -732,6 +805,42 @@ mod tests {
         assert_eq!(
             split_artist_title("We Are the World (Demo)"),
             ("".into(), "We Are the World (Demo)".into())
+        );
+        assert_eq!(
+            split_artist_title("周杰伦－晴天"),
+            ("周杰伦".into(), "晴天".into())
+        );
+        assert_eq!(
+            split_artist_title("周杰伦—晴天"),
+            ("周杰伦".into(), "晴天".into())
+        );
+        assert_eq!(
+            split_artist_title("周杰伦-晴天"),
+            ("周杰伦".into(), "晴天".into())
+        );
+        assert_eq!(
+            split_artist_title("01. 周杰伦 - 晴天"),
+            ("周杰伦".into(), "晴天".into())
+        );
+        assert_eq!(
+            split_artist_title("Riot-Grrrl"),
+            ("".into(), "Riot-Grrrl".into())
+        );
+    }
+
+    #[test]
+    fn cjk_queries_ask_cn_sources_before_itunes() {
+        assert_eq!(
+            tag_source_order("晴天", "周杰伦"),
+            TagSourceOrder::CnFirst
+        );
+        assert_eq!(
+            tag_source_order("Levels", "Avicii"),
+            TagSourceOrder::ItunesFirst
+        );
+        assert_eq!(
+            tag_source_order("海阔天空", ""),
+            TagSourceOrder::CnFirst
         );
     }
 
