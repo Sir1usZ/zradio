@@ -115,7 +115,7 @@ pub fn drawer_rect(frame: Rect, progress: f32, open_height: u16) -> Rect {
     }
 }
 
-pub fn drawer_rows(active: usize, lists: &[String]) -> Vec<DrawerRow> {
+pub fn drawer_rows(active: usize, lists: &[(String, bool)]) -> Vec<DrawerRow> {
     (1..=DRAWER_SLOTS)
         .map(|slot| {
             if slot == 1 {
@@ -128,10 +128,10 @@ pub fn drawer_rows(active: usize, lists: &[String]) -> Vec<DrawerRow> {
             } else {
                 let list_idx = slot - 2;
                 match lists.get(list_idx) {
-                    Some(name) => DrawerRow {
+                    Some((name, empty)) => DrawerRow {
                         slot,
                         name: name.clone(),
-                        empty: false,
+                        empty: *empty,
                         active: active == list_idx + 1,
                     },
                     None => DrawerRow {
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn rows_always_have_nine_slots_and_mark_empty() {
-        let rows = drawer_rows(1, &[String::from("通勤")]);
+        let rows = drawer_rows(1, &[("通勤".into(), false)]);
         assert_eq!(rows.len(), 9);
         assert_eq!(rows[0].name, "全部");
         assert!(!rows[0].empty);
@@ -261,6 +261,18 @@ mod tests {
         assert!(rows[2].empty);
         assert_eq!(rows[2].name, "—");
         assert_eq!(rows[8].slot, 9);
+    }
+
+    #[test]
+    fn named_list_with_no_songs_is_drawn_empty() {
+        let rows = drawer_rows(0, &[("通勤".into(), true), ("夜车".into(), false)]);
+        assert_eq!(rows[1].name, "通勤");
+        assert!(rows[1].empty);
+        assert!(!rows[1].active);
+        assert_eq!(rows[2].name, "夜车");
+        assert!(!rows[2].empty);
+        assert!(rows[3].empty);
+        assert_eq!(rows[3].name, "—");
     }
 
     #[test]

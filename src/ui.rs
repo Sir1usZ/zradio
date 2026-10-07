@@ -784,11 +784,11 @@ impl App {
         list_title(slot, &name, n)
     }
 
-    fn drawer_names(&self) -> Vec<String> {
+    fn drawer_lists(&self) -> Vec<(String, bool)> {
         self.playlists
             .lists
             .iter()
-            .map(|list| list.name.clone())
+            .map(|list| (list.name.clone(), list.paths.is_empty()))
             .collect()
     }
 
@@ -1746,7 +1746,7 @@ impl App {
     }
 
     fn drawer_rows_empty(&self, slot: usize) -> bool {
-        drawer_rows(self.playlists.active, &self.drawer_names())
+        drawer_rows(self.playlists.active, &self.drawer_lists())
             .get(slot.saturating_sub(1))
             .is_some_and(|row| row.empty)
     }
@@ -2856,7 +2856,7 @@ impl App {
             );
         }
         frame.render_widget(Clear, area);
-        let rows = drawer_rows(self.playlists.active, &self.drawer_names());
+        let rows = drawer_rows(self.playlists.active, &self.drawer_lists());
         let lines: Vec<Line> = rows
             .iter()
             .enumerate()
