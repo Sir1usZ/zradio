@@ -237,6 +237,7 @@ pub struct App {
     greeting: GreetingAnim,
     greeting_text: String,
     greeting_overlay: Option<crate::greeting::GreetingOverlay>,
+    greeting_overlay_sent: Option<crate::greeting::GreetingOverlay>,
     range_cache: Vec<RangeRow>,
     sorted_idx: Vec<usize>,
     api_dirty: bool,
@@ -426,6 +427,7 @@ impl App {
             greeting: GreetingAnim::new(),
             greeting_text: greeting_line(local_hour(), &system_name()),
             greeting_overlay: None,
+            greeting_overlay_sent: None,
             range_cache: Vec::new(),
             sorted_idx: Vec::new(),
             api_dirty: true,
@@ -2942,18 +2944,25 @@ impl App {
         self.greeting_overlay = greeting_overlay(area, &self.greeting_text, scale);
     }
 
-    fn write_greeting_overlay(&self) -> io::Result<()> {
-        let Some(overlay) = self.greeting_overlay.as_ref() else {
-            return Ok(());
-        };
+    fn write_greeting_overlay(&mut self) -> io::Result<()> {
         if std::env::var_os("KITTY_WINDOW_ID").is_none() {
+            self.greeting_overlay_sent = None;
             return Ok(());
         }
+        if self.greeting_overlay == self.greeting_overlay_sent {
+            return Ok(());
+        }
+        let Some(overlay) = self.greeting_overlay.clone() else {
+            self.greeting_overlay_sent = None;
+            return Ok(());
+        };
         let mut stdout = stdout();
         execute!(stdout, crossterm::cursor::Hide)?;
         use std::io::Write;
-        stdout.write_all(overlay_escape(overlay).as_bytes())?;
-        stdout.flush()
+        stdout.write_all(overlay_escape(&overlay).as_bytes())?;
+        stdout.flush()?;
+        self.greeting_overlay_sent = Some(overlay);
+        Ok(())
     }
 
     fn draw_artists(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {

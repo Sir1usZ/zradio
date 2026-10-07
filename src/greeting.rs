@@ -396,6 +396,21 @@ mod tests {
     }
 
     #[test]
+    fn overlay_escape_is_stable_for_the_same_overlay() {
+        let area = Rect {
+            x: 0,
+            y: 6,
+            width: 80,
+            height: 5,
+        };
+        let a = greeting_overlay(area, "早上好，xender", 2).expect("overlay");
+        let b = greeting_overlay(area, "早上好，xender", 2).expect("overlay");
+        assert_eq!(overlay_escape(&a), overlay_escape(&b));
+        let faded = greeting_overlay(area, "早上好，xender", 1);
+        assert_eq!(faded, None);
+    }
+
+    #[test]
     fn scaled_cell_width_counts_cjk_double_width() {
         assert_eq!(scaled_cell_width("ab", 2), 4);
         assert_eq!(scaled_cell_width("早上好", 2), 12);
