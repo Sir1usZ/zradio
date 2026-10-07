@@ -57,14 +57,24 @@ impl CoverArt {
 
     pub fn lines(&self, cols: u16, rows: u16) -> Vec<Line<'static>> {
         let (cols, rows) = self.fit(cols, rows);
+        self.raster(cols, rows, 0.0, 0.0, self.width as f32, self.height as f32)
+    }
+
+    pub fn fill_lines(&self, cols: u16, rows: u16) -> Vec<Line<'static>> {
+        let (cols, rows) = fill_cells(self.width, self.height, cols, rows);
+        let (x, y, w, h) = crop_rect(self.width, self.height, cols, rows);
+        self.raster(cols, rows, x, y, w, h)
+    }
+
+    fn raster(&self, cols: u16, rows: u16, x: f32, y: f32, w: f32, h: f32) -> Vec<Line<'static>> {
         let cols_u = cols.max(1) as u32;
         let rows_u = rows.max(1) as u32;
         let mut lines = Vec::with_capacity(rows_u as usize);
         for row in 0..rows_u {
             let mut spans = Vec::with_capacity(cols_u as usize);
             for col in 0..cols_u {
-                let top = self.sample(col, row * 2, cols_u, rows_u * 2);
-                let bot = self.sample(col, row * 2 + 1, cols_u, rows_u * 2);
+                let top = self.sample_rect([col, row * 2, cols_u, rows_u * 2], [x, y, w, h]);
+                let bot = self.sample_rect([col, row * 2 + 1, cols_u, rows_u * 2], [x, y, w, h]);
                 spans.push(Span::styled(
                     "▄",
                     Style::default()
@@ -77,12 +87,14 @@ impl CoverArt {
         lines
     }
 
-    fn sample(&self, x: u32, y: u32, cols: u32, px_rows: u32) -> [u8; 3] {
-        let sx = ((x as f32 + 0.5) * self.width as f32 / cols.max(1) as f32).floor() as u32;
-        let sy = ((y as f32 + 0.5) * self.height as f32 / px_rows.max(1) as f32).floor() as u32;
+    fn sample_rect(&self, cell: [u32; 4], src: [f32; 4]) -> [u8; 3] {
+        let [x, y, cols, px_rows] = cell;
+        let [ox, oy, w, h] = src;
+        let sx = ox + (x as f32 + 0.5) * w / cols.max(1) as f32;
+        let sy = oy + (y as f32 + 0.5) * h / px_rows.max(1) as f32;
         self.pixel(
-            sx.min(self.width.saturating_sub(1)),
-            sy.min(self.height.saturating_sub(1)),
+            sx.floor().clamp(0.0, self.width.saturating_sub(1) as f32) as u32,
+            sy.floor().clamp(0.0, self.height.saturating_sub(1) as f32) as u32,
         )
     }
 }
@@ -100,8 +112,35 @@ pub fn fit_cells(img_w: u32, img_h: u32, avail_cols: u16, avail_rows: u16) -> (u
     }
 }
 
+pub fn fill_cells(_img_w: u32, _img_h: u32, avail_cols: u16, avail_rows: u16) -> (u16, u16) {
+    (avail_cols.max(1), avail_rows.max(1))
+}
+
+pub fn crop_rect(img_w: u32, img_h: u32, avail_cols: u16, avail_rows: u16) -> (f32, f32, f32, f32) {
+    let img_w = img_w.max(1) as f32;
+    let img_h = img_h.max(1) as f32;
+    let cell_aspect = avail_cols.max(1) as f32 / (avail_rows.max(1) as f32 * 2.0);
+    let img_aspect = img_w / img_h;
+    if img_aspect > cell_aspect {
+        let w = img_h * cell_aspect;
+        let x = (img_w - w) / 2.0;
+        (x, 0.0, w, img_h)
+    } else {
+        let h = img_w / cell_aspect;
+        let y = (img_h - h) / 2.0;
+        (0.0, y, img_w, h)
+    }
+}
+
 pub fn placeholder(cols: u16, rows: u16) -> Vec<Line<'static>> {
-    let (cols, rows) = fit_cells(1, 1, cols, rows);
+    raster_placeholder(fit_cells(1, 1, cols, rows))
+}
+
+pub fn fill_placeholder(cols: u16, rows: u16) -> Vec<Line<'static>> {
+    raster_placeholder(fill_cells(1, 1, cols, rows))
+}
+
+fn raster_placeholder((cols, rows): (u16, u16)) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for y in 0..rows {
         let mut spans = Vec::new();
@@ -149,5 +188,45 @@ mod tests {
         let lines = cover.lines(40, 12);
         assert_eq!(lines.len(), 12);
         assert_eq!(lines[0].spans.len(), 24);
+    }
+
+    #[test]
+    fn fill_cover_uses_every_cell() {
+        let (cols, rows) = fill_cells(100, 100, 40, 12);
+        assert_eq!((cols, rows), (40, 12));
+        let (cols, rows) = fill_cells(200, 100, 20, 20);
+        assert_eq!((cols, rows), (20, 20));
+    }
+
+    #[test]
+    fn crop_rect_center_crops_taller_image() {
+        let (x, y, w, h) = crop_rect(100, 100, 40, 12);
+        assert_eq!(x, 0.0);
+        assert!((w - 100.0).abs() < 0.01);
+        assert!((h - 60.0).abs() < 0.01);
+        assert!((y - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn crop_rect_center_crops_wider_image() {
+        let (x, y, w, h) = crop_rect(200, 100, 20, 20);
+        assert_eq!(y, 0.0);
+        assert!((h - 100.0).abs() < 0.01);
+        assert!((w - 50.0).abs() < 0.01);
+        assert!((x - 75.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fill_lines_cover_the_cell_grid() {
+        let mut rgb = vec![0u8; 40 * 40 * 3];
+        rgb[0] = 255;
+        let cover = CoverArt {
+            width: 40,
+            height: 40,
+            rgb,
+        };
+        let lines = cover.fill_lines(40, 12);
+        assert_eq!(lines.len(), 12);
+        assert_eq!(lines[0].spans.len(), 40);
     }
 }
