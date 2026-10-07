@@ -77,6 +77,17 @@ pub fn apply_peek(slot: &mut Option<TrackMeta>, peeked: TrackMeta) -> bool {
     changed
 }
 
+pub fn sort_key_changed(slot: &Option<TrackMeta>, before: &TrackMeta) -> bool {
+    match slot.as_ref() {
+        Some(after) => {
+            after.artist != before.artist
+                || after.album != before.album
+                || after.title != before.title
+        }
+        None => !before.artist.is_empty() || !before.album.is_empty() || !before.title.is_empty(),
+    }
+}
+
 fn fill_empty_text(dst: &mut String, src: String) -> bool {
     if dst.trim().is_empty() && !src.trim().is_empty() {
         *dst = src;
@@ -614,6 +625,53 @@ mod tests {
             }
         ));
         assert_eq!(slot.as_ref().unwrap().artist, "Avicii");
+    }
+
+    #[test]
+    fn apply_peek_sort_key_stays_put_when_only_cover_arrives() {
+        let mut slot = Some(TrackMeta {
+            artist: "Avicii".into(),
+            album: "True".into(),
+            title: "Levels".into(),
+            ..TrackMeta::default()
+        });
+        let changed = apply_peek(
+            &mut slot,
+            TrackMeta {
+                artist: "Avicii".into(),
+                album: "True".into(),
+                title: "Levels".into(),
+                cover_path: Some(std::path::PathBuf::from("/tmp/cover.jpg")),
+                ..TrackMeta::default()
+            },
+        );
+        assert!(changed);
+        assert!(!sort_key_changed(&slot, &TrackMeta {
+            artist: "Avicii".into(),
+            album: "True".into(),
+            title: "Levels".into(),
+            ..TrackMeta::default()
+        }));
+        let mut empty_album = Some(TrackMeta {
+            artist: "Avicii".into(),
+            title: "Levels".into(),
+            ..TrackMeta::default()
+        });
+        let changed = apply_peek(
+            &mut empty_album,
+            TrackMeta {
+                artist: "Avicii".into(),
+                album: "Stories".into(),
+                title: "Levels".into(),
+                ..TrackMeta::default()
+            },
+        );
+        assert!(changed);
+        assert!(sort_key_changed(&empty_album, &TrackMeta {
+            artist: "Avicii".into(),
+            title: "Levels".into(),
+            ..TrackMeta::default()
+        }));
     }
 
     #[test]

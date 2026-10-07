@@ -43,7 +43,7 @@ use crate::greeting::{
 use crate::library::{scan_library, sort_indices, track_from_path, Track};
 use crate::meta::{
     apply_peek, load_meta, lyric_fill, lyric_progress, lyric_window, needs_fetch, peek_tags,
-    TrackMeta,
+    sort_key_changed, TrackMeta,
 };
 use crate::mpris::{MediaCmd, Mpris};
 use crate::playlist::{store_path, PlaylistStore};
@@ -241,6 +241,7 @@ pub struct App {
     sorted_idx: Vec<usize>,
     api_dirty: bool,
     taste_dirty: bool,
+    peek_sort_dirty: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,6 +430,7 @@ impl App {
             sorted_idx: Vec::new(),
             api_dirty: true,
             taste_dirty: false,
+            peek_sort_dirty: false,
         };
         app.rebuild_range_cache();
         app.push_taste();
@@ -1136,6 +1138,12 @@ impl App {
             let Some(slot) = self.metas[index].as_mut() else {
                 continue;
             };
+            let before = TrackMeta {
+                artist: slot.artist.clone(),
+                album: slot.album.clone(),
+                title: slot.title.clone(),
+                ..TrackMeta::default()
+            };
             if slot.artist.trim().is_empty() {
                 if let Some(artist) = job.artist.filter(|s| !s.trim().is_empty()) {
                     slot.artist = artist;
@@ -1169,9 +1177,12 @@ impl App {
                     changed = true;
                 }
             }
+            if sort_key_changed(&self.metas[index], &before) {
+                self.peek_sort_dirty = true;
+            }
         }
         if changed {
-            self.mark_meta_changed();
+            self.api_dirty = true;
         }
     }
 
@@ -1213,6 +1224,7 @@ impl App {
             if index >= self.metas.len() {
                 continue;
             }
+            let before = self.metas[index].clone().unwrap_or_default();
             if apply_peek(&mut self.metas[index], job.meta) {
                 if let Some(title) = self.metas[index]
                     .as_ref()
@@ -1224,6 +1236,9 @@ impl App {
                     }
                 }
                 changed += 1;
+                if sort_key_changed(&self.metas[index], &before) {
+                    self.peek_sort_dirty = true;
+                }
                 if self
                     .metas
                     .get(index)
@@ -1235,7 +1250,7 @@ impl App {
             }
         }
         if changed > 0 {
-            self.mark_meta_changed();
+            self.api_dirty = true;
         }
     }
 
@@ -1360,6 +1375,10 @@ impl App {
                 self.drain_decode();
                 self.drain_peek();
                 self.drain_remote_meta();
+                if self.peek_sort_dirty {
+                    self.mark_meta_changed();
+                    self.peek_sort_dirty = false;
+                }
                 self.pump_meta_queue();
                 self.drain_progress();
                 self.drain_import();
@@ -1382,16 +1401,18 @@ impl App {
                 self.update_api_state();
                 self.maybe_prefetch();
                 self.player.recover_if_needed();
-                if let Ok(mut mixer) = self.player.mixer.lock() {
-                    if let Some(cava) = self.cava.as_ref() {
-                        let bars = cava.latest();
-                        if !bars.is_empty() {
-                            mixer.ingest_cava(&bars);
+                if needs_spectrum_refresh(self.prefs.visualize, self.cava.is_some()) {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        if let Some(cava) = self.cava.as_ref() {
+                            let bars = cava.latest();
+                            if !bars.is_empty() {
+                                mixer.ingest_cava(&bars);
+                            } else {
+                                mixer.refresh_spectrum();
+                            }
                         } else {
                             mixer.refresh_spectrum();
                         }
-                    } else {
-                        mixer.refresh_spectrum();
                     }
                 }
                 last = Instant::now();
@@ -2249,7 +2270,7 @@ impl App {
     /// 将当前播放状态同步到 API 共享状态，供远程客户端读取
     fn update_api_state(&mut self) {
         let (snapshot, eq) = match self.player.mixer.lock() {
-            Ok(mixer) => (Some(mixer.snapshot(0)), mixer.eq_db()),
+            Ok(mixer) => (Some(mixer.playback_view(0)), mixer.eq_db()),
             Err(_) => (None, [0.0; 5]),
         };
 
@@ -2755,7 +2776,7 @@ impl App {
             .mixer
             .lock()
             .expect("mixer")
-            .snapshot(self.selected());
+            .playback_view(self.selected());
         let meta = snap
             .current
             .and_then(|i| self.metas.get(i).and_then(|m| m.as_ref()));
@@ -3201,7 +3222,7 @@ impl App {
             let mixer = self.player.mixer.lock().expect("mixer");
             visible_idx
                 .iter()
-                .map(|&i| (i, analysis_label(mixer.analysis_at(i))))
+                .filter_map(|&i| mixer.analysis_at(i).map(|a| (i, analysis_label(Some(a)))))
                 .collect()
         };
         let extra_at = |i: usize| -> String {
@@ -3848,6 +3869,14 @@ fn visible_window(
     (start, start + height)
 }
 
+fn needs_spectrum_refresh(mode: crate::prefs::VisualizeMode, has_cava: bool) -> bool {
+    match mode {
+        crate::prefs::VisualizeMode::Off => false,
+        crate::prefs::VisualizeMode::Oscilloscope => has_cava,
+        crate::prefs::VisualizeMode::Bars | crate::prefs::VisualizeMode::Cnm => true,
+    }
+}
+
 fn analysis_label(analysis: Option<&TrackAnalysis>) -> String {
     analysis
         .map(|a| {
@@ -4088,6 +4117,23 @@ mod tests {
         assert_eq!(visible_window(20, Some(19), 0, 8), (12, 20));
         assert_eq!(visible_window(20, Some(10), 0, 8), (3, 11));
         assert_eq!(visible_window(20, Some(4), 2, 8), (2, 10));
+    }
+
+    #[test]
+    fn tick_work_skips_spectrum_when_visualizer_is_off() {
+        assert!(!needs_spectrum_refresh(crate::prefs::VisualizeMode::Off, false));
+        assert!(needs_spectrum_refresh(
+            crate::prefs::VisualizeMode::Bars,
+            false
+        ));
+        assert!(needs_spectrum_refresh(
+            crate::prefs::VisualizeMode::Oscilloscope,
+            true
+        ));
+        assert!(!needs_spectrum_refresh(
+            crate::prefs::VisualizeMode::Oscilloscope,
+            false
+        ));
     }
 
     #[test]

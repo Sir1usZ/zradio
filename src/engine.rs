@@ -771,6 +771,14 @@ impl Mixer {
     }
 
     pub fn snapshot(&self, selected: usize) -> Snapshot {
+        self.snapshot_inner(selected, true)
+    }
+
+    pub fn playback_view(&self, selected: usize) -> Snapshot {
+        self.snapshot_inner(selected, false)
+    }
+
+    fn snapshot_inner(&self, selected: usize, include_pcm: bool) -> Snapshot {
         let duration = self.current.as_ref().map(Deck::frames).unwrap_or(0);
         let pos = self.current.as_ref().map(|d| d.pos).unwrap_or(0);
         Snapshot {
@@ -793,7 +801,11 @@ impl Mixer {
             spectrum_levels: self.spectrum.levels(),
             shuffle: self.shuffle,
             loop_mode: self.loop_mode,
-            pcm: self.pcm.snapshot(),
+            pcm: if include_pcm {
+                self.pcm.snapshot()
+            } else {
+                crate::scope::PcmSnapshot::default()
+            },
         }
     }
 
@@ -1369,6 +1381,19 @@ mod tests {
         assert_eq!(snap.pcm.len(), mixer.pcm_snapshot().len());
         assert_eq!(snap.pcm.samples, mixer.pcm_snapshot().samples);
         assert_eq!(snap.pcm.sample_rate, 48_000);
+    }
+
+    #[test]
+    fn playback_view_skips_pcm_copy() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.play_decoded(0, const_deck(100, 0.5));
+        let mut out = vec![0.0; 8];
+        mixer.fill(&mut out);
+        let view = mixer.playback_view(0);
+        assert!(view.pcm.samples.is_empty());
+        assert_eq!(view.current, Some(0));
+        assert_eq!(view.spectrum_levels, mixer.snapshot(0).spectrum_levels);
     }
 
     #[test]
