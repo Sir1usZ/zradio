@@ -2995,53 +2995,78 @@ impl App {
 
     fn draw_player(&self, frame: &mut ratatui::Frame<'_>, area: Rect, snap: &Snapshot) {
         let meta = self.current_meta(snap);
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(8), Constraint::Length(7)])
-            .split(area);
-        if self.show_lyrics {
-            let cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
-                .split(rows[0]);
-            self.draw_cover_only(frame, cols[0], snap);
-            self.draw_lyrics(frame, cols[1], snap, meta);
-        } else {
-            self.draw_cover_only(frame, rows[0], snap);
+        let has_lyrics = meta.is_some_and(|m| !m.lyrics.is_empty());
+        let splits = player_splits(
+            area,
+            self.show_lyrics,
+            has_lyrics,
+            self.prefs.visualize != crate::prefs::VisualizeMode::Off,
+        );
+        self.draw_cover_only(frame, splits.cover, snap);
+        if let Some(lyrics) = splits.lyrics {
+            self.draw_lyrics(frame, lyrics, snap, meta);
         }
-        if self.prefs.visualize != crate::prefs::VisualizeMode::Off {
-            self.draw_spectrum(frame, rows[1], snap);
+        if let Some(spectrum) = splits.spectrum {
+            self.draw_spectrum(frame, spectrum, snap);
         }
     }
 
     fn draw_cover_only(&self, frame: &mut ratatui::Frame<'_>, area: Rect, snap: &Snapshot) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
         let meta = self.current_meta(snap);
+        let pal = self.palette();
+        let title = meta
+            .map(|m| m.title.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                snap.current
+                    .and_then(|i| self.tracks.get(i))
+                    .map(|t| t.title.as_str())
+            })
+            .unwrap_or("—");
         let artist = meta
             .map(|m| m.artist.as_str())
             .filter(|s| !s.is_empty())
-            .unwrap_or("unknown");
+            .unwrap_or("");
         let album = meta
             .map(|m| m.album.as_str())
             .filter(|s| !s.is_empty())
-            .unwrap_or("—");
-        let inner = area.inner(ratatui::layout::Margin {
-            horizontal: 1,
-            vertical: 1,
-        });
-        let cover_lines = letterbox_cover(
+            .unwrap_or("");
+        let caption_h = if area.height >= 5 {
+            3
+        } else {
+            2u16.min(area.height)
+        };
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(caption_h)])
+            .split(area);
+        let cover_lines = fill_cover(
             meta.and_then(|m| m.cover.as_ref()),
-            inner.width,
-            inner.height.saturating_sub(1),
+            parts[0].width,
+            parts[0].height,
         );
-        let cover = Paragraph::new(cover_lines)
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .title(format!(" {artist} / {album} "))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().magenta()),
+        frame.render_widget(Paragraph::new(cover_lines), parts[0]);
+        let mut lines = vec![Line::from(Span::styled(
+            title.to_string(),
+            pal.peak_style().add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center)];
+        if !artist.is_empty() {
+            lines.push(
+                Line::from(Span::styled(artist.to_string(), pal.text_style()))
+                    .alignment(Alignment::Center),
             );
-        frame.render_widget(cover, area);
+        }
+        if !album.is_empty() && caption_h >= 3 {
+            lines.push(
+                Line::from(Span::styled(album.to_string(), pal.dim_style()))
+                    .alignment(Alignment::Center),
+            );
+        }
+        frame.render_widget(Paragraph::new(lines), parts[1]);
     }
 
     fn draw_me(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -3097,33 +3122,6 @@ impl App {
 
     fn draw_header(&self, frame: &mut ratatui::Frame<'_>, area: Rect, snap: &Snapshot) {
         let pal = self.palette();
-        let mix = match snap.mix {
-            MixMode::Cut => {
-                Span::styled("CUT", Style::default().red().add_modifier(Modifier::BOLD))
-            }
-            MixMode::Crossfade => {
-                Span::styled("FADE", Style::default().cyan().add_modifier(Modifier::BOLD))
-            }
-            MixMode::AutoMix => Span::styled(
-                "AUTO",
-                Style::default().magenta().add_modifier(Modifier::BOLD),
-            ),
-        };
-        let remix = match snap.remix {
-            RemixMode::Off => Span::styled("RAW", pal.dim_style().add_modifier(Modifier::BOLD)),
-            RemixMode::Chill => Span::styled(
-                "CHILL",
-                Style::default().blue().add_modifier(Modifier::BOLD),
-            ),
-            RemixMode::Club => Span::styled(
-                "CLUB",
-                Style::default().yellow().add_modifier(Modifier::BOLD),
-            ),
-            RemixMode::Nightcore => Span::styled(
-                "NCORE",
-                Style::default().magenta().add_modifier(Modifier::BOLD),
-            ),
-        };
         let state = if self.decoding {
             Span::styled("DEC", Style::default().yellow())
         } else if snap.paused {
@@ -3151,19 +3149,12 @@ impl App {
         }
         let mut title_spans = vec![Span::styled(" ZRADIO ", pal.highlight()), "  ".into()];
         title_spans.append(&mut tabs);
+        title_spans.push(state);
+        for chip in header_chips(snap.mix, snap.remix, self.prefs.shuffle_mode) {
+            title_spans.push("  ".into());
+            title_spans.push(header_chip_span(chip));
+        }
         title_spans.extend([
-            state,
-            "  ".into(),
-            mix,
-            " ".into(),
-            remix,
-            "  ".into(),
-            match self.prefs.shuffle_mode {
-                ShuffleMode::Off => Span::styled("SEQ", pal.dim_style()),
-                ShuffleMode::Random => Span::styled("SHUF", Style::default().yellow()),
-                ShuffleMode::NoRepeat => Span::styled("NOREP", Style::default().yellow()),
-                ShuffleMode::Taste => Span::styled("TASTE", Style::default().yellow()),
-            },
             "  ".into(),
             if self.login.logged_in {
                 if self.login.vip {
@@ -3178,14 +3169,14 @@ impl App {
         let title = Paragraph::new(ratatui::text::Line::from(title_spans)).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().cyan()),
+                .border_style(pal.dim_style()),
         );
         frame.render_widget(title, area);
     }
 
     fn track_row_text(&self, i: usize, snap: &Snapshot, extra: &str) -> (String, bool) {
         let playing = snap.current == Some(i);
-        let mark = if playing { "▸ " } else { "  " };
+        let mark = playing_row_mark(playing);
         let title = self.tracks.get(i).map(|t| t.title.as_str()).unwrap_or("—");
         let artist = self
             .metas
@@ -3249,7 +3240,7 @@ impl App {
                     let (text, playing) = self.track_row_text(i, snap, &extra);
                     let mut item = ListItem::new(text);
                     if playing {
-                        item = item.style(Style::default().magenta());
+                        item = item.style(playing_row_style(true, pal));
                     }
                     item
                 })
@@ -3263,7 +3254,7 @@ impl App {
                         let (text, playing) = self.track_row_text(*i, snap, &extra);
                         let mut item = ListItem::new(text);
                         if playing {
-                            item = item.style(Style::default().magenta());
+                            item = item.style(playing_row_style(true, pal));
                         }
                         item
                     }
@@ -3295,7 +3286,7 @@ impl App {
             )
             .style(pal.text_style())
             .highlight_style(pal.highlight())
-            .highlight_symbol("▶ ");
+            .highlight_symbol("");
         let mut window_state = ListState::default();
         window_state.select(window_sel);
         frame.render_stateful_widget(list, area, &mut window_state);
@@ -3309,7 +3300,7 @@ impl App {
         meta: Option<&TrackMeta>,
     ) {
         let inner = area.inner(ratatui::layout::Margin {
-            horizontal: 1,
+            horizontal: 2,
             vertical: 1,
         });
         let secs = if snap.sample_rate == 0 {
@@ -3322,12 +3313,7 @@ impl App {
         let view = lyric_window(lyrics, secs, rows);
         let pal = self.palette();
         let lines: Vec<Line> = if view.lines.is_empty() {
-            let pad = rows.saturating_sub(1) / 2;
-            let mut out = vec![Line::from(""); pad];
-            out.push(
-                Line::from(Span::styled("no lyrics", pal.dim_style())).alignment(Alignment::Center),
-            );
-            out
+            Vec::new()
         } else {
             view.lines
                 .iter()
@@ -3351,12 +3337,8 @@ impl App {
                 })
                 .collect()
         };
-        let lyric = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(pal.dim_style()),
-        );
-        frame.render_widget(lyric, area);
+        let lyric = Paragraph::new(lines);
+        frame.render_widget(lyric, inner);
     }
 
     fn draw_spectrum(&self, frame: &mut ratatui::Frame<'_>, area: Rect, snap: &Snapshot) {
@@ -3405,29 +3387,27 @@ impl App {
         } else {
             snap.position_frames as f64 / snap.duration_frames as f64
         };
-        let now = snap
+        let title = snap
             .current
             .and_then(|i| self.tracks.get(i))
             .map(|t| t.title.as_str())
             .unwrap_or("—");
-        let bpm = snap
-            .current_bpm
-            .map(|b| format!("{b:.0}"))
-            .unwrap_or_else(|| "--".into());
-        let key = snap.current_key.clone().unwrap_or_else(|| "--".into());
-        let hint = snap.next_hint.clone().unwrap_or_default();
-        let label = format!(
-            " {}  {} {}  {} / {}  {} ",
-            now,
-            bpm,
-            key,
-            fmt_time(snap.position_frames, snap.sample_rate),
-            fmt_time(snap.duration_frames, snap.sample_rate),
-            hint
+        let artist = snap
+            .current
+            .and_then(|i| self.metas.get(i).and_then(|m| m.as_ref()))
+            .map(|m| m.artist.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+        let label = now_playing_label(
+            title,
+            artist,
+            snap.position_frames,
+            snap.duration_frames,
+            snap.sample_rate,
         );
         let gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" now "))
-            .gauge_style(Style::default().cyan())
+            .block(Block::default().borders(Borders::NONE))
+            .gauge_style(Style::default().fg(Palette::rgb(self.palette().accent)))
             .ratio(ratio.clamp(0.0, 1.0))
             .label(label);
         frame.render_widget(gauge, area);
@@ -3480,21 +3460,9 @@ impl App {
     }
 
     fn draw_help(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let help = Paragraph::new(if self.command.is_some() {
-            format!(":{}", self.command.clone().unwrap_or_default())
-        } else {
-            match self.tab {
-                Tab::Music => {
-                    "q/e tab  p列表  b上一曲  n下一曲  x菜单  y库  :playlist  ^q退出".into()
-                }
-                Tab::Player => {
-                    "q/e tab  p列表  x当前曲  l歌词  g EQ  space  n/b  ←→seek  ^q退出".into()
-                }
-                Tab::Me => "q/e tab  p列表  听歌时长/最爱  t设置  ^k帮助  ^q退出".into(),
-            }
-        })
-        .alignment(Alignment::Center)
-        .style(self.palette().dim_style());
+        let help = Paragraph::new(footer_help(self.command.as_deref(), self.tab))
+            .alignment(Alignment::Center)
+            .style(self.palette().dim_style());
         frame.render_widget(help, area);
     }
 
@@ -3950,6 +3918,48 @@ fn overlay_scrim(area: Rect) -> Rect {
     area
 }
 
+struct PlayerSplits {
+    cover: Rect,
+    lyrics: Option<Rect>,
+    spectrum: Option<Rect>,
+}
+
+fn player_splits(area: Rect, show_lyrics: bool, has_lyrics: bool, visualize: bool) -> PlayerSplits {
+    let (body, spectrum) = if visualize {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(8), Constraint::Length(4)])
+            .split(area);
+        (rows[0], Some(rows[1]))
+    } else {
+        (area, None)
+    };
+    if show_lyrics && has_lyrics {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(body);
+        PlayerSplits {
+            cover: cols[0],
+            lyrics: Some(cols[1]),
+            spectrum,
+        }
+    } else {
+        PlayerSplits {
+            cover: body,
+            lyrics: None,
+            spectrum,
+        }
+    }
+}
+
+fn fill_cover(cover_art: Option<&cover::CoverArt>, width: u16, height: u16) -> Vec<Line<'static>> {
+    match cover_art {
+        Some(c) => c.fill_lines(width, height),
+        None => cover::fill_placeholder(width, height),
+    }
+}
+
 fn letterbox_cover(
     cover_art: Option<&cover::CoverArt>,
     width: u16,
@@ -3980,6 +3990,91 @@ fn letterbox_cover(
         out.push(Line::from(" ".repeat(width as usize)));
     }
     out
+}
+
+fn header_chips(mix: MixMode, remix: RemixMode, shuffle: ShuffleMode) -> Vec<&'static str> {
+    let mut chips = Vec::new();
+    match mix {
+        MixMode::Cut => chips.push("CUT"),
+        MixMode::Crossfade => {}
+        MixMode::AutoMix => chips.push("AUTO"),
+    }
+    if remix != RemixMode::Off {
+        chips.push(remix.label());
+    }
+    match shuffle {
+        ShuffleMode::Off => {}
+        ShuffleMode::Random => chips.push("SHUF"),
+        ShuffleMode::NoRepeat => chips.push("NOREP"),
+        ShuffleMode::Taste => chips.push("TASTE"),
+    }
+    chips
+}
+
+fn header_chip_span(chip: &str) -> Span<'static> {
+    match chip {
+        "CUT" => Span::styled("CUT", Style::default().red().add_modifier(Modifier::BOLD)),
+        "AUTO" => Span::styled(
+            "AUTO",
+            Style::default().magenta().add_modifier(Modifier::BOLD),
+        ),
+        "CHILL" => Span::styled(
+            "CHILL",
+            Style::default().blue().add_modifier(Modifier::BOLD),
+        ),
+        "CLUB" => Span::styled(
+            "CLUB",
+            Style::default().yellow().add_modifier(Modifier::BOLD),
+        ),
+        "NCORE" => Span::styled(
+            "NCORE",
+            Style::default().magenta().add_modifier(Modifier::BOLD),
+        ),
+        "SHUF" | "NOREP" | "TASTE" => Span::styled(chip.to_string(), Style::default().yellow()),
+        _ => Span::raw(chip.to_string()),
+    }
+}
+
+fn now_playing_label(
+    title: &str,
+    artist: &str,
+    position_frames: usize,
+    duration_frames: usize,
+    sample_rate: u32,
+) -> String {
+    let time = format!(
+        "{} / {}",
+        fmt_time(position_frames, sample_rate),
+        fmt_time(duration_frames, sample_rate)
+    );
+    if artist.is_empty() {
+        format!(" {title}  {time} ")
+    } else {
+        format!(" {title}  {artist}  {time} ")
+    }
+}
+
+fn footer_help(command: Option<&str>, _tab: Tab) -> String {
+    match command {
+        Some(cmd) => format!(":{cmd}"),
+        None => "^k keys".into(),
+    }
+}
+
+fn playing_row_mark(playing: bool) -> &'static str {
+    if playing {
+        "▸  "
+    } else {
+        "   "
+    }
+}
+
+fn playing_row_style(playing: bool, pal: Palette) -> Style {
+    if playing {
+        pal.peak_style().add_modifier(Modifier::BOLD)
+    } else {
+        pal.text_style()
+    }
 }
 
 fn fmt_time(frames: usize, sample_rate: u32) -> String {
@@ -4130,7 +4225,10 @@ mod tests {
 
     #[test]
     fn tick_work_skips_spectrum_when_visualizer_is_off() {
-        assert!(!needs_spectrum_refresh(crate::prefs::VisualizeMode::Off, false));
+        assert!(!needs_spectrum_refresh(
+            crate::prefs::VisualizeMode::Off,
+            false
+        ));
         assert!(needs_spectrum_refresh(
             crate::prefs::VisualizeMode::Bars,
             false
@@ -4277,5 +4375,87 @@ mod tests {
             1,
             "silent PCM should draw one centered line, got {lit:?}"
         );
+    }
+
+    #[test]
+    fn fill_cover_uses_every_cell() {
+        let lines = fill_cover(None, 40, 12);
+        assert_eq!(lines.len(), 12);
+        assert_eq!(lines[0].spans.len(), 40);
+    }
+
+    #[test]
+    fn fill_cover_placeholder_uses_every_cell() {
+        let lines = fill_cover(None, 30, 8);
+        assert_eq!(lines.len(), 8);
+        assert_eq!(lines[0].spans.len(), 30);
+    }
+
+    #[test]
+    fn player_splits_hide_empty_lyrics() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let with_lyrics = player_splits(area, true, true, true);
+        assert!(with_lyrics.lyrics.is_some());
+        assert_eq!(with_lyrics.spectrum.map(|r| r.height), Some(4));
+        let no_lyrics = player_splits(area, true, false, true);
+        assert!(no_lyrics.lyrics.is_none());
+        assert_eq!(no_lyrics.cover.width, 80);
+        let lyrics_off = player_splits(area, false, true, false);
+        assert!(lyrics_off.lyrics.is_none());
+        assert!(lyrics_off.spectrum.is_none());
+        assert_eq!(lyrics_off.cover.height, 24);
+    }
+
+    #[test]
+    fn header_omits_default_mixer_chips() {
+        let chips = header_chips(MixMode::Crossfade, RemixMode::Off, ShuffleMode::Off);
+        let joined = chips.join(" ");
+        assert!(!joined.contains("FADE"));
+        assert!(!joined.contains("RAW"));
+        assert!(!joined.contains("SEQ"));
+        assert!(!joined.contains("AUTO"));
+        assert!(!joined.contains("SHUF"));
+        assert_eq!(
+            header_chips(MixMode::Cut, RemixMode::Off, ShuffleMode::Off),
+            vec!["CUT"]
+        );
+    }
+
+    #[test]
+    fn header_keeps_nondefault_mixer_chips() {
+        let chips = header_chips(MixMode::AutoMix, RemixMode::Chill, ShuffleMode::Random);
+        assert_eq!(chips, vec!["AUTO", "CHILL", "SHUF"]);
+    }
+
+    #[test]
+    fn now_playing_label_is_title_artist_time() {
+        let label = now_playing_label("Nightcall", "Kavinsky", 90, 240, 1);
+        assert_eq!(label, " Nightcall  Kavinsky  1:30 / 4:00 ");
+        assert!(!label.contains("next"));
+        assert!(!label.contains("bpm"));
+    }
+
+    #[test]
+    fn footer_help_is_keys_hint() {
+        assert_eq!(footer_help(None, Tab::Player), "^k keys");
+        assert_eq!(footer_help(None, Tab::Music), "^k keys");
+        assert_eq!(footer_help(Some("find night"), Tab::Music), ":find night");
+    }
+
+    #[test]
+    fn playing_row_uses_peak_and_extra_space() {
+        let pal = Palette::for_theme(crate::prefs::ThemeName::Frappe);
+        assert_eq!(playing_row_mark(true), "▸  ");
+        assert_eq!(playing_row_mark(false), "   ");
+        assert_eq!(
+            playing_row_style(true, pal),
+            pal.peak_style().add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(playing_row_style(false, pal), pal.text_style());
     }
 }
