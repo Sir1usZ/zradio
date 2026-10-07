@@ -1381,6 +1381,7 @@ impl App {
                 self.publish_mpris();
                 self.update_api_state();
                 self.maybe_prefetch();
+                self.player.recover_if_needed();
                 if let Ok(mut mixer) = self.player.mixer.lock() {
                     if let Some(cava) = self.cava.as_ref() {
                         let bars = cava.latest();

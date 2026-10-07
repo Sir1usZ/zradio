@@ -1,9 +1,11 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Sample, SampleFormat, Stream};
+use cpal::{Sample, SampleFormat, Stream, StreamConfig};
 
 use crate::analysis::TrackAnalysis;
 use crate::automix::{
@@ -22,6 +24,56 @@ use crate::scope::{PcmRing, PcmSnapshot};
 use crate::spectrum::Spectrum;
 
 const FADE_SECS: f32 = 6.0;
+const STREAM_REBUILD_GAP: Duration = Duration::from_millis(500);
+
+struct StreamHealth {
+    failed: AtomicBool,
+}
+
+impl StreamHealth {
+    fn new() -> Self {
+        Self {
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    fn mark_failed(&self) {
+        self.failed.store(true, Ordering::SeqCst);
+    }
+
+    fn take_failed(&self) -> bool {
+        self.failed.swap(false, Ordering::SeqCst)
+    }
+}
+
+struct RebuildGate {
+    last: Option<Instant>,
+}
+
+impl RebuildGate {
+    fn new() -> Self {
+        Self { last: None }
+    }
+
+    fn allow(&mut self, now: Instant, gap: Duration) -> bool {
+        if self.last.is_some_and(|last| now.saturating_duration_since(last) < gap) {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+}
+
+fn stream_error_is_fatal(err: &str) -> bool {
+    err.contains("POLLERR")
+}
+
+fn note_stream_error(health: &StreamHealth, err: impl ToString) {
+    let msg = err.to_string();
+    if stream_error_is_fatal(&msg) {
+        health.mark_failed();
+    }
+}
 
 struct StreamErrorLog {
     last: Option<String>,
@@ -1002,7 +1054,12 @@ fn beatmatch(buf: AudioBuf, rate: f32) -> AudioBuf {
 
 pub struct Player {
     pub mixer: Arc<Mutex<Mixer>>,
-    _stream: Stream,
+    stream: Option<Stream>,
+    device: cpal::Device,
+    config: StreamConfig,
+    sample_format: SampleFormat,
+    health: Arc<StreamHealth>,
+    rebuild_gate: RebuildGate,
     pub sample_rate: u32,
     pub channels: usize,
 }
@@ -1016,36 +1073,88 @@ impl Player {
         let supported = device.default_output_config()?;
         let sample_rate = supported.sample_rate().0;
         let channels = supported.channels() as usize;
+        let sample_format = supported.sample_format();
+        let config: StreamConfig = supported.into();
         let mixer = Arc::new(Mutex::new(Mixer::new(sample_rate, channels)));
-        let stream_mixer = Arc::clone(&mixer);
-        let stream = match supported.sample_format() {
-            SampleFormat::F32 => build_stream::<f32>(&device, &supported.into(), stream_mixer)?,
-            SampleFormat::I16 => build_stream::<i16>(&device, &supported.into(), stream_mixer)?,
-            SampleFormat::U16 => build_stream::<u16>(&device, &supported.into(), stream_mixer)?,
-            other => return Err(anyhow!("unsupported sample format {other}")),
-        };
+        let health = Arc::new(StreamHealth::new());
+        let stream = open_stream(&device, &config, sample_format, Arc::clone(&mixer), Arc::clone(&health))?;
         stream.play()?;
         Ok(Self {
             mixer,
-            _stream: stream,
+            stream: Some(stream),
+            device,
+            config,
+            sample_format,
+            health,
+            rebuild_gate: RebuildGate::new(),
             sample_rate,
             channels,
         })
+    }
+
+    pub fn recover_if_needed(&mut self) {
+        if !self.health.take_failed() {
+            return;
+        }
+        if !self.rebuild_gate.allow(Instant::now(), STREAM_REBUILD_GAP) {
+            self.health.mark_failed();
+            return;
+        }
+        // Drop first so ALSA can reopen the same device.
+        self.stream = None;
+        match open_stream(
+            &self.device,
+            &self.config,
+            self.sample_format,
+            Arc::clone(&self.mixer),
+            Arc::clone(&self.health),
+        ) {
+            Ok(stream) => {
+                if let Err(err) = stream.play() {
+                    eprintln!("audio stream: rebuild play failed: {err}");
+                    self.health.mark_failed();
+                    return;
+                }
+                self.stream = Some(stream);
+            }
+            Err(err) => {
+                eprintln!("audio stream: rebuild failed: {err}");
+                self.health.mark_failed();
+            }
+        }
+    }
+}
+
+fn open_stream(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    sample_format: SampleFormat,
+    mixer: Arc<Mutex<Mixer>>,
+    health: Arc<StreamHealth>,
+) -> anyhow::Result<Stream> {
+    match sample_format {
+        SampleFormat::F32 => build_stream::<f32>(device, config, mixer, health),
+        SampleFormat::I16 => build_stream::<i16>(device, config, mixer, health),
+        SampleFormat::U16 => build_stream::<u16>(device, config, mixer, health),
+        other => Err(anyhow!("unsupported sample format {other}")),
     }
 }
 
 fn build_stream<T>(
     device: &cpal::Device,
-    config: &cpal::StreamConfig,
+    config: &StreamConfig,
     mixer: Arc<Mutex<Mixer>>,
+    health: Arc<StreamHealth>,
 ) -> anyhow::Result<Stream>
 where
     T: Sample + cpal::FromSample<f32> + cpal::SizedSample,
 {
     let log = Mutex::new(StreamErrorLog::new());
-    let err_fn = move |err| {
+    let err_fn = move |err: cpal::StreamError| {
+        let msg = err.to_string();
+        note_stream_error(&health, &msg);
         if let Ok(mut log) = log.lock() {
-            for line in log.push(err) {
+            for line in log.push(msg) {
                 eprintln!("{line}");
             }
         }
@@ -1079,6 +1188,7 @@ mod tests {
     use super::*;
     use crate::library::Track;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     fn const_deck(frames: usize, amp: f32) -> AudioBuf {
         AudioBuf {
@@ -1552,5 +1662,38 @@ mod tests {
                 "audio stream: underrun occurred".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn pollerr_is_a_fatal_stream_error() {
+        assert!(stream_error_is_fatal(
+            "A backend-specific error has occurred: `alsa::poll()` returned POLLERR"
+        ));
+        assert!(!stream_error_is_fatal("underrun occurred"));
+        assert!(!stream_error_is_fatal("Device is no longer available"));
+    }
+
+    #[test]
+    fn stream_health_latches_pollerr_until_taken() {
+        let health = StreamHealth::new();
+        assert!(!health.take_failed());
+        note_stream_error(&health, "underrun occurred");
+        assert!(!health.take_failed());
+        note_stream_error(
+            &health,
+            "A backend-specific error has occurred: `alsa::poll()` returned POLLERR",
+        );
+        assert!(health.take_failed());
+        assert!(!health.take_failed());
+    }
+
+    #[test]
+    fn rebuild_gate_blocks_until_backoff_elapses() {
+        let mut gate = RebuildGate::new();
+        let t0 = Instant::now();
+        let gap = Duration::from_millis(500);
+        assert!(gate.allow(t0, gap));
+        assert!(!gate.allow(t0 + Duration::from_millis(100), gap));
+        assert!(gate.allow(t0 + Duration::from_millis(500), gap));
     }
 }
