@@ -37,8 +37,8 @@ use crate::engine::{load_track, Player, Snapshot};
 use crate::eq::Equalizer;
 use crate::fetch::{self, looks_like_media_url};
 use crate::greeting::{
-    greeting_line, greeting_origin, local_hour, music_split, scaled_span, system_name,
-    GreetingAnim, GREET_SCALE,
+    greeting_line, greeting_origin, greeting_overlay, local_hour, music_split, overlay_escape,
+    system_name, GreetingAnim, GREET_SCALE,
 };
 use crate::library::{scan_library, sort_indices, track_from_path, Track};
 use crate::meta::{
@@ -236,6 +236,7 @@ pub struct App {
     drawer_idx: usize,
     greeting: GreetingAnim,
     greeting_text: String,
+    greeting_overlay: Option<crate::greeting::GreetingOverlay>,
     range_cache: Vec<RangeRow>,
     sorted_idx: Vec<usize>,
     api_dirty: bool,
@@ -423,6 +424,7 @@ impl App {
             drawer_idx: 0,
             greeting: GreetingAnim::new(),
             greeting_text: greeting_line(local_hour(), &system_name()),
+            greeting_overlay: None,
             range_cache: Vec::new(),
             sorted_idx: Vec::new(),
             api_dirty: true,
@@ -1338,6 +1340,7 @@ impl App {
                 terminal.clear()?;
             }
             terminal.draw(|frame| self.draw(frame))?;
+            self.write_greeting_overlay()?;
             last_wall = SystemTime::now();
             let timeout = tick.saturating_sub(last.elapsed());
             if event::poll(timeout)? {
@@ -2866,9 +2869,12 @@ impl App {
             let (greet_area, list_area) = music_split(area, self.greeting.visual());
             if greet_area.height > 0 {
                 self.draw_greeting(frame, greet_area);
+            } else {
+                self.greeting_overlay = None;
             }
             list_area
         } else {
+            self.greeting_overlay = None;
             area
         };
         match self.music_mode {
@@ -2877,7 +2883,7 @@ impl App {
         }
     }
 
-    fn draw_greeting(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+    fn draw_greeting(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let pal = self.palette();
         let t = self.greeting.opacity();
         let fg = if t >= 0.85 {
@@ -2893,8 +2899,9 @@ impl App {
             1
         };
         let (x, y) = greeting_origin(area, scale);
-        let text = if scale > 1 {
-            scaled_span(&self.greeting_text, scale)
+        let kitty = std::env::var_os("KITTY_WINDOW_ID").is_some();
+        let text = if scale > 1 && kitty {
+            String::new()
         } else {
             format!("  {}", self.greeting_text)
         };
@@ -2906,9 +2913,25 @@ impl App {
         }
         .intersection(area);
         if dest.width == 0 || dest.height == 0 {
+            self.greeting_overlay = None;
             return;
         }
         frame.render_widget(Paragraph::new(Line::from(Span::styled(text, fg))), dest);
+        self.greeting_overlay = greeting_overlay(area, &self.greeting_text, scale);
+    }
+
+    fn write_greeting_overlay(&self) -> io::Result<()> {
+        let Some(overlay) = self.greeting_overlay.as_ref() else {
+            return Ok(());
+        };
+        if std::env::var_os("KITTY_WINDOW_ID").is_none() {
+            return Ok(());
+        }
+        let mut stdout = stdout();
+        execute!(stdout, crossterm::cursor::Hide)?;
+        use std::io::Write;
+        stdout.write_all(overlay_escape(overlay).as_bytes())?;
+        stdout.flush()
     }
 
     fn draw_artists(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {

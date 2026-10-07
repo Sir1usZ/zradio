@@ -142,6 +142,36 @@ pub fn greeting_origin(area: Rect, scale: u8) -> (u16, u16) {
     (x, y)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GreetingOverlay {
+    pub text: String,
+    pub scale: u8,
+    pub col: u16,
+    pub row: u16,
+}
+
+pub fn greeting_overlay(area: Rect, text: &str, scale: u8) -> Option<GreetingOverlay> {
+    if scale <= 1 || text.is_empty() || area.width == 0 || area.height < scale as u16 {
+        return None;
+    }
+    let (x, y) = greeting_origin(area, scale);
+    Some(GreetingOverlay {
+        text: text.to_string(),
+        scale,
+        col: x.saturating_add(1),
+        row: y.saturating_add(1),
+    })
+}
+
+pub fn overlay_escape(overlay: &GreetingOverlay) -> String {
+    format!(
+        "\x1b[{};{}H{}",
+        overlay.row,
+        overlay.col,
+        scaled_span(&overlay.text, overlay.scale)
+    )
+}
+
 fn nonempty(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -324,6 +354,45 @@ mod tests {
         assert_eq!(scaled_span("hi", 1), "hi");
         assert_eq!(scaled_span("", 2), "");
         assert_eq!(scaled_span("早上好", 2), "\x1b]66;s=2;早上好\x07");
+    }
+
+    #[test]
+    fn greeting_overlay_skips_plain_text_and_empty_area() {
+        let area = Rect {
+            x: 0,
+            y: 6,
+            width: 80,
+            height: 5,
+        };
+        assert_eq!(greeting_overlay(area, "早上好，xender", 1), None);
+        assert_eq!(greeting_overlay(area, "", 2), None);
+        assert_eq!(greeting_overlay(Rect::default(), "早上好，xender", 2), None);
+        let tiny = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 1,
+        };
+        assert_eq!(greeting_overlay(tiny, "早上好，xender", 2), None);
+    }
+
+    #[test]
+    fn greeting_overlay_keeps_text_free_of_escapes() {
+        let area = Rect {
+            x: 0,
+            y: 6,
+            width: 80,
+            height: 5,
+        };
+        let overlay = greeting_overlay(area, "早上好，xender", 2).expect("overlay");
+        assert!(!overlay.text.contains('\x1b'));
+        assert_eq!(overlay.text, "早上好，xender");
+        assert_eq!(overlay.scale, 2);
+        assert_eq!(overlay.col, 3);
+        assert_eq!(overlay.row, 8);
+        let esc = overlay_escape(&overlay);
+        assert!(esc.starts_with("\x1b[8;3H"));
+        assert!(esc.contains("\x1b]66;s=2;早上好，xender\x07"));
     }
 
     #[test]
