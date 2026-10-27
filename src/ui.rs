@@ -1071,10 +1071,6 @@ impl App {
             job.analysis.size = meta.len();
         }
         self.analysis.insert(path, job.analysis.clone());
-        let remix = self.player.mixer.lock().expect("mixer").remix();
-        let buf = apply_remix(&job.buf, remix);
-        let mut mixer = self.player.mixer.lock().expect("mixer");
-        mixer.set_analysis(index, job.analysis);
         let meta = load_meta(
             path,
             &self
@@ -1083,7 +1079,18 @@ impl App {
                 .map(|t| t.title.clone())
                 .unwrap_or_default(),
         );
+        let mut mixer = self.player.mixer.lock().expect("mixer");
+        mixer.set_analysis(index, job.analysis);
         mixer.set_track_title(index, meta.title.clone());
+        let remix = mixer.remix();
+        let fade = job.transition && mixer.mix().uses_fade();
+        let rate = if fade {
+            mixer.transition_rate(index, job.skip)
+        } else {
+            1.0
+        };
+        drop(mixer);
+        let buf = crate::engine::beatmatch(apply_remix(job.buf, remix), rate);
         if let Some(track) = self.tracks.get_mut(index) {
             track.title = meta.title.clone();
         }
@@ -1091,15 +1098,13 @@ impl App {
             self.metas.resize(index + 1, None);
         }
         self.metas[index] = Some(meta.clone());
-        let queue_remote = self.wants_remote(&meta);
-        drop(mixer);
-        if queue_remote {
+        if self.wants_remote(&meta) {
             self.queue_meta(index);
         }
         self.mark_meta_changed();
         let mut mixer = self.player.mixer.lock().expect("mixer");
-        if job.transition && mixer.mix().uses_fade() {
-            mixer.start_transition(index, buf, job.skip);
+        if fade {
+            mixer.start_matched_transition(index, buf, job.skip, rate);
         } else {
             mixer.play_decoded(index, buf);
         }

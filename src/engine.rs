@@ -532,16 +532,34 @@ impl Mixer {
         self.status = self.play_status(index);
     }
 
-    pub fn start_transition(&mut self, index: usize, buf: AudioBuf, skip: bool) {
-        let plan = plan_for(
+    pub fn transition_rate(&self, index: usize, skip: bool) -> f32 {
+        self.plan_transition(index, skip).rate
+    }
+
+    fn plan_transition(&self, index: usize, skip: bool) -> TransitionPlan {
+        plan_for(
             self.current_idx,
             index,
             &self.analyses,
             self.mix,
             skip && self.mix != MixMode::AutoMix,
-        );
+        )
+    }
+
+    pub fn start_transition(&mut self, index: usize, buf: AudioBuf, skip: bool) {
+        self.start_matched_transition(index, buf, skip, 1.0);
+    }
+
+    pub fn start_matched_transition(
+        &mut self,
+        index: usize,
+        buf: AudioBuf,
+        skip: bool,
+        matched: f32,
+    ) {
+        let plan = self.plan_transition(index, skip);
         let fade_secs = plan.fade_secs;
-        let buf = beatmatch(buf, plan.rate);
+        let buf = beatmatch(buf, plan.rate / matched.max(0.01));
         if !self.mix.uses_fade() || self.current.as_ref().is_none_or(|d| d.remaining() < 2) {
             self.play_decoded(index, buf);
             return;
@@ -1103,7 +1121,7 @@ fn splitmix64(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn beatmatch(buf: AudioBuf, rate: f32) -> AudioBuf {
+pub fn beatmatch(buf: AudioBuf, rate: f32) -> AudioBuf {
     if (rate - 1.0).abs() < 0.004 || buf.samples.is_empty() {
         return buf;
     }
@@ -1447,6 +1465,32 @@ mod tests {
             start_at >= pos,
             "must not rewind current track, start={start_at} pos={pos}"
         );
+    }
+
+    #[test]
+    fn prematched_transition_is_not_resampled_again() {
+        let armed_frames = |prematched: bool| {
+            let mut mixer = Mixer::new(48_000, 2);
+            mixer.set_tracks(two_tracks());
+            mixer.mix = MixMode::AutoMix;
+            mixer.play_decoded(0, const_deck(48_000 * 20, 0.8));
+            mixer.set_analysis(0, analysis_at(0.0, 16.0, 20.0));
+            let mut next = analysis_at(4.0, 18.0, 20.0);
+            next.bpm = Some(126.0);
+            mixer.set_analysis(1, next);
+            let rate = mixer.transition_rate(1, false);
+            assert!((rate - 1.0).abs() > 0.004);
+            if prematched {
+                let buf = beatmatch(const_deck(48_000 * 20, 0.2), rate);
+                mixer.start_matched_transition(1, buf, false, rate);
+            } else {
+                mixer.start_transition(1, const_deck(48_000 * 20, 0.2), false);
+            }
+            mixer.armed.as_ref().expect("armed").deck.frames()
+        };
+        let raw = armed_frames(false);
+        assert_ne!(raw, 48_000 * 20);
+        assert_eq!(armed_frames(true), raw);
     }
 
     #[test]
