@@ -680,6 +680,9 @@ fn handle_control(body: &str, tx: &Sender<ControlCmd>, state: &SharedState) -> s
         // ── EQ ──
         "eq" => {
             let band = req.index.unwrap_or(0);
+            if band >= crate::eq::BANDS {
+                return err("band must be 0-4");
+            }
             let db = req.value.unwrap_or(0.0);
             ControlCmd::SetEq(band, db)
         }
@@ -750,6 +753,9 @@ fn handle_eq(body: &str, tx: &Sender<ControlCmd>) -> serde_json::Value {
         Ok(r) => r,
         Err(e) => return err(format!("bad json: {e}")),
     };
+    if req.band >= crate::eq::BANDS {
+        return err("band must be 0-4");
+    }
     if let Err(response) = enqueue_control(tx, ControlCmd::SetEq(req.band, req.db)) {
         return response;
     }
@@ -1029,6 +1035,19 @@ mod tests {
         let resp = err("something broke");
         assert_eq!(resp["ok"], false);
         assert_eq!(resp["error"], "something broke");
+    }
+
+    #[test]
+    fn eq_rejects_unknown_bands_before_queueing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state = new_shared_state();
+        assert_eq!(handle_eq(r#"{"band":5,"db":3.0}"#, &tx)["ok"], false);
+        let resp = handle_control(r#"{"action":"eq","index":7,"value":3.0}"#, &tx, &state);
+        assert_eq!(resp["ok"], false);
+        assert!(rx.try_recv().is_err());
+
+        assert_eq!(handle_eq(r#"{"band":4,"db":3.0}"#, &tx)["ok"], true);
+        assert!(matches!(rx.try_recv(), Ok(ControlCmd::SetEq(4, db)) if db == 3.0));
     }
 
     #[test]
