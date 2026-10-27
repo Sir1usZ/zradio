@@ -303,6 +303,15 @@ impl Mixer {
         );
     }
 
+    pub fn set_eq_band(&mut self, band: usize, db: f32) {
+        self.eq.set_band(self.sample_rate, band, db);
+        self.status = format!(
+            "eq {} {:+.0}",
+            Equalizer::labels()[band.min(4)],
+            self.eq.db()[band.min(4)]
+        );
+    }
+
     pub fn reset_eq(&mut self) {
         self.eq.reset(self.sample_rate);
         self.status = "eq reset".into();

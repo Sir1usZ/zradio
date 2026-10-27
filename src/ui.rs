@@ -2687,10 +2687,11 @@ impl App {
                 // ── EQ ──
                 ControlCmd::SetEq(band, db) => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
-                        mixer.bump_eq(band, db);
+                        mixer.set_eq_band(band, db);
                         self.prefs.eq_db = mixer.eq_db();
                         self.status = mixer.snapshot(self.selected()).status;
                     }
+                    self.prefs.save();
                 }
                 ControlCmd::ResetEq => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
@@ -2698,6 +2699,7 @@ impl App {
                         self.prefs.eq_db = mixer.eq_db();
                         self.status = mixer.snapshot(self.selected()).status;
                     }
+                    self.prefs.save();
                 }
 
                 // ── 排序 ──
