@@ -246,6 +246,7 @@ pub struct Mixer {
     shuffle: bool,
     shuffle_mode: ShuffleMode,
     recent: Vec<usize>,
+    shuffle_state: u64,
     loop_mode: LoopMode,
     taste_boosts: Vec<f32>,
     eq: Equalizer,
@@ -280,6 +281,7 @@ impl Mixer {
             shuffle: false,
             shuffle_mode: ShuffleMode::Off,
             recent: Vec::new(),
+            shuffle_state: shuffle_entropy(),
             loop_mode: LoopMode::Off,
             taste_boosts: Vec::new(),
             eq: Equalizer::new(sample_rate, [0.0; 5]),
@@ -456,6 +458,7 @@ impl Mixer {
         if self.tracks.is_empty() {
             return;
         }
+        self.shuffle_state = splitmix64(self.shuffle_state ^ index as u64);
         self.recent.retain(|&i| i != index);
         self.recent.push(index);
         let cap = self.tracks.len().saturating_sub(1).min(12);
@@ -739,8 +742,7 @@ impl Mixer {
     }
 
     fn shuffle_seed(&self) -> usize {
-        let cur = self.current_idx.unwrap_or(0);
-        cur.wrapping_mul(1_000_003) ^ self.tracks.len() ^ 0x9E37
+        (self.shuffle_state >> 11) as usize
     }
 
     fn random_next(&self, pool: &[usize]) -> usize {
@@ -1084,6 +1086,21 @@ impl Mixer {
             .map(|t| t.title.clone())
             .unwrap_or_default()
     }
+}
+
+fn shuffle_entropy() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    splitmix64(nanos ^ (u64::from(std::process::id()) << 32))
+}
+
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 fn beatmatch(buf: AudioBuf, rate: f32) -> AudioBuf {
@@ -1615,6 +1632,29 @@ mod tests {
         mixer.set_playhead(9_000);
         assert_eq!(mixer.next_index(), Some(first));
         assert_eq!(mixer.snapshot(0).next_hint, hint);
+    }
+
+    #[test]
+    fn random_shuffle_reaches_the_whole_library() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(
+            (0..16)
+                .map(|i| Track {
+                    path: PathBuf::from(format!("{i}.wav")),
+                    title: i.to_string(),
+                })
+                .collect(),
+        );
+        mixer.set_shuffle_mode(crate::prefs::ShuffleMode::Random);
+        mixer.shuffle_state = 7;
+        mixer.play_decoded(0, const_deck(100, 0.5));
+        let mut seen = std::collections::HashSet::from([0]);
+        for _ in 0..200 {
+            let next = mixer.next_index().unwrap();
+            mixer.play_decoded(next, const_deck(100, 0.5));
+            seen.insert(next);
+        }
+        assert_eq!(seen.len(), 16, "visited {seen:?}");
     }
 
     #[test]
