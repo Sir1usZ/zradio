@@ -270,8 +270,7 @@ fn short_err(line: &str) -> String {
 }
 
 pub fn parse_percent(msg: &str) -> Option<f64> {
-    let msg = msg.trim();
-    let pct = msg.split('%').next()?;
+    let (pct, _) = msg.trim().split_once('%')?;
     let num = pct
         .rsplit(|c: char| !(c.is_ascii_digit() || c == '.'))
         .next()?;
@@ -401,6 +400,13 @@ Deleting original file /music/song.webm (pass -k to keep)
             rx.try_iter().last().as_deref(),
             Some("[youtube] abc: Sign in to confirm")
         );
+    }
+
+    #[test]
+    fn percent_needs_a_percent_sign() {
+        assert_eq!(parse_percent("[youtube] HTTP Error 403: Forbidden"), None);
+        assert_eq!(parse_percent("cookies chrome"), None);
+        assert_eq!(parse_percent("100% of 16.14KiB in 00:00:00"), Some(1.0));
     }
 
     #[test]
