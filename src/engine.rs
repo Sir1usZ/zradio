@@ -205,10 +205,10 @@ impl Deck {
     }
 
     fn frame(&self, at: usize) -> [f32; 2] {
-        if self.frames() == 0 {
+        if at >= self.frames() {
             return [0.0, 0.0];
         }
-        let i = at.min(self.frames() - 1) * self.channels;
+        let i = at * self.channels;
         if self.channels == 1 {
             let s = self.samples[i];
             [s, s]
@@ -1426,6 +1426,21 @@ mod tests {
         let first = out[0].abs();
         let last = out[out.len() - 2].abs();
         assert!(first > last);
+    }
+
+    #[test]
+    fn deck_past_its_end_is_silent_not_its_last_sample() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.play_decoded(0, const_deck(100, 0.8));
+        let plan = mixer.plan_transition(1, true);
+        mixer.begin_mix(1, Deck::from_buf(const_deck(48_000, 0.0)), 400, plan);
+        for _ in 0..100 {
+            mixer.next_stereo();
+        }
+        for i in 0..200 {
+            assert_eq!(mixer.next_stereo(), [0.0, 0.0], "frame {i} past the end");
+        }
     }
 
     fn analysis_at(mix_in: f32, mix_out: f32, duration: f32) -> crate::analysis::TrackAnalysis {
