@@ -155,10 +155,8 @@ pub fn load_meta(path: &Path, fallback_title: &str) -> TrackMeta {
     if meta.cover_path.is_none() {
         if let Some(cover) = sidecar_cover(path) {
             if let Ok(bytes) = fs::read(&cover) {
-                if let Some((cover_path, art)) = store_cover(&cover, &bytes, None) {
-                    meta.cover_path = Some(cover_path);
-                    meta.cover = art;
-                }
+                meta.cover = crate::cover::CoverArt::from_bytes(&bytes);
+                meta.cover_path = Some(cover);
             }
         }
     }
@@ -739,6 +737,28 @@ mod tests {
         assert_eq!(merged.title, "Remote title");
         assert_eq!(merged.artist, "Remote artist");
         assert_eq!(merged.album, "Local album");
+    }
+
+    #[test]
+    fn sidecar_cover_is_used_in_place_without_copies() {
+        let dir = std::env::temp_dir().join(format!("zradio-sidecar-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("cover")).unwrap();
+        let song = dir.join("song.wav");
+        write_silent_wav(&song);
+        let cover = dir.join("cover").join("cover.png");
+        let mut png = Vec::new();
+        image::RgbImage::from_pixel(2, 2, image::Rgb([200, 40, 40]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        fs::write(&cover, &png).unwrap();
+
+        let meta = load_meta(&song, "song");
+
+        assert_eq!(meta.cover_path.as_deref(), Some(cover.as_path()));
+        assert!(meta.cover.is_some());
+        assert!(!dir.join("cover").join("cover").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
