@@ -404,7 +404,7 @@ Deleting original file /music/song.webm (pass -k to keep)
 
     #[test]
     fn percent_needs_a_percent_sign() {
-        assert_eq!(parse_percent("[youtube] HTTP Error 403: Forbidden"), None);
+        assert_eq!(parse_percent("unable to download: HTTP Error 403"), None);
         assert_eq!(parse_percent("cookies chrome"), None);
         assert_eq!(parse_percent("100% of 16.14KiB in 00:00:00"), Some(1.0));
     }
