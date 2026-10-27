@@ -656,14 +656,7 @@ impl App {
                 .collect()
         } else {
             match self.playlists.current_list() {
-                Some(list) => list
-                    .paths
-                    .iter()
-                    .map(|p| match self.tracks.iter().position(|t| &t.path == p) {
-                        Some(i) => RangeRow::Present(i),
-                        None => RangeRow::Missing(p.clone()),
-                    })
-                    .collect(),
+                Some(list) => playlist_rows(&list.paths, &self.tracks),
                 None => Vec::new(),
             }
         };
@@ -3941,6 +3934,21 @@ fn remap_track_indices(old: &[Track], new: &[Track]) -> Vec<Option<usize>> {
         .collect()
 }
 
+fn playlist_rows(paths: &[PathBuf], tracks: &[Track]) -> Vec<RangeRow> {
+    let mut by_path: std::collections::HashMap<&std::path::Path, usize> =
+        std::collections::HashMap::with_capacity(tracks.len());
+    for (i, t) in tracks.iter().enumerate() {
+        by_path.entry(t.path.as_path()).or_insert(i);
+    }
+    paths
+        .iter()
+        .map(|p| match by_path.get(p.as_path()) {
+            Some(&i) => RangeRow::Present(i),
+            None => RangeRow::Missing(p.clone()),
+        })
+        .collect()
+}
+
 fn visible_row(visible: &[usize], track_index: usize) -> Option<usize> {
     visible.iter().position(|&i| i == track_index)
 }
@@ -4136,6 +4144,27 @@ mod tests {
             path: PathBuf::from(path),
             title: path.into(),
         }
+    }
+
+    #[test]
+    fn playlist_rows_resolve_paths_to_first_library_index() {
+        let tracks = vec![
+            job_track("/m/a.mp3"),
+            job_track("/m/b.mp3"),
+            job_track("/m/a.mp3"),
+        ];
+        let paths = vec![
+            PathBuf::from("/m/b.mp3"),
+            PathBuf::from("/gone.mp3"),
+            PathBuf::from("/m/a.mp3"),
+            PathBuf::from("/m/b.mp3"),
+        ];
+        let rows = playlist_rows(&paths, &tracks);
+        assert!(matches!(rows[0], RangeRow::Present(1)));
+        assert!(matches!(&rows[1], RangeRow::Missing(p) if p == std::path::Path::new("/gone.mp3")));
+        assert!(matches!(rows[2], RangeRow::Present(0)));
+        assert!(matches!(rows[3], RangeRow::Present(1)));
+        assert_eq!(rows.len(), 4);
     }
 
     #[test]
