@@ -1171,6 +1171,7 @@ impl App {
 
     fn drain_remote_meta(&mut self) {
         let mut changed = false;
+        let mut titles = Vec::new();
         while let Ok(job) = self.remote_rx.try_recv() {
             if !job.id.matches(self.library_generation, &self.tracks)
                 || !self.meta_inflight.remove(&job.id)
@@ -1203,7 +1204,8 @@ impl App {
                 if let Some(title) = job.title.filter(|s| !s.trim().is_empty()) {
                     slot.title = title.clone();
                     if let Some(track) = self.tracks.get_mut(index) {
-                        track.title = title;
+                        track.title = title.clone();
+                        titles.push((index, title));
                     }
                     changed = true;
                 }
@@ -1230,6 +1232,7 @@ impl App {
                 self.peek_sort_dirty = true;
             }
         }
+        self.push_mixer_titles(titles);
         if changed {
             self.api_dirty = true;
         }
@@ -1265,6 +1268,7 @@ impl App {
     fn drain_peek(&mut self) {
         const PEEK_PER_TICK: usize = 24;
         let mut changed = 0;
+        let mut titles = Vec::new();
         for job in receive_batch(&self.peek_rx, PEEK_PER_TICK) {
             if !job.id.matches(self.library_generation, &self.tracks) {
                 continue;
@@ -1281,7 +1285,8 @@ impl App {
                     .filter(|t| !t.is_empty())
                 {
                     if let Some(track) = self.tracks.get_mut(index) {
-                        track.title = title;
+                        track.title = title.clone();
+                        titles.push((index, title));
                     }
                 }
                 changed += 1;
@@ -1298,8 +1303,20 @@ impl App {
                 }
             }
         }
+        self.push_mixer_titles(titles);
         if changed > 0 {
             self.api_dirty = true;
+        }
+    }
+
+    fn push_mixer_titles(&self, titles: Vec<(usize, String)>) {
+        if titles.is_empty() {
+            return;
+        }
+        if let Ok(mut mixer) = self.player.mixer.lock() {
+            for (index, title) in titles {
+                mixer.set_track_title(index, title);
+            }
         }
     }
 
