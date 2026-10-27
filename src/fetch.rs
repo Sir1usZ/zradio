@@ -1,10 +1,20 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 type DownloadMeta = (Option<String>, Option<String>);
+
+const DOWNLOAD_IDLE_LIMIT: Duration = Duration::from_secs(120);
+const DOWNLOAD_TOTAL_LIMIT: Duration = Duration::from_secs(60 * 60);
+
+fn download_stalled(total: Duration, idle: Duration) -> bool {
+    idle > DOWNLOAD_IDLE_LIMIT || total > DOWNLOAD_TOTAL_LIMIT
+}
 
 fn collect_reader_metadata(
     readers: Vec<JoinHandle<()>>,
@@ -174,6 +184,8 @@ pub fn download_audio(
     }
     cmd.arg("--").arg(&url);
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let started = Instant::now();
+    let last_output = Arc::new(AtomicU64::new(0));
     let (meta_tx, meta_rx) = std::sync::mpsc::channel::<DownloadMeta>();
     let mut readers = Vec::with_capacity(2);
     if let Some(stderr) = child.stderr.take() {
@@ -182,6 +194,8 @@ pub fn download_audio(
             progress.clone(),
             meta_tx.clone(),
             true,
+            started,
+            Arc::clone(&last_output),
         ));
     }
     if let Some(stdout) = child.stdout.take() {
@@ -190,19 +204,22 @@ pub fn download_audio(
             progress.clone(),
             meta_tx.clone(),
             false,
+            started,
+            Arc::clone(&last_output),
         ));
     }
     drop(meta_tx);
-    let started = std::time::Instant::now();
     let (status, timed_out) = loop {
         match child.try_wait()? {
             Some(status) => break (status, false),
             None => {
-                if started.elapsed().as_secs() > 90 {
+                let total = started.elapsed();
+                let last = Duration::from_millis(last_output.load(Ordering::Relaxed));
+                if download_stalled(total, total.saturating_sub(last)) {
                     let _ = child.kill();
                     break (child.wait()?, true);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(200));
             }
         }
     };
@@ -223,11 +240,14 @@ fn spawn_output_reader<R: Read + Send + 'static>(
     progress: Option<Sender<String>>,
     meta_tx: Sender<DownloadMeta>,
     keep_err: bool,
+    started: Instant,
+    last_output: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let lines = BufReader::new(stream)
             .split(b'\n')
             .map_while(Result::ok)
+            .inspect(|_| last_output.store(started.elapsed().as_millis() as u64, Ordering::Relaxed))
             .map(|line| String::from_utf8_lossy(&line).into_owned());
         let _ = meta_tx.send(scan_output(lines, progress.as_ref(), keep_err));
     })
@@ -522,6 +542,14 @@ Deleting original file /music/song.webm (pass -k to keep)
 
         assert_eq!(path, "/tmp/delayed-song.mp3");
         assert_eq!(err, "reader finished");
+    }
+
+    #[test]
+    fn download_timeout_tracks_silence_not_total_time() {
+        let secs = Duration::from_secs;
+        assert!(!download_stalled(secs(600), secs(5)));
+        assert!(download_stalled(secs(130), secs(121)));
+        assert!(download_stalled(secs(3601), secs(0)));
     }
 
     #[test]
