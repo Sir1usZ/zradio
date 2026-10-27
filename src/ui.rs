@@ -2123,23 +2123,9 @@ impl App {
     fn open_folder(&mut self, root: PathBuf) {
         match scan_library(&root) {
             Ok(tracks) => {
-                self.invalidate_library_jobs();
                 self.prefs.set_library(&root);
                 self.prefs.save();
-                self.tracks = tracks;
-                self.metas = vec![None; self.tracks.len()];
-                if let Ok(mut mixer) = self.player.mixer.lock() {
-                    mixer.set_tracks(self.tracks.clone());
-                    mixer.set_shuffle_mode(self.prefs.shuffle_mode);
-                }
-                self.sync_playable();
-                self.spawn_peek();
-                self.mark_meta_changed();
-                self.list_state.select(if self.tracks.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                });
+                self.replace_tracks(tracks);
                 self.status = format!("open {} · {} tracks", root.display(), self.tracks.len());
             }
             Err(err) => self.status = format!("open fail {err}"),
@@ -2150,25 +2136,51 @@ impl App {
         let root = self.prefs.library_path();
         match scan_library(&root) {
             Ok(tracks) => {
-                self.invalidate_library_jobs();
-                self.tracks = tracks;
-                self.metas = vec![None; self.tracks.len()];
-                if let Ok(mut mixer) = self.player.mixer.lock() {
-                    mixer.set_tracks(self.tracks.clone());
-                    mixer.set_shuffle_mode(self.prefs.shuffle_mode);
-                }
-                self.sync_playable();
-                self.spawn_peek();
-                self.mark_meta_changed();
-                self.list_state.select(if self.tracks.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                });
+                self.replace_tracks(tracks);
                 self.status = format!("rescan {} · {} tracks", root.display(), self.tracks.len());
             }
             Err(err) => self.status = format!("rescan fail {err}"),
         }
+    }
+
+    fn replace_tracks(&mut self, tracks: Vec<Track>) {
+        self.invalidate_library_jobs();
+        let moved = remap_track_indices(&self.tracks, &tracks);
+        let mut metas = vec![None; tracks.len()];
+        let playing = self
+            .player
+            .mixer
+            .lock()
+            .ok()
+            .and_then(|m| m.playback_view(0).current);
+        if let Some(old) = playing {
+            if let Some(new) = moved.get(old).copied().flatten() {
+                metas[new] = self.metas.get_mut(old).and_then(Option::take);
+            }
+        }
+        self.local_hits = self
+            .local_hits
+            .iter()
+            .filter_map(|&i| moved.get(i).copied().flatten())
+            .collect();
+        if self.local_hits.is_empty() {
+            self.local_filter.clear();
+        }
+        self.local_idx = 0;
+        self.tracks = tracks;
+        self.metas = metas;
+        if let Ok(mut mixer) = self.player.mixer.lock() {
+            mixer.set_tracks(self.tracks.clone());
+            mixer.set_shuffle_mode(self.prefs.shuffle_mode);
+        }
+        self.sync_playable();
+        self.spawn_peek();
+        self.mark_meta_changed();
+        self.list_state.select(if self.tracks.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
     }
 
     fn search_local(&mut self, query: &str) {
@@ -3894,6 +3906,17 @@ fn esc_outcome(search_open: bool, local_open: bool) -> EscOutcome {
     }
 }
 
+fn remap_track_indices(old: &[Track], new: &[Track]) -> Vec<Option<usize>> {
+    let by_path: std::collections::HashMap<&std::path::Path, usize> = new
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.path.as_path(), i))
+        .collect();
+    old.iter()
+        .map(|t| by_path.get(t.path.as_path()).copied())
+        .collect()
+}
+
 fn visible_row(visible: &[usize], track_index: usize) -> Option<usize> {
     visible.iter().position(|&i| i == track_index)
 }
@@ -4089,6 +4112,24 @@ mod tests {
             path: PathBuf::from(path),
             title: path.into(),
         }
+    }
+
+    #[test]
+    fn rescan_moves_indices_with_their_files() {
+        let old = vec![
+            job_track("/m/a.mp3"),
+            job_track("/m/b.mp3"),
+            job_track("/m/c.mp3"),
+        ];
+        let new = vec![
+            job_track("/m/c.mp3"),
+            job_track("/m/new.mp3"),
+            job_track("/m/a.mp3"),
+        ];
+        assert_eq!(
+            remap_track_indices(&old, &new),
+            vec![Some(2), None, Some(0)]
+        );
     }
 
     #[test]
