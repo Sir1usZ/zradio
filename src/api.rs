@@ -1239,10 +1239,11 @@ mod tests {
         info.has_cover = true;
         let state = Arc::new(Mutex::new(ApiSnapshot {
             library: vec![sample_track(0, "A"), info],
-            cover_paths: vec![None, Some(path)],
+            cover_paths: vec![None, Some(path.clone())],
             ..Default::default()
         }));
         let resp = handle_track("/track/1", &state);
+        let _ = std::fs::remove_file(&path);
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["data"]["info"]["title"], "B");
         assert_eq!(resp["data"]["cover"]["mime"], "image/jpeg");
@@ -1265,10 +1266,11 @@ mod tests {
         info.has_cover = true;
         let state = Arc::new(Mutex::new(ApiSnapshot {
             library: vec![info],
-            cover_paths: vec![Some(path)],
+            cover_paths: vec![Some(path.clone())],
             ..Default::default()
         }));
         let resp = handle_library_full(&state);
+        let _ = std::fs::remove_file(&path);
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("secret"));
         assert!(!json.contains("image/jpeg"));
@@ -1281,10 +1283,12 @@ mod tests {
         let path = temp_cover(jpeg, "jpg");
         let state = Arc::new(Mutex::new(ApiSnapshot {
             library: vec![sample_track(2, "C")],
-            cover_paths: vec![None, None, Some(path)],
+            cover_paths: vec![None, None, Some(path.clone())],
             ..Default::default()
         }));
-        let (mime, bytes) = cover_bytes_for("/cover/2", &state).expect("cover");
+        let found = cover_bytes_for("/cover/2", &state);
+        let _ = std::fs::remove_file(&path);
+        let (mime, bytes) = found.expect("cover");
         assert_eq!(mime, "image/jpeg");
         assert_eq!(bytes, jpeg);
         assert!(cover_bytes_for("/cover/0", &state).is_none());
