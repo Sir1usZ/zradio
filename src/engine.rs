@@ -10,8 +10,8 @@ use cpal::{Sample, SampleFormat, Stream, StreamConfig};
 
 use crate::analysis::TrackAnalysis;
 use crate::automix::{
-    cue, fade_secs_for, place, plan_for, plan_pair, Cue, MixStyle, TailBend, TransitionPlan,
-    PREFETCH_LEAD_SECS, RAMP_MAX_SECS,
+    at_tempo, cue, fade_secs_for, place, plan_for, plan_pair, Cue, MixStyle, TailBend,
+    TransitionPlan, PREFETCH_LEAD_SECS, RAMP_MAX_SECS,
 };
 use crate::decode::{decode_file, AudioBuf};
 use crate::dsp::{
@@ -181,6 +181,8 @@ struct Deck {
     pos: usize,
     channels: usize,
     tail: Option<BentTail>,
+    /// Playback speed relative to the analysed audio; a remix resamples the buffer.
+    tempo: f32,
 }
 
 /// From `start` on the deck plays `samples`, its source rendered through `map`.
@@ -197,6 +199,7 @@ impl Deck {
             pos: 0,
             channels: buf.channels.max(1),
             tail: None,
+            tempo: 1.0,
         }
     }
 
@@ -271,6 +274,7 @@ pub struct BendJob {
     sample_rate: u32,
     index: usize,
     current_idx: usize,
+    next_tempo: f32,
     plan: TransitionPlan,
     bend: TailBend,
     mix_at: usize,
@@ -599,7 +603,14 @@ impl Mixer {
     }
 
     pub fn play_decoded(&mut self, index: usize, buf: AudioBuf) {
-        self.play_deck(index, Deck::from_buf(buf));
+        self.play_remixed(index, buf, 1.0);
+    }
+
+    /// `tempo` is the speed the remix resampled `buf` to.
+    pub fn play_remixed(&mut self, index: usize, buf: AudioBuf, tempo: f32) {
+        let mut deck = Deck::from_buf(buf);
+        deck.tempo = tempo;
+        self.play_deck(index, deck);
     }
 
     fn play_deck(&mut self, index: usize, mut deck: Deck) {
@@ -631,6 +642,12 @@ impl Mixer {
         )
     }
 
+    /// The current track's analysis in its deck's time.
+    fn deck_view(&self) -> Option<TrackAnalysis> {
+        let tempo = self.current.as_ref().map_or(1.0, |d| d.tempo);
+        self.analysis_at_current().map(|a| at_tempo(a, tempo))
+    }
+
     /// Hands the outgoing deck to a worker when AutoMix wants to bend its tail into `next`.
     /// `next` is passed in because the worker has it before the mixer does.
     pub fn bend_job(&self, index: usize, next: &TrackAnalysis, skip: bool) -> Option<BendJob> {
@@ -639,11 +656,13 @@ impl Mixer {
         }
         let current_idx = self.current_idx?;
         let deck = self.current.as_ref()?;
-        let current = self.analysis_at(current_idx);
-        let plan = plan_pair(current, Some(next), index, self.mix, false);
+        let current = self.deck_view();
+        let next_tempo = self.remix.rate();
+        let next = at_tempo(next, next_tempo);
+        let plan = plan_pair(current.as_ref(), Some(&next), index, self.mix, false);
         let pos = deck.source_pos();
         let cued = cue(
-            current,
+            current.as_ref(),
             &plan,
             pos,
             deck.source_frames(),
@@ -656,6 +675,7 @@ impl Mixer {
             sample_rate: self.sample_rate,
             index,
             current_idx,
+            next_tempo,
             plan,
             bend: cued.bend?,
             mix_at: cued.mix_at,
@@ -671,28 +691,31 @@ impl Mixer {
     }
 
     pub fn start_transition(&mut self, index: usize, buf: AudioBuf, skip: bool) {
-        self.start_prepared_transition(index, buf, skip, None);
+        self.start_prepared_transition(index, buf, 1.0, skip, None);
     }
 
-    /// `prepared` is a tail the worker rendered; it is used only if it still fits the deck.
+    /// `tempo` is the speed the remix resampled `buf` to. `prepared` is a tail the worker
+    /// rendered; it is used only if it still fits the deck.
     pub fn start_prepared_transition(
         &mut self,
         index: usize,
         buf: AudioBuf,
+        tempo: f32,
         skip: bool,
         prepared: Option<PreparedBend>,
     ) {
         self.drop_armed();
-        let plan = self.plan_transition(index, skip);
+        let mut incoming = Deck::from_buf(buf);
+        incoming.tempo = tempo;
         if !self.mix.uses_fade() || self.current.as_ref().is_none_or(|d| d.remaining() < 2) {
-            self.play_decoded(index, buf);
+            self.play_deck(index, incoming);
             return;
         }
-        let incoming = Deck::from_buf(buf);
         if self.mix == MixMode::AutoMix {
-            self.start_automix(index, incoming, skip, plan, prepared);
+            self.start_automix(index, incoming, skip, prepared);
             return;
         }
+        let plan = self.plan_transition(index, skip);
         let remain = self
             .current
             .as_ref()
@@ -713,7 +736,6 @@ impl Mixer {
         index: usize,
         mut incoming: Deck,
         skip: bool,
-        plan: TransitionPlan,
         prepared: Option<PreparedBend>,
     ) {
         let sr = self.sample_rate;
@@ -721,10 +743,14 @@ impl Mixer {
             return;
         };
         let (pos, frames) = (deck.pos, deck.source_frames());
-        let current = self.analysis_at_current();
+        // Analysis times are in the original audio; remixed decks run at their own tempo.
+        let current = self.deck_view();
+        let next = self.analysis_at(index).map(|a| at_tempo(a, incoming.tempo));
+        let plan = plan_pair(current.as_ref(), next.as_ref(), index, self.mix, false);
         let fits = |p: &PreparedBend| {
             Some(p.job.current_idx) == self.current_idx
                 && p.job.index == index
+                && p.job.next_tempo == incoming.tempo
                 && p.job.plan == plan
                 && pos <= p.job.bend.start
                 && Arc::ptr_eq(&p.job.samples, &deck.samples)
@@ -740,12 +766,20 @@ impl Mixer {
             None => {
                 // Without a rendered tail the outgoing deck keeps its own tempo.
                 let plan = TransitionPlan { speed: 1.0, ..plan };
-                (cue(current, &plan, pos, frames, sr, skip), plan, None)
+                let cued = cue(current.as_ref(), &plan, pos, frames, sr, skip);
+                (cued, plan, None)
             }
         };
-        let next = self.analysis_at(index);
         let next_frames = incoming.source_frames();
-        let placed = place(&cued, current, next, &plan, frames, next_frames, sr);
+        let placed = place(
+            &cued,
+            current.as_ref(),
+            next.as_ref(),
+            &plan,
+            frames,
+            next_frames,
+            sr,
+        );
         if placed.fade < 2 {
             self.play_deck(index, incoming);
             return;
@@ -814,9 +848,10 @@ impl Mixer {
             return deck.remaining() < (self.sample_rate as usize / 2).max(1);
         }
         if self.mix == MixMode::AutoMix {
-            if let Some(mix_out) = self.analysis_at_current().map(|a| a.mix_out) {
+            if let Some(current) = self.deck_view() {
+                let mix_out = current.mix_out;
                 let pos_secs = deck.pos as f32 / self.sample_rate.max(1) as f32;
-                let fade = fade_secs_for(self.mix, self.analysis_at_current(), false);
+                let fade = fade_secs_for(self.mix, Some(&current), false);
                 // The tail starts bending up to RAMP_MAX_SECS before the overlap.
                 return pos_secs + fade + RAMP_MAX_SECS + PREFETCH_LEAD_SECS >= mix_out;
             }
@@ -1686,7 +1721,7 @@ mod tests {
         mixer.set_analysis(1, b.clone());
         let job = mixer.bend_job(1, &b, false).expect("128 → 120 locks");
         let next = tone(48_000 * 20);
-        mixer.start_prepared_transition(1, next.clone(), false, Some(job.render()));
+        mixer.start_prepared_transition(1, next.clone(), 1.0, false, Some(job.render()));
         assert!(mixer.armed.is_some());
         assert!(mixer.current.as_ref().unwrap().tail.is_some());
         (mixer, next)
@@ -1758,6 +1793,31 @@ mod tests {
     }
 
     #[test]
+    fn remixed_decks_are_cued_in_their_own_time() {
+        let tempo = RemixMode::Nightcore.rate();
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.mix = MixMode::AutoMix;
+        mixer.play_remixed(0, const_deck(48_000 * 18, 0.5), tempo);
+        mixer.set_analysis(0, analysis_at(0.0, 16.0, 20.0));
+        mixer.set_analysis(1, analysis_at(4.0, 16.0, 20.0));
+        mixer.set_playhead(48_000 * 7);
+        mixer.start_prepared_transition(1, const_deck(48_000 * 18, 0.2), tempo, false, None);
+        let armed = mixer.armed.as_ref().expect("armed");
+        let bar = 2.0;
+        let start_bars = armed.start_at as f64 * tempo as f64 / 48_000.0 / bar;
+        assert!(
+            (start_bars - start_bars.round()).abs() < 1e-3,
+            "overlap starts {start_bars} bars into the source, off the grid"
+        );
+        let mix_in = armed.deck.pos as f64 * tempo as f64 / 48_000.0;
+        assert!(
+            (mix_in - 4.0).abs() < 1e-3,
+            "next starts at {mix_in}s, not mix_in"
+        );
+    }
+
+    #[test]
     fn stale_bend_falls_back_to_an_unbent_mix() {
         let mut mixer = Mixer::new(48_000, 2);
         mixer.set_tracks(two_tracks());
@@ -1771,7 +1831,7 @@ mod tests {
         let job = mixer.bend_job(1, &b, false).unwrap();
         let prepared = job.render();
         mixer.set_playhead(prepared.job.bend.start + 1);
-        mixer.start_prepared_transition(1, tone(48_000 * 20), false, Some(prepared));
+        mixer.start_prepared_transition(1, tone(48_000 * 20), 1.0, false, Some(prepared));
         let armed = mixer.armed.as_ref().expect("still mixes");
         assert_eq!(armed.plan.speed, 1.0);
         assert!(mixer.current.as_ref().unwrap().tail.is_none());

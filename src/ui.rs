@@ -1087,6 +1087,7 @@ impl App {
         let fade = job.transition && mixer.mix().uses_fade();
         drop(mixer);
         let buf = apply_remix(job.buf, remix);
+        let tempo = remix.rate();
         if let Some(track) = self.tracks.get_mut(index) {
             track.title = meta.title.clone();
         }
@@ -1100,9 +1101,9 @@ impl App {
         self.mark_meta_changed();
         let mut mixer = self.player.mixer.lock().expect("mixer");
         if fade {
-            mixer.start_prepared_transition(index, buf, job.skip, job.bend);
+            mixer.start_prepared_transition(index, buf, tempo, job.skip, job.bend);
         } else {
-            mixer.play_decoded(index, buf);
+            mixer.play_remixed(index, buf, tempo);
         }
         if let Some(secs) = self.pending_seek.take() {
             let snap = mixer.snapshot(index);

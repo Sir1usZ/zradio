@@ -79,6 +79,22 @@ pub fn beat_seconds(bpm: f32) -> f32 {
     }
 }
 
+/// The analysis of a track heard at `tempo` times its speed, as a remix plays it: the same
+/// beats and phrase points, in the resampled buffer's time.
+pub fn at_tempo(a: &TrackAnalysis, tempo: f32) -> TrackAnalysis {
+    if tempo == 1.0 || tempo <= 0.0 {
+        return a.clone();
+    }
+    TrackAnalysis {
+        bpm: a.bpm.map(|bpm| bpm * tempo),
+        mix_in: a.mix_in / tempo,
+        mix_out: a.mix_out / tempo,
+        first_beat: a.first_beat / tempo,
+        duration: a.duration / tempo,
+        ..a.clone()
+    }
+}
+
 pub fn bpm_compatible(a: f32, b: f32) -> bool {
     if a <= 1.0 || b <= 1.0 {
         return false;
