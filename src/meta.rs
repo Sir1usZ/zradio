@@ -155,8 +155,10 @@ pub fn load_meta(path: &Path, fallback_title: &str) -> TrackMeta {
     if meta.cover_path.is_none() {
         if let Some(cover) = sidecar_cover(path) {
             if let Ok(bytes) = fs::read(&cover) {
-                meta.cover = crate::cover::CoverArt::from_bytes(&bytes);
-                meta.cover_path = Some(cover);
+                if sniff_image(&bytes).is_some() {
+                    meta.cover = crate::cover::CoverArt::from_bytes(&bytes);
+                    meta.cover_path = Some(cover);
+                }
             }
         }
     }
@@ -765,6 +767,26 @@ mod tests {
         assert_eq!(meta.cover_path.as_deref(), Some(cover.as_path()));
         assert!(meta.cover.is_some());
         assert!(!dir.join("cover").join("cover").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_image_sidecar_does_not_block_cover_fetch() {
+        let dir = std::env::temp_dir().join(format!("zradio-badside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("cover")).unwrap();
+        let song = dir.join("song.wav");
+        write_silent_wav(&song);
+        fs::write(
+            dir.join("cover").join("song.jpg"),
+            b"<html>403 Forbidden</html>",
+        )
+        .unwrap();
+
+        let meta = load_meta(&song, "song");
+
+        assert!(meta.cover_path.is_none());
+        assert!(meta.cover.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
