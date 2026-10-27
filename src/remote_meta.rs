@@ -693,7 +693,7 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
 
 fn curl_bytes(url: &str) -> Option<Vec<u8>> {
     let out = Command::new("curl")
-        .args(["-sS", "--max-time", "8", "-A", "zradio/0.1", "-L", url])
+        .args(["-sSf", "--max-time", "8", "-A", "zradio/0.1", "-L", url])
         .output()
         .ok()?;
     if !out.status.success() || out.stdout.is_empty() {

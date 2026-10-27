@@ -361,6 +361,7 @@ fn sidecar_cover(path: &Path) -> Option<PathBuf> {
 }
 
 pub fn cache_cover(src: &Path, data: &[u8]) -> Option<(PathBuf, Option<crate::cover::CoverArt>)> {
+    sniff_image(data)?;
     store_cover(src, data, None)
 }
 
@@ -390,14 +391,20 @@ fn cover_extension(data: &[u8], mime: Option<&str>) -> &'static str {
         Some("image/jpeg" | "image/jpg") => return "jpg",
         _ => {}
     }
+    sniff_image(data).unwrap_or("jpg")
+}
+
+fn sniff_image(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"\x89PNG\r\n\x1a\n") {
-        "png"
+        Some("png")
     } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
-        "gif"
+        Some("gif")
     } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
-        "webp"
+        Some("webp")
+    } else if data.starts_with(b"\xff\xd8\xff") {
+        Some("jpg")
     } else {
-        "jpg"
+        None
     }
 }
 
@@ -758,6 +765,18 @@ mod tests {
         assert_eq!(meta.cover_path.as_deref(), Some(cover.as_path()));
         assert!(meta.cover.is_some());
         assert!(!dir.join("cover").join("cover").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetched_error_page_is_not_cached_as_cover() {
+        let dir = std::env::temp_dir().join(format!("zradio-badcover-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let song = dir.join("song.wav");
+
+        assert!(cache_cover(&song, b"<html><body>404 Not Found</body></html>").is_none());
+        assert!(!dir.join("cover").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
