@@ -38,13 +38,52 @@ fn finish_reader_metadata(
     Some(collect_reader_metadata(readers, meta_rx))
 }
 
+const MEDIA_HOSTS: [&str; 4] = ["youtube.com", "youtu.be", "bilibili.com", "b23.tv"];
+
 pub fn looks_like_media_url(raw: &str) -> bool {
+    url_host(raw).is_some_and(|host| {
+        MEDIA_HOSTS.iter().any(|known| {
+            host == *known
+                || host
+                    .strip_suffix(known)
+                    .is_some_and(|sub| sub.ends_with('.'))
+        })
+    })
+}
+
+pub fn find_media_url(text: &str) -> Option<&str> {
+    text.split_whitespace()
+        .find(|token| looks_like_media_url(token))
+}
+
+fn url_host(raw: &str) -> Option<String> {
     let s = raw.trim();
-    s.contains("youtube.com/")
-        || s.contains("youtu.be/")
-        || s.contains("bilibili.com/")
-        || s.contains("b23.tv/")
-        || s.contains("music.youtube.com/")
+    let rest = match s.split_once("://") {
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http") =>
+        {
+            rest
+        }
+        Some(_) => return None,
+        None => s,
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    if !tail.starts_with('/') || tail.len() < 2 || tail.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let host = match authority.split_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return None,
+        None => authority,
+    };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
 }
 
 pub fn library_dir() -> PathBuf {
@@ -133,7 +172,7 @@ pub fn download_audio(
             let _ = tx.send(format!("cookies {browser}"));
         }
     }
-    cmd.arg(&url);
+    cmd.arg("--").arg(&url);
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let (meta_tx, meta_rx) = std::sync::mpsc::channel::<DownloadMeta>();
     let mut readers = Vec::with_capacity(2);
@@ -227,10 +266,17 @@ fn scan_output(
 
 pub fn clean_media_url(url: &str) -> String {
     let url = url.trim();
-    if let Some(id) = youtube_id(url) {
+    let youtube = url_host(url).is_some_and(|host| {
+        host == "youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com")
+    });
+    if let Some(id) = youtube.then(|| youtube_id(url)).flatten() {
         return format!("https://www.youtube.com/watch?v={id}");
     }
-    url.to_string()
+    if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{url}")
+    }
 }
 
 fn youtube_id(url: &str) -> Option<String> {
@@ -328,6 +374,47 @@ mod tests {
         ));
         assert!(looks_like_media_url("https://b23.tv/abcdef"));
         assert!(!looks_like_media_url("https://example.com/song"));
+    }
+
+    #[test]
+    fn media_url_checks_the_real_host() {
+        assert!(looks_like_media_url("www.youtube.com/watch?v=tRsQsTMvPNg"));
+        assert!(looks_like_media_url(
+            "https://m.youtube.com/watch?v=tRsQsTMvPNg"
+        ));
+        assert!(looks_like_media_url(
+            "HTTPS://music.youtube.com/watch?v=tRsQsTMvPNg"
+        ));
+        assert!(!looks_like_media_url(
+            "https://evil.example/youtube.com/watch?v=x"
+        ));
+        assert!(!looks_like_media_url(
+            "https://youtube.com.evil.example/watch?v=x"
+        ));
+        assert!(!looks_like_media_url("https://evil.example#@youtube.com/x"));
+        assert!(!looks_like_media_url("https://notyoutube.com/watch?v=x"));
+        assert!(!looks_like_media_url("file:///home/me/youtube.com/a.mp3"));
+        assert!(!looks_like_media_url("--exec=sh youtube.com/x"));
+    }
+
+    #[test]
+    fn share_text_yields_its_media_link() {
+        assert_eq!(
+            find_media_url("【标题-哔哩哔哩】 https://b23.tv/AbCdEf"),
+            Some("https://b23.tv/AbCdEf")
+        );
+        assert_eq!(find_media_url("see https://example.com/x"), None);
+    }
+
+    #[test]
+    fn schemeless_media_url_gets_https() {
+        assert_eq!(clean_media_url("b23.tv/abcdef"), "https://b23.tv/abcdef");
+        assert_eq!(
+            clean_media_url("youtu.be/tRsQsTMvPNg"),
+            "https://www.youtube.com/watch?v=tRsQsTMvPNg"
+        );
+        let bili = "https://www.bilibili.com/video/BV1xx411c7mD?lv=12345678";
+        assert_eq!(clean_media_url(bili), bili);
     }
 
     #[test]

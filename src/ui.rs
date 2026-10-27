@@ -35,7 +35,7 @@ use crate::drawer::{
 use crate::dsp::MixMode;
 use crate::engine::{load_track, Player, Snapshot};
 use crate::eq::Equalizer;
-use crate::fetch::{self, looks_like_media_url};
+use crate::fetch::{self, find_media_url};
 use crate::greeting::{
     greeting_line, greeting_origin, greeting_overlay, local_hour, music_split, overlay_escape,
     system_name, GreetingAnim, GREET_SCALE,
@@ -2082,8 +2082,8 @@ impl App {
             buf.push_str(text);
             return;
         }
-        if looks_like_media_url(text) {
-            self.command = Some(text.to_string());
+        if let Some(url) = find_media_url(text) {
+            self.command = Some(url.to_string());
             self.status = "enter to import pasted url".into();
         }
     }
@@ -2093,8 +2093,8 @@ impl App {
         if raw.is_empty() {
             return;
         }
-        if looks_like_media_url(raw) {
-            self.start_import(raw);
+        if let Some(url) = find_media_url(raw) {
+            self.start_import(url);
             return;
         }
         if let Some(rest) = raw.strip_prefix("search ") {

@@ -701,6 +701,9 @@ fn handle_import(body: &str, tx: &Sender<ControlCmd>) -> serde_json::Value {
         Ok(r) => r,
         Err(e) => return err(format!("bad json: {e}")),
     };
+    if !crate::fetch::looks_like_media_url(&req.url) {
+        return err("need a youtube or bilibili url");
+    }
     if let Err(response) = enqueue_control(tx, ControlCmd::Import(req.url.clone())) {
         return response;
     }
@@ -948,13 +951,25 @@ mod tests {
     }
 
     #[test]
+    fn import_rejects_non_media_urls_before_queueing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let resp = handle_import(r#"{"url":"https://evil.example/youtube.com/x"}"#, &tx);
+        assert_eq!(resp["ok"], false);
+        assert!(rx.try_recv().is_err());
+
+        let resp = handle_import(r#"{"url":"https://youtu.be/tRsQsTMvPNg"}"#, &tx);
+        assert_eq!(resp["ok"], true);
+        assert!(matches!(rx.try_recv(), Ok(ControlCmd::Import(_))));
+    }
+
+    #[test]
     fn disconnected_control_handlers_report_unavailable() {
         let (tx, rx) = std::sync::mpsc::channel();
         drop(rx);
         let state = new_shared_state();
         let responses = [
             handle_control(r#"{"action":"play"}"#, &tx, &state),
-            handle_import(r#"{"url":"https://example.com/song"}"#, &tx),
+            handle_import(r#"{"url":"https://youtu.be/tRsQsTMvPNg"}"#, &tx),
             handle_library_scan(&tx),
             handle_meta_scan(&tx),
             handle_eq(r#"{"band":2,"db":4.5}"#, &tx),
