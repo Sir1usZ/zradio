@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
@@ -138,41 +138,20 @@ pub fn download_audio(
     let (meta_tx, meta_rx) = std::sync::mpsc::channel::<DownloadMeta>();
     let mut readers = Vec::with_capacity(2);
     if let Some(stderr) = child.stderr.take() {
-        let progress = progress.clone();
-        let meta_tx = meta_tx.clone();
-        readers.push(std::thread::spawn(move || {
-            let mut last_path = None;
-            let mut last_err = None;
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                last_err = Some(line.clone());
-                if let Some(msg) = progress_line(&line) {
-                    if let Some(tx) = progress.as_ref() {
-                        let _ = tx.send(msg);
-                    }
-                } else if let Some(tx) = progress.as_ref() {
-                    if line.contains("ERROR") || line.contains("Sign in") || line.contains("cookie")
-                    {
-                        let _ = tx.send(short_err(&line));
-                    }
-                }
-                if let Some(path) = destination_line(&line) {
-                    last_path = Some(path);
-                }
-            }
-            let _ = meta_tx.send((last_path, last_err));
-        }));
+        readers.push(spawn_output_reader(
+            stderr,
+            progress.clone(),
+            meta_tx.clone(),
+            true,
+        ));
     }
     if let Some(stdout) = child.stdout.take() {
-        let meta_tx = meta_tx.clone();
-        readers.push(std::thread::spawn(move || {
-            let mut last_path = None;
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if looks_like_path(&line) {
-                    last_path = Some(line.trim().to_string());
-                }
-            }
-            let _ = meta_tx.send((last_path, None));
-        }));
+        readers.push(spawn_output_reader(
+            stdout,
+            progress.clone(),
+            meta_tx.clone(),
+            false,
+        ));
     }
     drop(meta_tx);
     let started = std::time::Instant::now();
@@ -198,6 +177,52 @@ pub fn download_audio(
         anyhow::bail!("downloaded, but no file path returned");
     }
     Ok(last_path)
+}
+
+fn spawn_output_reader<R: Read + Send + 'static>(
+    stream: R,
+    progress: Option<Sender<String>>,
+    meta_tx: Sender<DownloadMeta>,
+    keep_err: bool,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let lines = BufReader::new(stream)
+            .split(b'\n')
+            .map_while(Result::ok)
+            .map(|line| String::from_utf8_lossy(&line).into_owned());
+        let _ = meta_tx.send(scan_output(lines, progress.as_ref(), keep_err));
+    })
+}
+
+fn scan_output(
+    lines: impl Iterator<Item = String>,
+    progress: Option<&Sender<String>>,
+    keep_err: bool,
+) -> DownloadMeta {
+    let mut last_path = None;
+    let mut last_err = None;
+    for line in lines {
+        if let Some(msg) = progress_line(&line) {
+            if let Some(tx) = progress {
+                let _ = tx.send(msg);
+            }
+        } else if keep_err
+            && (line.contains("ERROR") || line.contains("Sign in") || line.contains("cookie"))
+        {
+            if let Some(tx) = progress {
+                let _ = tx.send(short_err(&line));
+            }
+        }
+        if let Some(path) = destination_line(&line) {
+            last_path = Some(path);
+        } else if looks_like_path(&line) {
+            last_path = Some(line.trim().to_string());
+        }
+        if keep_err {
+            last_err = Some(line);
+        }
+    }
+    (last_path, last_err)
 }
 
 pub fn clean_media_url(url: &str) -> String {
@@ -326,6 +351,56 @@ mod tests {
             Some("/home/xender/音乐/song.mp3")
         );
         assert!((parse_percent("12.3% of 4.10MiB").unwrap() - 0.123).abs() < 0.001);
+    }
+
+    fn lines(text: &str) -> impl Iterator<Item = String> + '_ {
+        text.lines().map(str::to_string)
+    }
+
+    #[test]
+    fn ytdlp_stdout_reports_progress_and_final_path() {
+        let stdout = "\
+[generic] Extracting URL: https://example.test/song
+[info] song: Downloading 1 format(s): webm
+[download] Destination: /music/song.webm
+[download]  43.4% of   16.14KiB at  Unknown B/s ETA Unknown
+[download] 100% of   16.14KiB in 00:00:00 at 9.14MiB/s
+[ExtractAudio] Destination: /music/song.mp3
+Deleting original file /music/song.webm (pass -k to keep)
+";
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (path, err) = scan_output(lines(stdout), Some(&tx), false);
+        assert_eq!(path.as_deref(), Some("/music/song.mp3"));
+        assert_eq!(err, None);
+        let sent: Vec<String> = rx.try_iter().collect();
+        assert!(sent.iter().any(|m| m.starts_with("43.4%")));
+        assert!(sent.iter().any(|m| m == "extract audio"));
+    }
+
+    #[test]
+    fn ytdlp_stdout_reuses_already_downloaded_file() {
+        let stdout = "\
+[download] /music/song.mp3 has already been downloaded
+[ExtractAudio] Not converting audio /music/song.mp3; file is already in target format mp3
+";
+        let (path, _) = scan_output(lines(stdout), None, false);
+        assert_eq!(path.as_deref(), Some("/music/song.mp3"));
+    }
+
+    #[test]
+    fn ytdlp_stderr_keeps_last_error_line() {
+        let stderr = "WARNING: [youtube] slow\nERROR: [youtube] abc: Sign in to confirm\n";
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (path, err) = scan_output(lines(stderr), Some(&tx), true);
+        assert_eq!(path, None);
+        assert_eq!(
+            err.as_deref(),
+            Some("ERROR: [youtube] abc: Sign in to confirm")
+        );
+        assert_eq!(
+            rx.try_iter().last().as_deref(),
+            Some("[youtube] abc: Sign in to confirm")
+        );
     }
 
     #[test]
