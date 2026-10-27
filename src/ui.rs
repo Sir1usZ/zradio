@@ -1337,29 +1337,30 @@ impl App {
         if self.inflight.is_some() {
             return;
         }
-        let (need, index, mix) = {
-            let mixer = self.player.mixer.lock().expect("mixer");
-            (mixer.should_prefetch(), mixer.next_index(), mixer.mix())
+        let (advance, prefetch) = {
+            let mut mixer = self.player.mixer.lock().expect("mixer");
+            let advance = mixer.take_auto_advance();
+            let prefetch =
+                if advance.is_none() && mixer.mix().uses_fade() && mixer.should_prefetch() {
+                    mixer.next_index()
+                } else {
+                    None
+                };
+            (advance, prefetch)
         };
-        if !need {
+        if let Some(index) = advance {
+            self.note_leave(false);
+            self.sync_list_cursor(index);
+            self.spawn_decode(index, false, false);
             return;
         }
-        let Some(index) = index else {
+        let Some(index) = prefetch else {
             return;
         };
         if self.prefetch_attempt == Some(index) {
             return;
         }
         self.prefetch_attempt = Some(index);
-        if !mix.uses_fade() {
-            let finished = self.player.mixer.lock().expect("mixer").take_finished();
-            if finished {
-                self.note_leave(false);
-                self.sync_list_cursor(index);
-                self.spawn_decode(index, false, false);
-            }
-            return;
-        }
         self.note_leave(false);
         self.spawn_decode(index, true, false);
     }

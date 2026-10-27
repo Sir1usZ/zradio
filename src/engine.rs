@@ -767,10 +767,14 @@ impl Mixer {
         Some(self.step_in_pool(&pool, -1))
     }
 
-    pub fn take_finished(&mut self) -> bool {
-        let done = self.done;
-        self.done = false;
-        done
+    pub fn take_auto_advance(&mut self) -> Option<usize> {
+        if !std::mem::take(&mut self.done) {
+            return None;
+        }
+        if self.loop_mode == LoopMode::One || self.tracks.len() < 2 {
+            return None;
+        }
+        self.next_index()
     }
 
     pub fn snapshot(&self, selected: usize) -> Snapshot {
@@ -1252,6 +1256,50 @@ mod tests {
         mixer.start_transition(1, const_deck(200, 0.1), true);
         assert_eq!(mixer.current_idx, Some(1));
         assert!(!mixer.fading());
+    }
+
+    #[test]
+    fn cut_end_hands_next_track_to_ui_once() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.mix = MixMode::Cut;
+        mixer.play_decoded(0, const_deck(64, 0.5));
+        assert_eq!(mixer.take_auto_advance(), None);
+        let mut out = vec![0.0; 256];
+        mixer.fill(&mut out);
+        assert!(!mixer.should_prefetch());
+        assert_eq!(mixer.take_auto_advance(), Some(1));
+        assert_eq!(mixer.take_auto_advance(), None);
+    }
+
+    #[test]
+    fn fade_mode_still_advances_when_prefetch_never_landed() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.mix = MixMode::Crossfade;
+        mixer.play_decoded(0, const_deck(64, 0.5));
+        let mut out = vec![0.0; 256];
+        mixer.fill(&mut out);
+        assert_eq!(mixer.take_auto_advance(), Some(1));
+    }
+
+    #[test]
+    fn auto_advance_respects_loop_one_and_single_track() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.mix = MixMode::Cut;
+        mixer.loop_mode = LoopMode::One;
+        mixer.play_decoded(0, const_deck(64, 0.5));
+        let mut out = vec![0.0; 256];
+        mixer.fill(&mut out);
+        assert_eq!(mixer.take_auto_advance(), None);
+
+        let mut single = Mixer::new(48_000, 2);
+        single.set_tracks(two_tracks()[..1].to_vec());
+        single.mix = MixMode::Cut;
+        single.play_decoded(0, const_deck(64, 0.5));
+        single.fill(&mut out);
+        assert_eq!(single.take_auto_advance(), None);
     }
 
     #[test]
