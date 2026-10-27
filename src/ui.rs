@@ -675,21 +675,10 @@ impl App {
         }
         match self.browse_kind {
             BrowseKind::All => self.sorted_idx.iter().copied().map(LibRow::Track).collect(),
-            BrowseKind::Tagged => {
-                let tagged = browse::tagged_indices(&self.metas);
-                self.sorted_idx
-                    .iter()
-                    .copied()
-                    .filter(|i| tagged.contains(i))
-                    .map(LibRow::Track)
-                    .collect()
-            }
-            BrowseKind::Untagged => {
-                let untagged = browse::untagged_indices(&self.metas);
-                self.sorted_idx
-                    .iter()
-                    .copied()
-                    .filter(|i| untagged.contains(i))
+            BrowseKind::Tagged | BrowseKind::Untagged => {
+                let tagged = self.browse_kind == BrowseKind::Tagged;
+                browse::filter_tagged(&self.sorted_idx, &self.metas, tagged)
+                    .into_iter()
                     .map(LibRow::Track)
                     .collect()
             }
