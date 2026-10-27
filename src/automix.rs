@@ -323,13 +323,10 @@ pub fn place(
         }
         None => (cue.mix_at, frames.saturating_sub(cue.mix_at)),
     };
+    // Signed, so a cue rounded to the frame before a beat is not read as a whole beat late.
     let phase = current.and_then(beat_grid).map_or(0.0, |(first, beat)| {
-        let p = ((cue.mix_at as f64 / sr - first) / beat).rem_euclid(1.0);
-        if p > 1.0 - 1e-6 {
-            0.0
-        } else {
-            p
-        }
+        let beats = (cue.mix_at as f64 / sr - first) / beat;
+        beats - beats.round()
     });
     let next_beat = next
         .and_then(beat_grid)
@@ -337,8 +334,12 @@ pub fn place(
         .or(current.and_then(beat_grid))
         .map_or(0.0, |(_, beat)| beat);
     let mix_in = plan.next_mix_in.map_or(0.0, |s| s.max(0.0) as f64);
-    let incoming_pos =
-        (((mix_in + phase * next_beat) * sr).round() as usize).min(next_frames.saturating_sub(1));
+    let mut offset = mix_in + phase * next_beat;
+    if offset < -1.0 / sr {
+        // Too close to the start to go back: come in on the same phase a beat later.
+        offset += next_beat;
+    }
+    let incoming_pos = ((offset.max(0.0) * sr).round() as usize).min(next_frames.saturating_sub(1));
     let fade = fade_frames(sample_rate, frames.min(next_frames), plan.fade_secs)
         .min(out_left)
         .min(next_frames.saturating_sub(incoming_pos));
@@ -598,6 +599,29 @@ mod tests {
     }
 
     #[test]
+    fn a_cue_rounded_to_the_frame_before_a_bar_still_meets_the_downbeat() {
+        let a = analysis(126.0, key8(), 0.2);
+        let mut b = analysis(126.0, key8(), 0.2);
+        b.mix_in = 4.0;
+        let plan = plan_pair(Some(&a), Some(&b), 1, MixMode::AutoMix, false);
+        let sr = 48_000;
+        let frames = 200 * sr as usize;
+        let c = cue(Some(&a), &plan, 150 * sr as usize, frames, sr, false);
+        // Bar 90 of a 126 BPM grid is at frame 8_228_571.43; the cue rounds just below it.
+        assert_eq!(c.mix_at, 8_228_571);
+        let p = place(&c, Some(&a), Some(&b), &plan, frames, frames, sr);
+        assert_eq!(p.incoming_pos, 4 * sr as usize, "a beat late");
+
+        b.mix_in = 0.0;
+        let plan = plan_pair(Some(&a), Some(&b), 1, MixMode::AutoMix, false);
+        let p = place(&c, Some(&a), Some(&b), &plan, frames, frames, sr);
+        assert_eq!(
+            p.incoming_pos, 0,
+            "nothing before the first beat to go back to"
+        );
+    }
+
+    #[test]
     fn skip_bend_glides_over_one_beat_to_the_next_beat_line() {
         let a = analysis(128.0, key8(), 0.2);
         let b = analysis(124.0, key8(), 0.2);
@@ -657,7 +681,7 @@ mod tests {
         let plan = plan_pair(Some(&a), Some(&b), 1, MixMode::AutoMix, false);
         let sr = 48_000;
         let frames = 20 * sr as usize;
-        let pos = sr as usize * 5 / 4;
+        let pos = sr as usize * 9 / 8;
         let c = cue(Some(&a), &plan, pos, frames, sr, true);
         assert_eq!(
             c,
@@ -670,8 +694,16 @@ mod tests {
         assert_eq!(p.start_at, pos);
         assert_eq!(
             p.incoming_pos,
-            sr as usize * 17 / 4,
-            "half a beat past mix_in"
+            sr as usize * 33 / 8,
+            "a quarter beat past mix_in"
         );
+
+        // A quarter beat before a beat, with nothing before mix_in: same phase, a beat later.
+        b.mix_in = 0.0;
+        let plan = plan_pair(Some(&a), Some(&b), 1, MixMode::AutoMix, false);
+        let pos = sr as usize * 11 / 8;
+        let c = cue(Some(&a), &plan, pos, frames, sr, true);
+        let p = place(&c, Some(&a), Some(&b), &plan, frames, frames, sr);
+        assert_eq!(p.incoming_pos, sr as usize * 3 / 8);
     }
 }
