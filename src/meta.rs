@@ -662,12 +662,15 @@ mod tests {
             },
         );
         assert!(changed);
-        assert!(!sort_key_changed(&slot, &TrackMeta {
-            artist: "Avicii".into(),
-            album: "True".into(),
-            title: "Levels".into(),
-            ..TrackMeta::default()
-        }));
+        assert!(!sort_key_changed(
+            &slot,
+            &TrackMeta {
+                artist: "Avicii".into(),
+                album: "True".into(),
+                title: "Levels".into(),
+                ..TrackMeta::default()
+            }
+        ));
         let mut empty_album = Some(TrackMeta {
             artist: "Avicii".into(),
             title: "Levels".into(),
@@ -683,11 +686,14 @@ mod tests {
             },
         );
         assert!(changed);
-        assert!(sort_key_changed(&empty_album, &TrackMeta {
-            artist: "Avicii".into(),
-            title: "Levels".into(),
-            ..TrackMeta::default()
-        }));
+        assert!(sort_key_changed(
+            &empty_album,
+            &TrackMeta {
+                artist: "Avicii".into(),
+                title: "Levels".into(),
+                ..TrackMeta::default()
+            }
+        ));
     }
 
     #[test]

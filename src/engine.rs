@@ -56,7 +56,10 @@ impl RebuildGate {
     }
 
     fn allow(&mut self, now: Instant, gap: Duration) -> bool {
-        if self.last.is_some_and(|last| now.saturating_duration_since(last) < gap) {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < gap)
+        {
             return false;
         }
         self.last = Some(now);
@@ -1089,7 +1092,13 @@ impl Player {
         let config: StreamConfig = supported.into();
         let mixer = Arc::new(Mutex::new(Mixer::new(sample_rate, channels)));
         let health = Arc::new(StreamHealth::new());
-        let stream = open_stream(&device, &config, sample_format, Arc::clone(&mixer), Arc::clone(&health))?;
+        let stream = open_stream(
+            &device,
+            &config,
+            sample_format,
+            Arc::clone(&mixer),
+            Arc::clone(&health),
+        )?;
         stream.play()?;
         Ok(Self {
             mixer,

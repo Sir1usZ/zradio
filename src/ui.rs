@@ -4197,7 +4197,10 @@ mod tests {
 
     #[test]
     fn tick_work_skips_spectrum_when_visualizer_is_off() {
-        assert!(!needs_spectrum_refresh(crate::prefs::VisualizeMode::Off, false));
+        assert!(!needs_spectrum_refresh(
+            crate::prefs::VisualizeMode::Off,
+            false
+        ));
         assert!(needs_spectrum_refresh(
             crate::prefs::VisualizeMode::Bars,
             false

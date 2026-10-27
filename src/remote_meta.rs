@@ -830,18 +830,12 @@ mod tests {
 
     #[test]
     fn cjk_queries_ask_cn_sources_before_itunes() {
-        assert_eq!(
-            tag_source_order("晴天", "周杰伦"),
-            TagSourceOrder::CnFirst
-        );
+        assert_eq!(tag_source_order("晴天", "周杰伦"), TagSourceOrder::CnFirst);
         assert_eq!(
             tag_source_order("Levels", "Avicii"),
             TagSourceOrder::ItunesFirst
         );
-        assert_eq!(
-            tag_source_order("海阔天空", ""),
-            TagSourceOrder::CnFirst
-        );
+        assert_eq!(tag_source_order("海阔天空", ""), TagSourceOrder::CnFirst);
     }
 
     #[test]
