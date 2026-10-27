@@ -174,7 +174,7 @@ struct ArmedMix {
 }
 
 struct Deck {
-    samples: Vec<f32>,
+    samples: Arc<Vec<f32>>,
     pos: usize,
     channels: usize,
 }
@@ -182,7 +182,7 @@ struct Deck {
 impl Deck {
     fn from_buf(buf: AudioBuf) -> Self {
         Self {
-            samples: buf.samples,
+            samples: Arc::new(buf.samples),
             pos: 0,
             channels: buf.channels.max(1),
         }
@@ -524,6 +524,11 @@ impl Mixer {
     }
 
     pub fn play_decoded(&mut self, index: usize, buf: AudioBuf) {
+        self.play_deck(index, Deck::from_buf(buf));
+    }
+
+    fn play_deck(&mut self, index: usize, mut deck: Deck) {
+        deck.pos = 0;
         self.remember_played(index);
         self.current_idx = Some(index);
         self.incoming_idx = None;
@@ -534,7 +539,7 @@ impl Mixer {
         self.armed = None;
         self.current_lp = OnePole::default();
         self.incoming_lp = OnePole::default();
-        self.current = Some(Deck::from_buf(buf));
+        self.current = Some(deck);
         self.paused = false;
         self.done = false;
         self.pcm.reset();
@@ -597,14 +602,7 @@ impl Mixer {
             .max(2);
         let fade = fade_frames(self.sample_rate, remain, fade_secs);
         if fade < 2 {
-            self.play_decoded(
-                index,
-                AudioBuf {
-                    samples: incoming.samples,
-                    sample_rate: self.sample_rate,
-                    channels: incoming.channels,
-                },
-            );
+            self.play_deck(index, incoming);
             return;
         }
         if self.mix == MixMode::AutoMix && !skip {
