@@ -13,8 +13,26 @@ use crate::engine::Snapshot;
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
+const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
+
 fn request_body_size_allowed(content_length: usize) -> bool {
     content_length <= MAX_REQUEST_BODY_BYTES
+}
+
+fn read_head_line<R: BufRead>(
+    reader: &mut R,
+    budget: &mut usize,
+) -> std::io::Result<Option<String>> {
+    let mut line = Vec::new();
+    let n = reader
+        .by_ref()
+        .take(*budget as u64 + 1)
+        .read_until(b'\n', &mut line)?;
+    if n > *budget {
+        return Ok(None);
+    }
+    *budget -= n;
+    Ok(Some(String::from_utf8_lossy(&line).into_owned()))
 }
 
 fn request_read_timeout() -> Duration {
@@ -143,8 +161,10 @@ fn handle_connection(
     reader.set_read_timeout(Some(request_read_timeout()))?;
     let mut buf_reader = BufReader::new(reader);
 
-    let mut request_line = String::new();
-    buf_reader.read_line(&mut request_line)?;
+    let mut budget = MAX_REQUEST_HEAD_BYTES;
+    let Some(request_line) = read_head_line(&mut buf_reader, &mut budget)? else {
+        return send_json(&mut stream, 431, &err("request head too large"));
+    };
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         return send_json(&mut stream, 400, &err("bad request"));
@@ -155,8 +175,9 @@ fn handle_connection(
 
     let mut content_length: usize = 0;
     loop {
-        let mut line = String::new();
-        buf_reader.read_line(&mut line)?;
+        let Some(line) = read_head_line(&mut buf_reader, &mut budget)? else {
+            return send_json(&mut stream, 431, &err("request head too large"));
+        };
         let trimmed = line.trim().to_lowercase();
         if trimmed.is_empty() {
             break;
@@ -867,6 +888,7 @@ fn http_status_text(status: u16) -> &'static str {
         400 => "Bad Request",
         404 => "Not Found",
         413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
         _ => "Error",
     }
 }
@@ -929,6 +951,65 @@ mod tests {
         assert!(request_body_size_allowed(65_536));
         assert!(!request_body_size_allowed(65_537));
         assert_eq!(http_status_text(413), "Payload Too Large");
+    }
+
+    #[test]
+    fn request_head_reads_stop_at_the_byte_budget() {
+        let mut budget = MAX_REQUEST_HEAD_BYTES;
+        let mut endless = BufReader::new(std::io::repeat(b'a'));
+        assert!(read_head_line(&mut endless, &mut budget).unwrap().is_none());
+
+        let mut budget = MAX_REQUEST_HEAD_BYTES;
+        let mut flood = std::io::Cursor::new(b"X-Pad: 1\r\n".repeat(4000));
+        let mut lines = 0;
+        while read_head_line(&mut flood, &mut budget).unwrap().is_some() {
+            lines += 1;
+        }
+        assert!(lines < 4000, "header count must be bounded, read {lines}");
+
+        let mut budget = MAX_REQUEST_HEAD_BYTES;
+        let mut req = std::io::Cursor::new(b"GET /status HTTP/1.1\r\n\r\n".to_vec());
+        let line = read_head_line(&mut req, &mut budget).unwrap().unwrap();
+        assert_eq!(line, "GET /status HTTP/1.1\r\n");
+        assert_eq!(budget, MAX_REQUEST_HEAD_BYTES - line.len());
+        assert_eq!(http_status_text(431), "Request Header Fields Too Large");
+    }
+
+    #[test]
+    fn oversized_header_line_gets_431_instead_of_buffering() {
+        let mut req = b"GET /status HTTP/1.1\r\nX-Pad: ".to_vec();
+        req.resize(MAX_REQUEST_HEAD_BYTES + 1, b'a');
+        let resp = serve_once(&req);
+        assert!(resp.starts_with("HTTP/1.1 431 "), "got {resp:?}");
+
+        let body = r#"{"url":"https://youtu.be/tRsQsTMvPNg"}"#;
+        let req = format!(
+            "POST /import HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let resp = serve_once(req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 200 "), "got {resp:?}");
+        assert!(resp.contains(r#""ok":true"#), "got {resp:?}");
+    }
+
+    fn serve_once(req: &[u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = handle_connection(stream, &tx, &new_shared_state());
+            drop(rx);
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        client.write_all(req).unwrap();
+        let mut resp = String::new();
+        let _ = client.read_to_string(&mut resp);
+        server.join().unwrap();
+        resp
     }
 
     #[test]
