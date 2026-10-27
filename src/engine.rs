@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -318,10 +319,43 @@ impl Mixer {
     }
 
     pub fn set_tracks(&mut self, tracks: Vec<Track>) {
-        self.analyses = vec![None; tracks.len()];
-        self.taste_boosts = vec![0.0; tracks.len()];
+        let new_index: HashMap<&Path, usize> = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.path.as_path(), i))
+            .collect();
+        let remap = |old: usize| {
+            self.tracks
+                .get(old)
+                .and_then(|t| new_index.get(t.path.as_path()).copied())
+        };
+        let current_idx = self.current_idx.and_then(remap);
+        let incoming_idx = self.incoming_idx.and_then(remap);
+        let armed_idx = self.armed.as_ref().map(|a| remap(a.index));
+        let recent: Vec<usize> = self.recent.iter().filter_map(|&i| remap(i)).collect();
+        let mut analyses = vec![None; tracks.len()];
+        let mut taste_boosts = vec![0.0; tracks.len()];
+        for (old, track) in self.tracks.iter().enumerate() {
+            if let Some(&new) = new_index.get(track.path.as_path()) {
+                analyses[new] = self.analyses.get(old).cloned().flatten();
+                taste_boosts[new] = self.taste_boosts.get(old).copied().unwrap_or(0.0);
+            }
+        }
+        self.current_idx = current_idx;
+        self.incoming_idx = incoming_idx;
+        match armed_idx {
+            Some(Some(index)) => {
+                if let Some(armed) = self.armed.as_mut() {
+                    armed.index = index;
+                }
+            }
+            Some(None) => self.armed = None,
+            None => {}
+        }
+        self.recent = recent;
+        self.analyses = analyses;
+        self.taste_boosts = taste_boosts;
         self.tracks = tracks;
-        self.recent.clear();
         if self.tracks.is_empty() {
             self.status = "empty library".into();
         } else {
@@ -1300,6 +1334,37 @@ mod tests {
         single.play_decoded(0, const_deck(64, 0.5));
         single.fill(&mut out);
         assert_eq!(single.take_auto_advance(), None);
+    }
+
+    #[test]
+    fn rescan_keeps_playing_and_fading_tracks_by_path() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(four_tracks());
+        mixer.mix = MixMode::Crossfade;
+        mixer.set_analysis(1, analysis_at(1.0, 9.0, 10.0));
+        mixer.play_decoded(1, const_deck(48_000, 0.5));
+        mixer.start_transition(2, const_deck(48_000, 0.2), true);
+        assert!(mixer.fading());
+
+        let mut reordered = four_tracks();
+        reordered.reverse();
+        mixer.set_tracks(reordered);
+
+        assert_eq!(mixer.current_idx, Some(2));
+        assert_eq!(mixer.incoming_idx, Some(1));
+        assert_eq!(mixer.recent, vec![2]);
+        assert!(mixer.analysis_at(2).is_some());
+        assert!(mixer.analysis_at(1).is_none());
+    }
+
+    #[test]
+    fn rescan_forgets_a_playing_track_that_vanished() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(four_tracks());
+        mixer.play_decoded(3, const_deck(100, 0.5));
+        mixer.set_tracks(four_tracks()[..2].to_vec());
+        assert_eq!(mixer.current_idx, None);
+        assert!(mixer.recent.is_empty());
     }
 
     #[test]
