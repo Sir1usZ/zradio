@@ -7,6 +7,8 @@ use crate::stretch::TimeMap;
 const BEND_LEAD_SECS: f64 = 1.0;
 const SKIP_LEAD_SECS: f64 = 0.25;
 const RAMP_BARS: f64 = 4.0;
+/// Source audio a bent tail renders past the end of the overlap.
+const TAIL_PAD_SECS: f64 = 0.5;
 pub const RAMP_MAX_SECS: f32 = 8.0;
 /// How long before the bend AutoMix wants the next track decoded and analysed.
 pub const PREFETCH_LEAD_SECS: f32 = 6.0;
@@ -209,7 +211,7 @@ pub fn plan_pair(
 pub struct TailBend {
     pub start: usize,
     pub map: TimeMap,
-    /// Output frames from `start` to the end of the source.
+    /// Output frames from `start` through the overlap; the deck is gone after that.
     pub out_frames: usize,
 }
 
@@ -286,7 +288,8 @@ pub fn cue(
         if mix_s + overlap <= end_s {
             let (start, mix_at) = (at(start_s), at(mix_s));
             let map = TimeMap::new((mix_at - start) as f64, speed);
-            let out_frames = map.out_of((frames - start) as f64).ceil() as usize;
+            let end = at(mix_s + overlap + TAIL_PAD_SECS);
+            let out_frames = map.out_of((end - start) as f64).ceil() as usize;
             return Cue {
                 mix_at,
                 bend: Some(TailBend {
@@ -656,6 +659,32 @@ mod tests {
         assert!(wait > SKIP_LEAD_SECS + beat - 1e-9 && wait <= SKIP_LEAD_SECS + 2.0 * beat);
         assert!(bend.start >= pos);
         assert!((bend.map.ramp() / sr as f64 - beat).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_bent_tail_stops_just_past_the_overlap() {
+        let a = analysis(128.0, key8(), 0.2);
+        let b = analysis(124.0, key8(), 0.2);
+        let plan = plan_pair(Some(&a), Some(&b), 1, MixMode::AutoMix, false);
+        let sr = 48_000;
+        let frames = 200 * sr as usize;
+        // A skip 60 s into a 200 s track hears a beat of glide and the fade, not the rest.
+        for (pos, skip) in [(60, true), (150, false)] {
+            let c = cue(Some(&a), &plan, pos * sr as usize, frames, sr, skip);
+            let bend = c.bend.expect("bent");
+            let p = place(&c, Some(&a), Some(&b), &plan, frames, frames, sr);
+            assert_eq!(
+                p.fade,
+                fade_frames(sr, frames, plan.fade_secs),
+                "the whole fade still fits"
+            );
+            let end = bend.start + bend.out_frames;
+            assert!(
+                end <= p.start_at + p.fade + sr as usize,
+                "renders {} s past the overlap",
+                (end - p.start_at - p.fade) as f64 / sr as f64
+            );
+        }
     }
 
     #[test]
