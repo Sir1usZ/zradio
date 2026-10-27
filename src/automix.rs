@@ -1,6 +1,15 @@
 use crate::analysis::TrackAnalysis;
-use crate::dsp::MixMode;
+use crate::dsp::{fade_frames, MixMode};
 use crate::library::Track;
+use crate::stretch::TimeMap;
+
+/// Lead the bend needs before it starts: worker render plus the UI tick that installs it.
+const BEND_LEAD_SECS: f64 = 1.0;
+const SKIP_LEAD_SECS: f64 = 0.25;
+const RAMP_BARS: f64 = 4.0;
+pub const RAMP_MAX_SECS: f32 = 8.0;
+/// How long before the bend AutoMix wants the next track decoded and analysed.
+pub const PREFETCH_LEAD_SECS: f32 = 6.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MixStyle {
@@ -25,7 +34,8 @@ impl MixStyle {
 pub struct TransitionPlan {
     pub next_index: usize,
     pub fade_secs: f32,
-    pub rate: f32,
+    /// Speed the outgoing tail glides to so it plays at the incoming tempo; 1 means no bend.
+    pub speed: f32,
     pub key_ok: bool,
     pub bpm_ok: bool,
     pub score: f32,
@@ -69,41 +79,6 @@ pub fn beat_seconds(bpm: f32) -> f32 {
     }
 }
 
-pub fn aligned_mix_in(
-    current_pos_secs: f32,
-    current: Option<&TrackAnalysis>,
-    next_mix_in: f32,
-    rate: f32,
-) -> f32 {
-    let Some(cur) = current else {
-        return next_mix_in.max(0.0);
-    };
-    let bpm = cur.bpm.unwrap_or(120.0);
-    let beat = beat_seconds(bpm);
-    if beat <= 0.001 {
-        return next_mix_in.max(0.0);
-    }
-    let phase = (current_pos_secs - cur.first_beat).rem_euclid(beat);
-    (next_mix_in + phase / rate.max(0.01)).max(0.0)
-}
-
-pub fn mix_start_frame(
-    current_pos: usize,
-    remaining: usize,
-    mix_out_secs: Option<f32>,
-    fade_secs: f32,
-    sample_rate: u32,
-) -> usize {
-    let sr = sample_rate.max(1) as f32;
-    let fade = (fade_secs.max(0.5) * sr).round() as usize;
-    let by_phrase = mix_out_secs
-        .map(|secs| ((secs.max(0.0) * sr) as usize).saturating_sub(fade))
-        .unwrap_or(current_pos);
-    let start = by_phrase.max(current_pos);
-    let last = current_pos.saturating_add(remaining.saturating_sub(1));
-    start.min(last)
-}
-
 pub fn bpm_compatible(a: f32, b: f32) -> bool {
     if a <= 1.0 || b <= 1.0 {
         return false;
@@ -112,9 +87,10 @@ pub fn bpm_compatible(a: f32, b: f32) -> bool {
     ratio <= 1.08
 }
 
-pub fn match_rate(current_bpm: Option<f32>, next_bpm: Option<f32>) -> f32 {
+/// Only bend when the tempos are close enough to lock; a clashing pair is mixed unbent.
+pub fn tail_speed(current_bpm: Option<f32>, next_bpm: Option<f32>) -> f32 {
     match (current_bpm, next_bpm) {
-        (Some(a), Some(b)) if b > 1.0 => (a / b).clamp(0.92, 1.08),
+        (Some(a), Some(b)) if bpm_compatible(a, b) => b / a,
         _ => 1.0,
     }
 }
@@ -168,15 +144,22 @@ pub fn plan_for(
 ) -> TransitionPlan {
     let current = current_idx.and_then(|i| analyses.get(i).and_then(|a| a.as_ref()));
     let next = analyses.get(next_index).and_then(|a| a.as_ref());
+    plan_pair(current, next, next_index, mode, skip)
+}
+
+pub fn plan_pair(
+    current: Option<&TrackAnalysis>,
+    next: Option<&TrackAnalysis>,
+    next_index: usize,
+    mode: MixMode,
+    skip: bool,
+) -> TransitionPlan {
     let (score, key_ok, bpm_ok) = match (current, next) {
         (Some(a), Some(b)) => pair_score(a, b),
         _ => (0.0, false, false),
     };
-    let rate = if mode == MixMode::AutoMix {
-        match (current, next) {
-            (Some(a), Some(b)) => match_rate(a.bpm, b.bpm),
-            _ => 1.0,
-        }
+    let speed = if mode == MixMode::AutoMix {
+        tail_speed(current.and_then(|a| a.bpm), next.and_then(|b| b.bpm))
     } else {
         1.0
     };
@@ -185,21 +168,184 @@ pub fn plan_for(
     } else {
         MixStyle::Quick
     };
+    // A bent overlap runs at the incoming tempo, so its bars are the incoming track's.
+    let tempo = if speed != 1.0 { next } else { current };
     let fade_secs = match (mode, style, skip) {
         (MixMode::AutoMix, MixStyle::Echo | MixStyle::Quick, _) => 4.0,
         (MixMode::AutoMix, MixStyle::Filter, _) => 6.5,
-        _ => fade_secs_for(mode, current, skip),
+        _ => fade_secs_for(mode, tempo, skip),
     };
     TransitionPlan {
         next_index,
         fade_secs,
-        rate,
+        speed,
         key_ok,
         bpm_ok,
         score,
         style,
         current_mix_out: current.map(|a| a.mix_out),
-        next_mix_in: next.map(|a| a.mix_in / rate.max(0.01)),
+        next_mix_in: next.map(|a| a.mix_in),
+    }
+}
+
+/// From `start` on, the outgoing deck plays its source through `map`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TailBend {
+    pub start: usize,
+    pub map: TimeMap,
+    /// Output frames from `start` to the end of the source.
+    pub out_frames: usize,
+}
+
+/// Outgoing side of a transition, in source frames of the current deck.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cue {
+    /// Where the overlap starts; a bend has finished gliding by here.
+    pub mix_at: usize,
+    pub bend: Option<TailBend>,
+}
+
+/// Mixer side of a transition, once the incoming buffer is known.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    /// Outgoing deck frame (bent time) where the overlap starts.
+    pub start_at: usize,
+    /// First incoming frame, on the outgoing track's beat phase.
+    pub incoming_pos: usize,
+    pub fade: usize,
+}
+
+fn beat_grid(a: &TrackAnalysis) -> Option<(f64, f64)> {
+    a.bpm
+        .filter(|&bpm| bpm > 1.0)
+        .map(|bpm| (a.first_beat as f64, 60.0 / bpm as f64))
+}
+
+/// Nearest grid line on one side of `t`; lines sit at `first + n * step`.
+fn grid_line(t: f64, first: f64, step: f64, up: bool) -> f64 {
+    let n = (t - first) / step;
+    let n = if up {
+        (n - 1e-6).ceil()
+    } else {
+        (n + 1e-6).floor()
+    };
+    first + n * step
+}
+
+/// Where the outgoing deck hands over and, when the tempos lock, how its tail glides to the
+/// incoming tempo. A natural mix finishes the glide on the bar the overlap starts on; a skip
+/// glides over one beat and starts on the next beat line.
+pub fn cue(
+    current: Option<&TrackAnalysis>,
+    plan: &TransitionPlan,
+    pos: usize,
+    frames: usize,
+    sample_rate: u32,
+    skip: bool,
+) -> Cue {
+    let sr = sample_rate.max(1) as f64;
+    let at = |secs: f64| ((secs.max(0.0) * sr).round() as usize).min(frames);
+    let pos_s = pos as f64 / sr;
+    let end_s = frames as f64 / sr;
+    let grid = current.and_then(beat_grid);
+    let speed = plan.speed as f64;
+    let fade = plan.fade_secs.max(0.5) as f64;
+    if let (Some((first, beat)), true) = (grid, speed != 1.0) {
+        let overlap = fade * speed;
+        let span = if skip {
+            let mix_s = grid_line(pos_s + SKIP_LEAD_SECS + beat, first, beat, true);
+            (mix_s - beat, mix_s)
+        } else {
+            let bar = beat * 4.0;
+            let ramp = (RAMP_BARS * bar).clamp(2.0, RAMP_MAX_SECS as f64);
+            let lead = pos_s + BEND_LEAD_SECS;
+            let ideal = plan.current_mix_out.map_or(end_s, f64::from) - overlap;
+            let mut mix_s = grid_line(ideal, first, bar, false);
+            if mix_s < lead + beat {
+                mix_s = grid_line(lead + beat, first, bar, true);
+            }
+            ((mix_s - ramp).max(lead), mix_s)
+        };
+        let (start_s, mix_s) = span;
+        if mix_s + overlap <= end_s {
+            let (start, mix_at) = (at(start_s), at(mix_s));
+            let map = TimeMap::new((mix_at - start) as f64, speed);
+            let out_frames = map.out_of((frames - start) as f64).ceil() as usize;
+            return Cue {
+                mix_at,
+                bend: Some(TailBend {
+                    start,
+                    map,
+                    out_frames,
+                }),
+            };
+        }
+    }
+    let latest = frames.saturating_sub((fade * sr) as usize);
+    let unbent = |mix_at: usize| Cue {
+        mix_at: mix_at.min(latest).max(pos),
+        bend: None,
+    };
+    let Some(mix_out) = plan.current_mix_out.filter(|_| !skip) else {
+        return unbent(pos);
+    };
+    let ideal = mix_out as f64 - fade;
+    let mix_s = match grid {
+        Some((first, beat)) => {
+            let down = grid_line(ideal, first, beat * 4.0, false);
+            if down < pos_s {
+                grid_line(pos_s, first, beat * 4.0, true)
+            } else {
+                down
+            }
+        }
+        None => ideal,
+    };
+    unbent(at(mix_s))
+}
+
+/// Fixes the overlap on the outgoing deck's clock and starts the incoming track on the same
+/// beat phase the outgoing one has at `cue.mix_at`.
+pub fn place(
+    cue: &Cue,
+    current: Option<&TrackAnalysis>,
+    next: Option<&TrackAnalysis>,
+    plan: &TransitionPlan,
+    frames: usize,
+    next_frames: usize,
+    sample_rate: u32,
+) -> Placement {
+    let sr = sample_rate.max(1) as f64;
+    let (start_at, out_left) = match cue.bend {
+        Some(b) => {
+            let at = b.start + b.map.out_of((cue.mix_at - b.start) as f64).round() as usize;
+            (at, (b.start + b.out_frames).saturating_sub(at))
+        }
+        None => (cue.mix_at, frames.saturating_sub(cue.mix_at)),
+    };
+    let phase = current.and_then(beat_grid).map_or(0.0, |(first, beat)| {
+        let p = ((cue.mix_at as f64 / sr - first) / beat).rem_euclid(1.0);
+        if p > 1.0 - 1e-6 {
+            0.0
+        } else {
+            p
+        }
+    });
+    let next_beat = next
+        .and_then(beat_grid)
+        .filter(|_| plan.bpm_ok)
+        .or(current.and_then(beat_grid))
+        .map_or(0.0, |(_, beat)| beat);
+    let mix_in = plan.next_mix_in.map_or(0.0, |s| s.max(0.0) as f64);
+    let incoming_pos =
+        (((mix_in + phase * next_beat) * sr).round() as usize).min(next_frames.saturating_sub(1));
+    let fade = fade_frames(sample_rate, frames.min(next_frames), plan.fade_secs)
+        .min(out_left)
+        .min(next_frames.saturating_sub(incoming_pos));
+    Placement {
+        start_at,
+        incoming_pos,
+        fade,
     }
 }
 
@@ -299,7 +445,7 @@ mod tests {
         assert_eq!(plan.next_index, 2);
         assert!(plan.key_ok);
         assert!(plan.bpm_ok);
-        assert!((plan.rate - 128.0 / 126.0).abs() < 0.01);
+        assert!((plan.speed - 126.0 / 128.0).abs() < 1e-6);
     }
 
     #[test]
@@ -363,22 +509,6 @@ mod tests {
     }
 
     #[test]
-    fn aligned_mix_in_keeps_beat_phase() {
-        let cur = analysis(
-            120.0,
-            Camelot {
-                number: 8,
-                minor: false,
-            },
-            0.2,
-        );
-        let mix_in = aligned_mix_in(1.25, Some(&cur), 4.0, 1.0);
-        let beat = 0.5;
-        let phase = (mix_in - 4.0).rem_euclid(beat);
-        assert!((phase - 0.25).abs() < 1e-4);
-    }
-
-    #[test]
     fn taste_boost_can_beat_close_harmonic_match() {
         let tracks = vec![track("a"), track("fit"), track("loved")];
         let current = analysis(
@@ -419,11 +549,129 @@ mod tests {
         assert_eq!(boosted.next_index, 2);
     }
 
+    fn key8() -> Camelot {
+        Camelot {
+            number: 8,
+            minor: false,
+        }
+    }
+
     #[test]
-    fn mix_start_waits_for_phrase_not_now() {
-        let start = mix_start_frame(48_000 * 6, 48_000 * 14, Some(16.0), 8.0, 48_000);
-        assert_eq!(start, 48_000 * 8);
-        let later = mix_start_frame(48_000 * 10, 48_000 * 10, Some(18.0), 8.0, 48_000);
-        assert_eq!(later, 48_000 * 10);
+    fn natural_bend_glides_into_the_bar_the_overlap_starts_on() {
+        let a = analysis(128.0, key8(), 0.2);
+        let mut b = analysis(120.0, key8(), 0.2);
+        b.mix_in = 16.0;
+        let plan = plan_pair(Some(&a), Some(&b), 1, MixMode::AutoMix, false);
+        assert!((plan.speed - 120.0 / 128.0).abs() < 1e-6);
+        let sr = 48_000;
+        let frames = 200 * sr as usize;
+        let c = cue(Some(&a), &plan, 150 * sr as usize, frames, sr, false);
+        let bend = c.bend.expect("compatible tempos should bend");
+        let bar = 240.0 / 128.0;
+        let overlap = plan.fade_secs as f64 * plan.speed as f64;
+        let mix_s = c.mix_at as f64 / sr as f64;
+        assert!(
+            (mix_s / bar - (mix_s / bar).round()).abs() < 1e-6,
+            "on a bar line"
+        );
+        assert!(mix_s + overlap <= 180.0 + 1e-9, "overlap ends by mix_out");
+        assert!(mix_s + bar + overlap > 180.0, "latest bar that fits");
+        assert_eq!(bend.map.ramp(), (c.mix_at - bend.start) as f64);
+        assert!(
+            (bend.map.ramp() / sr as f64 - 4.0 * bar).abs() < 1e-3,
+            "4 bar glide"
+        );
+
+        let p = place(&c, Some(&a), Some(&b), &plan, frames, frames, sr);
+        let glide_out = bend.start as f64 + bend.map.out_of(bend.map.ramp());
+        assert!((p.start_at as f64 - glide_out).abs() <= 1.0);
+        assert_eq!(p.incoming_pos, 16 * sr as usize, "downbeat meets downbeat");
+        assert_eq!(p.fade, 8 * sr as usize);
+
+        let late = cue(Some(&a), &plan, 178 * sr as usize, frames, sr, false);
+        let late_bend = late.bend.expect("a late cue shortens the glide");
+        assert!(
+            late_bend.start >= 179 * sr as usize,
+            "never glides in the past"
+        );
+        assert!(late.mix_at > late_bend.start);
+    }
+
+    #[test]
+    fn skip_bend_glides_over_one_beat_to_the_next_beat_line() {
+        let a = analysis(128.0, key8(), 0.2);
+        let b = analysis(124.0, key8(), 0.2);
+        let plan = plan_pair(Some(&a), Some(&b), 1, MixMode::AutoMix, false);
+        let sr = 48_000;
+        let pos = 60 * sr as usize;
+        let c = cue(Some(&a), &plan, pos, 200 * sr as usize, sr, true);
+        let bend = c.bend.expect("a skip still locks tempo");
+        let beat = 60.0 / 128.0;
+        let mix_s = c.mix_at as f64 / sr as f64;
+        assert!(
+            (mix_s / beat - (mix_s / beat).round()).abs() < 1e-6,
+            "on a beat line"
+        );
+        let wait = mix_s - 60.0;
+        assert!(wait > SKIP_LEAD_SECS + beat - 1e-9 && wait <= SKIP_LEAD_SECS + 2.0 * beat);
+        assert!(bend.start >= pos);
+        assert!((bend.map.ramp() / sr as f64 - beat).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clashing_tempos_mix_unbent() {
+        let a = analysis(128.0, key8(), 0.2);
+        let b = analysis(90.0, key8(), 0.2);
+        let plan = plan_pair(Some(&a), Some(&b), 1, MixMode::AutoMix, false);
+        assert_eq!(plan.speed, 1.0);
+        let c = cue(Some(&a), &plan, 0, 200 * 48_000, 48_000, false);
+        assert_eq!(c.bend, None);
+        let fit = analysis(126.0, key8(), 0.2);
+        let crossfade = plan_pair(Some(&a), Some(&fit), 1, MixMode::Crossfade, false);
+        assert_eq!(crossfade.speed, 1.0);
+    }
+
+    #[test]
+    fn unbent_mix_waits_for_a_bar_line() {
+        let a = analysis(120.0, key8(), 0.2);
+        let b = analysis(120.0, key8(), 0.2);
+        let plan = plan_pair(Some(&a), Some(&b), 1, MixMode::AutoMix, false);
+        assert_eq!(plan.speed, 1.0);
+        let sr = 48_000;
+        let frames = 200 * sr as usize;
+        let c = cue(Some(&a), &plan, 150 * sr as usize, frames, sr, false);
+        let want = Cue {
+            mix_at: 172 * sr as usize,
+            bend: None,
+        };
+        assert_eq!(c, want);
+        let late = cue(Some(&a), &plan, 175 * sr as usize, frames, sr, false);
+        assert_eq!(late.mix_at, 176 * sr as usize, "never rewinds, waits a bar");
+    }
+
+    #[test]
+    fn unbent_skip_starts_now_on_the_outgoing_beat_phase() {
+        let a = analysis(120.0, key8(), 0.2);
+        let mut b = analysis(120.0, key8(), 0.2);
+        b.mix_in = 4.0;
+        let plan = plan_pair(Some(&a), Some(&b), 1, MixMode::AutoMix, false);
+        let sr = 48_000;
+        let frames = 20 * sr as usize;
+        let pos = sr as usize * 5 / 4;
+        let c = cue(Some(&a), &plan, pos, frames, sr, true);
+        assert_eq!(
+            c,
+            Cue {
+                mix_at: pos,
+                bend: None
+            }
+        );
+        let p = place(&c, Some(&a), Some(&b), &plan, frames, frames, sr);
+        assert_eq!(p.start_at, pos);
+        assert_eq!(
+            p.incoming_pos,
+            sr as usize * 17 / 4,
+            "half a beat past mix_in"
+        );
     }
 }

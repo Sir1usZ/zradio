@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::io::{self, stdout};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -33,7 +33,7 @@ use crate::drawer::{
     drawer_open_height, drawer_rect, drawer_rows, list_title, wrap_idx, DrawerAnim, DRAWER_SLOTS,
 };
 use crate::dsp::MixMode;
-use crate::engine::{load_track, Player, Snapshot};
+use crate::engine::{load_track, Mixer, Player, PreparedBend, Snapshot};
 use crate::eq::Equalizer;
 use crate::fetch::{self, find_media_url};
 use crate::greeting::{
@@ -84,6 +84,17 @@ fn decode_request_is_current(
     tracks: &[Track],
 ) -> bool {
     inflight == Some(completed) && completed.track.matches(generation, tracks)
+}
+
+/// Renders the outgoing tail on the decode worker; the mixer is locked only to snapshot it.
+fn prepare_bend(
+    mixer: &Mutex<Mixer>,
+    index: usize,
+    next: &TrackAnalysis,
+    skip: bool,
+) -> Option<PreparedBend> {
+    let job = mixer.lock().ok()?.bend_job(index, next, skip)?;
+    Some(job.render())
 }
 
 fn receive_batch<T>(rx: &Receiver<T>, limit: usize) -> Vec<T> {
@@ -145,6 +156,7 @@ struct DecodeJob {
     skip: bool,
     buf: AudioBuf,
     analysis: TrackAnalysis,
+    bend: Option<PreparedBend>,
 }
 
 struct DecodeFailure {
@@ -991,15 +1003,22 @@ impl App {
         let ch = self.player.channels;
         let cached = self.analysis.get(&track.path);
         let tx = self.decode_tx.clone();
+        let mixer = Arc::clone(&self.player.mixer);
         thread::spawn(move || {
             let result = load_track(&track.path, rate, ch).map(|buf| {
                 let analysis = cached.unwrap_or_else(|| analyze_buffer(&buf));
+                let bend = if transition {
+                    prepare_bend(&mixer, index, &analysis, skip)
+                } else {
+                    None
+                };
                 DecodeJob {
                     id: id.clone(),
                     transition,
                     skip,
                     buf,
                     analysis,
+                    bend,
                 }
             });
             let _ = tx.send(result.map_err(|err| DecodeFailure {
@@ -1066,13 +1085,8 @@ impl App {
         mixer.set_track_title(index, meta.title.clone());
         let remix = mixer.remix();
         let fade = job.transition && mixer.mix().uses_fade();
-        let rate = if fade {
-            mixer.transition_rate(index, job.skip)
-        } else {
-            1.0
-        };
         drop(mixer);
-        let buf = crate::engine::beatmatch(apply_remix(job.buf, remix), rate);
+        let buf = apply_remix(job.buf, remix);
         if let Some(track) = self.tracks.get_mut(index) {
             track.title = meta.title.clone();
         }
@@ -1086,7 +1100,7 @@ impl App {
         self.mark_meta_changed();
         let mut mixer = self.player.mixer.lock().expect("mixer");
         if fade {
-            mixer.start_matched_transition(index, buf, job.skip, rate);
+            mixer.start_prepared_transition(index, buf, job.skip, job.bend);
         } else {
             mixer.play_decoded(index, buf);
         }
