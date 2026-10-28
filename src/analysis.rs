@@ -10,10 +10,16 @@ use serde::{Deserialize, Serialize};
 use crate::decode::AudioBuf;
 use crate::storage::write_json_atomic;
 
-const ANALYSIS_VERSION: u32 = 2;
+const ANALYSIS_VERSION: u32 = 3;
 const ENV_HZ: f32 = 50.0;
 const BPM_MIN: f32 = 70.0;
 const BPM_MAX: f32 = 180.0;
+/// Onset frames per second; the hop is 10 ms at any rate.
+const ONSET_HZ: f64 = 100.0;
+/// Magnitude compression: log(1 + gamma * |X|).
+const ONSET_GAMMA: f32 = 100.0;
+/// Where in its window an onset frame's flux peaks, as a fraction of the window length.
+const ONSET_LEAD: f64 = 0.55;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Camelot {
@@ -81,7 +87,7 @@ pub fn analyze_buffer(buf: &AudioBuf) -> TrackAnalysis {
         buf.frames() as f32 / buf.sample_rate as f32
     };
     let envelope = rms_envelope(buf, ENV_HZ);
-    let (bpm, bpm_confidence, first_beat) = detect_bpm(&envelope, ENV_HZ);
+    let (bpm, bpm_confidence, first_beat) = detect_bpm(buf);
     let (key_root, key_minor, key_confidence) = detect_key(buf);
     let camelot = key_root.map(|root| Camelot::from_root_mode(root, key_minor));
     let energy = mean_energy(&envelope);
@@ -156,65 +162,241 @@ fn rms_envelope(buf: &AudioBuf, env_hz: f32) -> Vec<f32> {
     out
 }
 
-fn detect_bpm(envelope: &[f32], env_hz: f32) -> (Option<f32>, f32, Option<f32>) {
-    if envelope.len() < 80 {
-        return (None, 0.0, None);
+/// Onset strength: spectral flux at ONSET_HZ, the low, mid and high bands weighted alike.
+struct Onsets {
+    fps: f64,
+    /// Seconds from a frame's start to the onset it reports.
+    lead: f64,
+    strength: Vec<f32>,
+}
+
+fn onset_strength(buf: &AudioBuf) -> Option<Onsets> {
+    let sr = buf.sample_rate as usize;
+    let hop = (sr as f64 / ONSET_HZ).round() as usize;
+    if hop < 16 {
+        return None;
     }
-    let flux: Vec<f32> = envelope
-        .windows(2)
-        .map(|w| (w[1] - w[0]).max(0.0))
+    let n = (2 * hop).next_power_of_two();
+    let frames = buf.frames().checked_sub(n)? / hop + 1;
+    let bin = |hz: f64| ((hz * n as f64 / sr as f64).round() as usize).clamp(1, n / 2);
+    let edges = [bin(30.0), bin(200.0), bin(2_500.0), bin(11_000.0)];
+    let window: Vec<f32> = (0..n)
+        .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos())
         .collect();
-    let min_lag = (60.0 * env_hz / BPM_MAX).round() as usize;
-    let max_lag = (60.0 * env_hz / BPM_MIN).round() as usize;
-    let max_lag = max_lag.min(flux.len() / 2).max(min_lag + 1);
-    let mut best_lag = 0;
-    let mut best = 0.0;
-    let mut second = 0.0;
-    for lag in min_lag..max_lag {
-        let mut sum = 0.0;
-        let mut n = 0usize;
-        let mut i = 0;
-        while i + lag < flux.len() {
-            sum += flux[i] * flux[i + lag];
-            n += 1;
-            i += 1;
+    let fft = FftPlanner::<f32>::new().plan_fft_forward(n);
+    let mut spectrum = vec![Complex32::new(0.0, 0.0); n];
+    let mut scratch = vec![Complex32::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+    // Log-compressed magnitude, 1 for a full-scale sine.
+    let gain = 4.0 / n as f32;
+    let mut prev = vec![0.0f32; edges[3]];
+    let mut mag = vec![0.0f32; edges[3]];
+    let mut flux = vec![[0.0f32; 3]; frames];
+    for (i, f) in flux.iter_mut().enumerate() {
+        for (k, s) in spectrum.iter_mut().enumerate() {
+            let x = buf.stereo_at(i * hop + k);
+            *s = Complex32::new((x[0] + x[1]) * 0.5 * window[k], 0.0);
         }
-        if n == 0 {
-            continue;
+        fft.process_with_scratch(&mut spectrum, &mut scratch);
+        for (k, m) in mag.iter_mut().enumerate().skip(edges[0]) {
+            *m = (1.0 + ONSET_GAMMA * gain * spectrum[k].norm()).ln();
         }
-        let score = sum / n as f32;
-        if score > best {
-            second = best;
-            best = score;
-            best_lag = lag;
-        } else if score > second {
-            second = score;
+        if i > 0 {
+            for (band, lo_hi) in edges.windows(2).enumerate() {
+                f[band] = (lo_hi[0]..lo_hi[1])
+                    .map(|k| (mag[k] - prev[k]).max(0.0))
+                    .sum();
+            }
+        }
+        std::mem::swap(&mut prev, &mut mag);
+    }
+    let mut mean = [0.0f32; 3];
+    for f in &flux {
+        for (m, v) in mean.iter_mut().zip(f) {
+            *m += v / frames as f32;
         }
     }
-    if best_lag == 0 || best <= 1e-8 {
+    let raw: Vec<f32> = flux
+        .iter()
+        .map(|f| {
+            (0..3)
+                .filter(|&b| mean[b] > 1e-9)
+                .map(|b| f[b] / mean[b])
+                .sum()
+        })
+        .collect();
+    // Only what stands out of its surroundings is an onset.
+    let half = (ONSET_HZ * 0.25) as usize;
+    let mut sums = vec![0.0f64; frames + 1];
+    for (i, v) in raw.iter().enumerate() {
+        sums[i + 1] = sums[i] + f64::from(*v);
+    }
+    let strength = (0..frames)
+        .map(|i| {
+            let (lo, hi) = (i.saturating_sub(half), (i + half + 1).min(frames));
+            let local = (sums[hi] - sums[lo]) / (hi - lo) as f64;
+            (raw[i] - local as f32).max(0.0)
+        })
+        .collect();
+    Some(Onsets {
+        fps: sr as f64 / hop as f64,
+        lead: ONSET_LEAD * n as f64 / sr as f64,
+        strength,
+    })
+}
+
+/// Tempo and beat phase from the onset strength, or no tempo when the track has no steady
+/// pulse to lock to.
+fn detect_bpm(buf: &AudioBuf) -> (Option<f32>, f32, Option<f32>) {
+    let Some(onsets) = onset_strength(buf) else {
         return (None, 0.0, None);
+    };
+    let Some((period, confidence)) = beat_period(&onsets.strength, onsets.fps) else {
+        return (None, 0.0, None);
+    };
+    let (period, phase) = fit_grid(&onsets.strength, period);
+    let beat = period / onsets.fps;
+    let first = (phase / onsets.fps + onsets.lead).rem_euclid(beat);
+    (Some((60.0 / beat) as f32), confidence, Some(first as f32))
+}
+
+/// Beat period in onset frames. The autocorrelation peak picks the tempo, then the peaks at
+/// 2, 4, 8, ... beats pin it down, since a lag of k beats carries k times the precision.
+fn beat_period(strength: &[f32], fps: f64) -> Option<(f64, f32)> {
+    let mean = strength.iter().map(|&v| f64::from(v)).sum::<f64>() / strength.len().max(1) as f64;
+    let x: Vec<f64> = strength.iter().map(|&v| f64::from(v) - mean).collect();
+    let acf = |lag: usize| -> f64 {
+        let n = x.len().saturating_sub(lag);
+        if n == 0 {
+            return 0.0;
+        }
+        x[..n]
+            .iter()
+            .zip(&x[lag..])
+            .map(|(a, b)| a * b)
+            .sum::<f64>()
+            / n as f64
+    };
+    let min_lag = ((60.0 * fps / BPM_MAX as f64).floor() as usize).max(2);
+    let max_lag = (60.0 * fps / BPM_MIN as f64).ceil() as usize;
+    if x.len() < max_lag * 4 {
+        return None;
     }
-    let bpm = 60.0 * env_hz / best_lag as f32;
-    let conf = if best == 0.0 {
+    let zero = acf(0);
+    if zero <= 1e-12 {
+        return None;
+    }
+    let scores: Vec<f64> = (min_lag - 1..=max_lag + 1).map(acf).collect();
+    // A mild preference for tempos near 120 settles half and double time.
+    let prior = |lag: usize| {
+        let octaves = (60.0 * fps / lag as f64 / 120.0).log2();
+        (-0.5 * (octaves / 0.8).powi(2)).exp()
+    };
+    let lag = (1..scores.len() - 1)
+        .filter(|&i| scores[i] > 0.0 && scores[i] >= scores[i - 1] && scores[i] >= scores[i + 1])
+        .max_by(|&i, &j| {
+            let si = scores[i] * prior(min_lag - 1 + i);
+            let sj = scores[j] * prior(min_lag - 1 + j);
+            si.total_cmp(&sj)
+        })?
+        + min_lag
+        - 1;
+    let base = acf(lag);
+    let mut period = lag as f64 + vertex(acf(lag - 1), base, acf(lag + 1));
+    let mut k = 2;
+    while (k as f64 * period) < x.len() as f64 / 2.0 {
+        let center = (k as f64 * period).round() as usize;
+        let near: Vec<f64> = (center - 3..=center + 3).map(acf).collect();
+        let i = (0..near.len())
+            .max_by(|&i, &j| near[i].total_cmp(&near[j]))
+            .unwrap_or(3);
+        if i == 0 || i == near.len() - 1 || near[i] < 0.3 * base {
+            break;
+        }
+        let peak = (center - 3 + i) as f64 + vertex(near[i - 1], near[i], near[i + 1]);
+        period = peak / k as f64;
+        k *= 2;
+    }
+    Some((period, (base / zero).clamp(0.0, 1.0) as f32))
+}
+
+/// Offset of a parabola's vertex through three equally spaced points, from the middle one.
+fn vertex(a: f64, b: f64, c: f64) -> f64 {
+    let d = a - 2.0 * b + c;
+    if d.abs() < 1e-15 {
         0.0
     } else {
-        ((best - second) / best).clamp(0.0, 1.0)
-    };
-    let mut best_phase = 0;
-    let mut best_energy = -1.0;
-    for phase in 0..best_lag {
-        let mut e = 0.0;
-        let mut idx = phase;
-        while idx < flux.len() {
-            e += flux[idx];
-            idx += best_lag;
-        }
-        if e > best_energy {
-            best_energy = e;
-            best_phase = phase;
-        }
+        (0.5 * (a - c) / d).clamp(-0.5, 0.5)
     }
-    (Some(bpm), conf, Some(best_phase as f32 / env_hz))
+}
+
+/// Beat phase in onset frames, and the period refined by a weighted line through the beats:
+/// each beat's onset centroid against its index.
+fn fit_grid(strength: &[f32], period: f64) -> (f64, f64) {
+    let len = strength.len() as f64;
+    let comb = |phase: f64| {
+        let (mut sum, mut n) = (0.0, 0usize);
+        let mut t = phase;
+        while t < len - 1.0 {
+            sum += lerp(strength, t);
+            n += 1;
+            t = phase + n as f64 * period;
+        }
+        sum / n.max(1) as f64
+    };
+    let mut phase = (0..(period * 4.0) as usize)
+        .map(|i| i as f64 * 0.25)
+        .max_by(|&a, &b| comb(a).total_cmp(&comb(b)))
+        .unwrap_or(0.0);
+    let mut period = period;
+    for _ in 0..3 {
+        let reach = period * 0.1;
+        let (mut sw, mut sn, mut sc, mut snn, mut snc) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut beat = 0usize;
+        loop {
+            let at = phase + beat as f64 * period;
+            let (lo, hi) = ((at - reach).ceil(), (at + reach).floor());
+            if hi >= len {
+                break;
+            }
+            if lo >= 0.0 {
+                let (lo, hi) = (lo as usize, hi as usize);
+                let (mut w, mut m) = (0.0, 0.0);
+                for (i, &v) in strength[lo..=hi].iter().enumerate() {
+                    let v = f64::from(v);
+                    w += v;
+                    m += v * (lo + i) as f64;
+                }
+                if w > 0.0 {
+                    let (n, c) = (beat as f64, m / w);
+                    sw += w;
+                    sn += w * n;
+                    sc += w * c;
+                    snn += w * n * n;
+                    snc += w * n * c;
+                }
+            }
+            beat += 1;
+        }
+        let det = sw * snn - sn * sn;
+        if det <= 1e-9 * sw * sw {
+            break;
+        }
+        let slope = (sw * snc - sn * sc) / det;
+        if (slope / period - 1.0).abs() > 0.01 {
+            break;
+        }
+        phase = (sc - slope * sn) / sw;
+        period = slope;
+    }
+    (period, phase.rem_euclid(period))
+}
+
+fn lerp(x: &[f32], t: f64) -> f64 {
+    let i = t.floor() as usize;
+    let f = t - i as f64;
+    let a = x.get(i).copied().unwrap_or(0.0) as f64;
+    let b = x.get(i + 1).copied().unwrap_or(0.0) as f64;
+    a + (b - a) * f
 }
 
 fn detect_key(buf: &AudioBuf) -> (Option<u8>, bool, f32) {
@@ -468,6 +650,79 @@ mod tests {
         let bar = 2.0;
         let units = ((snapped - 0.2) / bar).round();
         assert!((snapped - (units * bar + 0.2)).abs() < 1e-4);
+    }
+
+    /// A kick on every beat from `first` seconds on and, with `hats`, a noise hat on every
+    /// off-beat.
+    fn beat_track(bpm: f64, first: f64, secs: f64, rate: u32, hats: bool) -> AudioBuf {
+        let sr = rate as f64;
+        let frames = (secs * sr) as usize;
+        let beat = 60.0 / bpm;
+        let mut mono = vec![0.0f32; frames];
+        let mut seed = 0x2545_f491_u32;
+        let mut noise = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32 * 2.0 - 1.0
+        };
+        let mut add = |at: f64, len: f64, f: &mut dyn FnMut(f64) -> f32| {
+            let start = (at * sr).round() as usize;
+            for i in 0..(len * sr) as usize {
+                let Some(s) = mono.get_mut(start + i) else {
+                    break;
+                };
+                *s += f(i as f64 / sr);
+            }
+        };
+        for n in 0.. {
+            let t = first + n as f64 * beat;
+            if t >= secs {
+                break;
+            }
+            let mut phase = 0.0;
+            add(t, 0.15, &mut |x| {
+                phase += std::f64::consts::TAU * (50.0 + 90.0 * (-x / 0.02).exp()) / sr;
+                (0.8 * (-x / 0.06).exp() * phase.sin()) as f32
+                    + 0.3 * (-x / 0.002).exp() as f32 * noise()
+            });
+            if hats {
+                add(t + beat / 2.0, 0.04, &mut |x| {
+                    0.2 * (-x / 0.01).exp() as f32 * noise()
+                });
+            }
+        }
+        AudioBuf {
+            samples: mono.iter().flat_map(|&s| [s, s]).collect(),
+            sample_rate: rate,
+            channels: 2,
+        }
+    }
+
+    /// Furthest any true beat lies from the analysed grid.
+    fn grid_error(a: &TrackAnalysis, bpm: f64, first: f64, secs: f64) -> f64 {
+        let beat = 60.0 / a.bpm.expect("bpm") as f64;
+        let grid = a.first_beat as f64;
+        (0..)
+            .map(|n| first + n as f64 * 60.0 / bpm)
+            .take_while(|&t| t < secs)
+            .map(|t| {
+                let near = grid + ((t - grid) / beat).round() * beat;
+                (near - t).abs()
+            })
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn tempo_and_beat_grid_hold_to_the_end_of_the_track() {
+        let secs = 90.0;
+        for (bpm, first, hats) in [(128.0, 0.31, true), (123.7, 0.05, false), (87.0, 0.6, true)] {
+            let a = analyze_buffer(&beat_track(bpm, first, secs, 22_050, hats));
+            let got = a.bpm.expect("bpm") as f64;
+            assert!((got - bpm).abs() < 0.01, "{bpm} BPM read as {got}");
+            let err = grid_error(&a, bpm, first, secs);
+            assert!(err < 0.008, "{bpm} BPM grid is {:.1} ms off", err * 1e3);
+        }
     }
 
     #[test]
