@@ -520,6 +520,21 @@ impl Mixer {
         self.status = format!("mix {}", self.mix.label());
     }
 
+    pub fn set_mix(&mut self, mode: MixMode) {
+        while self.mix != mode {
+            self.cycle_mix();
+        }
+    }
+
+    pub fn current_index(&self) -> Option<usize> {
+        self.current_idx
+    }
+
+    /// The plan of the transition that is running or last ran.
+    pub fn last_plan(&self) -> Option<TransitionPlan> {
+        self.last_plan
+    }
+
     pub fn shuffle(&self) -> bool {
         self.shuffle
     }
