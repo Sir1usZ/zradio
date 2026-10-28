@@ -11,7 +11,7 @@ use crate::decode::AudioBuf;
 use crate::dsp::{Biquad, CROSSOVER_HZ};
 use crate::storage::write_json_atomic;
 
-const ANALYSIS_VERSION: u32 = 6;
+const ANALYSIS_VERSION: u32 = 7;
 const ENV_HZ: f32 = 50.0;
 const BPM_MIN: f32 = 70.0;
 const BPM_MAX: f32 = 180.0;
@@ -99,16 +99,30 @@ pub fn analyze_buffer(buf: &AudioBuf) -> TrackAnalysis {
     let camelot = key_root.map(|root| Camelot::from_root_mode(root, key_minor));
     let energy = mean_energy(&envelope);
     let first = first_beat.unwrap_or(0.0).clamp(0.0, duration);
+    let steps = loudness_steps(buf);
+    let loudness = loudness(&steps);
+    let (start, end) = loudness
+        .and_then(|l| music_span(&steps, l))
+        .unwrap_or((0.0, duration));
     let mix_in = if let Some(bpm) = bpm {
-        snap_to_bar(first, first, bpm).min(duration)
+        // The first beat of the grid that the music is heard on, or the step before it, as
+        // the step it starts in begins up to 100 ms early.
+        let beat = 60.0 / bpm;
+        let n = ((start - LOUDNESS_STEP_SECS - first) / beat)
+            .ceil()
+            .max(0.0);
+        (first + n * beat).min(duration)
     } else {
-        first
+        first.max(start)
     };
     let mix_out = if let Some(bpm) = bpm {
         let bar = 240.0 / bpm;
-        snap_to_bar((duration - bar * 8.0).max(mix_in + bar), first, bpm).min(duration)
+        let ideal = snap_to_bar(duration - bar * 8.0, first, bpm);
+        // On a short track or a long silent tail, the bar the music is still heard on.
+        let last = first + ((end - first) / bar + 1e-3).floor() * bar;
+        ideal.min(last).max(mix_in + bar).min(duration)
     } else {
-        (duration * 0.82).max(0.0).min(duration)
+        (duration * 0.82).min(end).max(0.0).min(duration)
     };
     TrackAnalysis {
         version: ANALYSIS_VERSION,
@@ -125,7 +139,7 @@ pub fn analyze_buffer(buf: &AudioBuf) -> TrackAnalysis {
         mix_out,
         first_beat: first,
         duration,
-        loudness: loudness(buf),
+        loudness,
         peak: peak(buf),
     }
 }
@@ -202,12 +216,20 @@ fn k_weighting(sample_rate: u32) -> [Biquad; 2] {
     [shelf, high_pass]
 }
 
-/// Gated integrated loudness of the stereo mix (BS.1770-4): 400 ms blocks every 100 ms, an
-/// absolute gate at -70 LUFS and a relative one 10 LU under what passes it.
-fn loudness(buf: &AudioBuf) -> Option<f32> {
+/// Length of a loudness step, the hop between BS.1770 blocks.
+const LOUDNESS_STEP_SECS: f32 = 0.1;
+/// How far under a track's loudness the music counts as not yet begun or already over: low
+/// enough to keep the first notes of a fade-in, high enough to pass over noise and silence.
+const MUSIC_FLOOR_LU: f64 = 30.0;
+
+fn lufs(power: f64) -> f64 {
+    -0.691 + 10.0 * power.log10()
+}
+
+/// Summed K-weighted mean square of both channels over each 100 ms step.
+fn loudness_steps(buf: &AudioBuf) -> Vec<f64> {
     let step = (buf.sample_rate as usize / 10).max(1);
     let mut filters = [k_weighting(buf.sample_rate); 2];
-    // Summed mean square of both channels over each 100 ms step.
     let mut steps = Vec::with_capacity(buf.frames() / step + 1);
     let mut acc = 0.0f64;
     for i in 0..buf.frames() {
@@ -221,11 +243,29 @@ fn loudness(buf: &AudioBuf) -> Option<f32> {
             acc = 0.0;
         }
     }
+    steps
+}
+
+/// Seconds from the start of the first step the music is heard in to the end of the last,
+/// against its integrated loudness `lufs_of`.
+fn music_span(steps: &[f64], lufs_of: f32) -> Option<(f32, f32)> {
+    let floor = (f64::from(lufs_of) - MUSIC_FLOOR_LU).max(-70.0);
+    let heard = |p: &f64| lufs(*p) > floor;
+    let first = steps.iter().position(heard)?;
+    let last = steps.iter().rposition(heard)?;
+    Some((
+        first as f32 * LOUDNESS_STEP_SECS,
+        (last + 1) as f32 * LOUDNESS_STEP_SECS,
+    ))
+}
+
+/// Gated integrated loudness of the stereo mix (BS.1770-4): 400 ms blocks every 100 ms, an
+/// absolute gate at -70 LUFS and a relative one 10 LU under what passes it.
+fn loudness(steps: &[f64]) -> Option<f32> {
     let blocks: Vec<f64> = steps
         .windows(4)
         .map(|w| w.iter().sum::<f64>() / 4.0)
         .collect();
-    let lufs = |power: f64| -0.691 + 10.0 * power.log10();
     let mean_over = |floor: f64| {
         let kept: Vec<f64> = blocks
             .iter()
@@ -752,6 +792,35 @@ mod tests {
     }
 
     #[test]
+    fn mix_points_skip_the_silence_around_the_music() {
+        // 40 s of 120 BPM pulses between 3 s and 25 s of digital silence.
+        let rate = 22_050;
+        let pad = |secs: f32| vec![0.0; (secs * rate as f32) as usize * 2];
+        let buf = AudioBuf {
+            samples: [pad(3.0), pulse_track(120.0, 40.0, rate).samples, pad(25.0)].concat(),
+            sample_rate: rate,
+            channels: 2,
+        };
+        let a = analyze_buffer(&buf);
+        let beat = 60.0 / a.bpm.expect("bpm");
+        let on_grid = |t: f32, step: f32| {
+            let n = (t - a.first_beat) / step;
+            (n - n.round()).abs() < 1e-3
+        };
+        assert!(
+            (2.95..3.5).contains(&a.mix_in) && on_grid(a.mix_in, beat),
+            "mixes in at {} s, the music starts at 3 s",
+            a.mix_in
+        );
+        // The last pulse sounds at 42.5 s, so the overlap ends by then, on a bar.
+        assert!(
+            (40.4..42.6).contains(&a.mix_out) && on_grid(a.mix_out, beat * 4.0),
+            "mixes out at {} s, the music ends at 42.5 s",
+            a.mix_out
+        );
+    }
+
+    #[test]
     fn snap_to_bar_lands_on_grid() {
         let snapped = snap_to_bar(17.3, 0.2, 120.0);
         let bar = 2.0;
@@ -990,14 +1059,18 @@ mod tests {
         ];
         for rate in [48_000, 44_100] {
             for (segments, want) in cases {
-                let got = loudness(&tone(rate, segments)).expect("loudness") as f64;
+                let got =
+                    loudness(&loudness_steps(&tone(rate, segments))).expect("loudness") as f64;
                 assert!(
                     (got - want).abs() < 0.1,
                     "{segments:?} at {rate} Hz read {got:.2} LUFS"
                 );
             }
         }
-        assert_eq!(loudness(&tone(48_000, &[(5.0, f64::NEG_INFINITY)])), None);
+        assert_eq!(
+            loudness(&loudness_steps(&tone(48_000, &[(5.0, f64::NEG_INFINITY)]))),
+            None
+        );
     }
 
     #[test]
