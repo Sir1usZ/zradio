@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::decode::AudioBuf;
 use crate::storage::write_json_atomic;
 
-const ANALYSIS_VERSION: u32 = 3;
+const ANALYSIS_VERSION: u32 = 4;
 const ENV_HZ: f32 = 50.0;
 const BPM_MIN: f32 = 70.0;
 const BPM_MAX: f32 = 180.0;
@@ -259,8 +259,10 @@ fn detect_bpm(buf: &AudioBuf) -> (Option<f32>, f32, Option<f32>) {
     (Some((60.0 / beat) as f32), confidence, Some(first as f32))
 }
 
-/// Beat period in onset frames. The autocorrelation peak picks the tempo, then the peaks at
-/// 2, 4, 8, ... beats pin it down, since a lag of k beats carries k times the precision.
+/// Beat period in onset frames. Every autocorrelation peak in the tempo range is a
+/// candidate, pinned down by its peaks at 2, 4, 8, ... beats, since a lag of k beats carries k
+/// times the precision. The candidate whose bars and half bars repeat as well as its beats
+/// wins, so a figure every 1.5 or 0.75 beats is not taken for the beat.
 fn beat_period(strength: &[f32], fps: f64) -> Option<(f64, f32)> {
     let mean = strength.iter().map(|&v| f64::from(v)).sum::<f64>() / strength.len().max(1) as f64;
     let x: Vec<f64> = strength.iter().map(|&v| f64::from(v) - mean).collect();
@@ -285,38 +287,53 @@ fn beat_period(strength: &[f32], fps: f64) -> Option<(f64, f32)> {
     if zero <= 1e-12 {
         return None;
     }
-    let scores: Vec<f64> = (min_lag - 1..=max_lag + 1).map(acf).collect();
-    // A mild preference for tempos near 120 settles half and double time.
-    let prior = |lag: usize| {
-        let octaves = (60.0 * fps / lag as f64 / 120.0).log2();
-        (-0.5 * (octaves / 0.8).powi(2)).exp()
-    };
-    let lag = (1..scores.len() - 1)
-        .filter(|&i| scores[i] > 0.0 && scores[i] >= scores[i - 1] && scores[i] >= scores[i + 1])
-        .max_by(|&i, &j| {
-            let si = scores[i] * prior(min_lag - 1 + i);
-            let sj = scores[j] * prior(min_lag - 1 + j);
-            si.total_cmp(&sj)
-        })?
-        + min_lag
-        - 1;
-    let base = acf(lag);
-    let mut period = lag as f64 + vertex(acf(lag - 1), base, acf(lag + 1));
-    let mut k = 2;
-    while (k as f64 * period) < x.len() as f64 / 2.0 {
-        let center = (k as f64 * period).round() as usize;
-        let near: Vec<f64> = (center - 3..=center + 3).map(acf).collect();
-        let i = (0..near.len())
-            .max_by(|&i, &j| near[i].total_cmp(&near[j]))
-            .unwrap_or(3);
-        if i == 0 || i == near.len() - 1 || near[i] < 0.3 * base {
-            break;
+    let half = x.len() as f64 / 2.0;
+    let refine = |lag: usize| {
+        let base = acf(lag);
+        let mut period = lag as f64 + vertex(acf(lag - 1), base, acf(lag + 1));
+        let mut k = 2;
+        while (k as f64 * period) < half {
+            let center = (k as f64 * period).round() as usize;
+            let near: Vec<f64> = (center - 3..=center + 3).map(acf).collect();
+            let i = (0..near.len())
+                .max_by(|&i, &j| near[i].total_cmp(&near[j]))
+                .unwrap_or(3);
+            if i == 0 || i == near.len() - 1 || near[i] < 0.3 * base {
+                break;
+            }
+            let peak = (center - 3 + i) as f64 + vertex(near[i - 1], near[i], near[i + 1]);
+            period = peak / k as f64;
+            k *= 2;
         }
-        let peak = (center - 3 + i) as f64 + vertex(near[i - 1], near[i], near[i + 1]);
-        period = peak / k as f64;
-        k *= 2;
-    }
-    Some((period, (base / zero).clamp(0.0, 1.0) as f32))
+        period
+    };
+    // How well beats, half bars, bars and pairs of bars repeat.
+    let metre = |period: f64| {
+        let near = |lag: f64| {
+            let c = lag.round() as usize;
+            (c - 2..=c + 2).map(acf).fold(f64::MIN, f64::max)
+        };
+        let lags: Vec<f64> = [1.0, 2.0, 4.0, 8.0]
+            .iter()
+            .map(|k| k * period)
+            .filter(|&lag| lag < half)
+            .collect();
+        lags.iter().map(|&lag| near(lag)).sum::<f64>() / lags.len() as f64
+    };
+    // A mild preference for tempos near 120 settles half and double time.
+    let prior = |period: f64| {
+        let octaves = (60.0 * fps / period / 120.0).log2();
+        (-0.5 * octaves.powi(2)).exp()
+    };
+    let scores: Vec<f64> = (min_lag - 1..=max_lag + 1).map(acf).collect();
+    let (lag, period) = (1..scores.len() - 1)
+        .filter(|&i| scores[i] > 0.0 && scores[i] >= scores[i - 1] && scores[i] >= scores[i + 1])
+        .map(|i| {
+            let lag = min_lag - 1 + i;
+            (lag, refine(lag))
+        })
+        .max_by(|a, b| (metre(a.1) * prior(a.1)).total_cmp(&(metre(b.1) * prior(b.1))))?;
+    Some((period, (acf(lag) / zero).clamp(0.0, 1.0) as f32))
 }
 
 /// Offset of a parabola's vertex through three equally spaced points, from the middle one.
@@ -652,9 +669,37 @@ mod tests {
         assert!((snapped - (units * bar + 0.2)).abs() < 1e-4);
     }
 
+    #[derive(Clone, Copy)]
+    enum Hit {
+        Kick,
+        Snare,
+        Hat,
+        Stab,
+    }
+
+    /// Hits at offsets in beats.
+    type Pattern = [(f64, Hit)];
+
     /// A kick on every beat from `first` seconds on and, with `hats`, a noise hat on every
     /// off-beat.
     fn beat_track(bpm: f64, first: f64, secs: f64, rate: u32, hats: bool) -> AudioBuf {
+        let pattern: &Pattern = if hats {
+            &[(0.0, Hit::Kick), (0.5, Hit::Hat)]
+        } else {
+            &[(0.0, Hit::Kick)]
+        };
+        drum_track(bpm, first, secs, rate, pattern, 1.0)
+    }
+
+    /// `pattern` repeated every `cycle` beats from `first` seconds on.
+    fn drum_track(
+        bpm: f64,
+        first: f64,
+        secs: f64,
+        rate: u32,
+        pattern: &Pattern,
+        cycle: f64,
+    ) -> AudioBuf {
         let sr = rate as f64;
         let frames = (secs * sr) as usize;
         let beat = 60.0 / bpm;
@@ -675,21 +720,36 @@ mod tests {
                 *s += f(i as f64 / sr);
             }
         };
+        let tau = std::f64::consts::TAU;
         for n in 0.. {
-            let t = first + n as f64 * beat;
-            if t >= secs {
+            let start = first + n as f64 * cycle * beat;
+            if start >= secs {
                 break;
             }
-            let mut phase = 0.0;
-            add(t, 0.15, &mut |x| {
-                phase += std::f64::consts::TAU * (50.0 + 90.0 * (-x / 0.02).exp()) / sr;
-                (0.8 * (-x / 0.06).exp() * phase.sin()) as f32
-                    + 0.3 * (-x / 0.002).exp() as f32 * noise()
-            });
-            if hats {
-                add(t + beat / 2.0, 0.04, &mut |x| {
-                    0.2 * (-x / 0.01).exp() as f32 * noise()
-                });
+            for &(offset, hit) in pattern {
+                let t = start + offset * beat;
+                match hit {
+                    Hit::Kick => {
+                        let mut phase = 0.0;
+                        add(t, 0.15, &mut |x| {
+                            phase += tau * (50.0 + 90.0 * (-x / 0.02).exp()) / sr;
+                            (0.8 * (-x / 0.06).exp() * phase.sin()) as f32
+                                + 0.3 * (-x / 0.002).exp() as f32 * noise()
+                        });
+                    }
+                    Hit::Snare => add(t, 0.2, &mut |x| {
+                        (0.3 * (-x / 0.04).exp() * (tau * 190.0 * x).sin()) as f32
+                            + 0.4 * (-x / 0.05).exp() as f32 * noise()
+                    }),
+                    Hit::Hat => add(t, 0.04, &mut |x| 0.2 * (-x / 0.01).exp() as f32 * noise()),
+                    Hit::Stab => add(t, 0.15, &mut |x| {
+                        let chord: f64 = [220.0, 277.2, 329.6, 440.0]
+                            .iter()
+                            .map(|f| (tau * f * x).sin())
+                            .sum();
+                        (0.15 * (-x / 0.05).exp() * chord) as f32
+                    }),
+                }
             }
         }
         AudioBuf {
@@ -722,6 +782,60 @@ mod tests {
             assert!((got - bpm).abs() < 0.01, "{bpm} BPM read as {got}");
             let err = grid_error(&a, bpm, first, secs);
             assert!(err < 0.008, "{bpm} BPM grid is {:.1} ms off", err * 1e3);
+        }
+    }
+
+    #[test]
+    fn dotted_figures_do_not_set_the_tempo() {
+        use Hit::*;
+        // Accents 1.5 or 0.75 beats apart correlate more strongly than the beat itself: a
+        // dotted kick under a snare on 3, and a 3+3+2 figure in every band over the kick.
+        let cases: [(f64, &Pattern, f64); 2] = [
+            (
+                160.0,
+                &[
+                    (0.0, Kick),
+                    (0.0, Stab),
+                    (1.5, Kick),
+                    (1.5, Stab),
+                    (2.0, Snare),
+                    (3.0, Kick),
+                    (3.0, Stab),
+                ],
+                4.0,
+            ),
+            (
+                95.0,
+                &[
+                    (0.0, Kick),
+                    (0.0, Stab),
+                    (0.0, Snare),
+                    (0.75, Stab),
+                    (0.75, Snare),
+                    (1.0, Kick),
+                    (1.5, Stab),
+                    (1.5, Snare),
+                ],
+                2.0,
+            ),
+        ];
+        for (bpm, pattern, cycle) in cases {
+            let a = analyze_buffer(&drum_track(bpm, 0.2, 90.0, 22_050, pattern, cycle));
+            let got = a.bpm.expect("bpm") as f64;
+            // Half or double time still puts the grid on beats; 2/3 or 4/3 does not.
+            let octaves = (got / bpm).log2();
+            assert!(
+                (octaves - octaves.round()).abs() < 0.01,
+                "{bpm} BPM read as {got}"
+            );
+            let beat = 60.0 / bpm;
+            let off = ((a.first_beat as f64 - 0.2) / beat).rem_euclid(1.0);
+            let off = off.min(1.0 - off) * beat;
+            assert!(
+                off < 0.01,
+                "{bpm} BPM grid sits {:.0} ms off the beat",
+                off * 1e3
+            );
         }
     }
 
