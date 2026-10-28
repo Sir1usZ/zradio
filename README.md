@@ -64,6 +64,22 @@ Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `
 
 Missing tags / covers / lyrics fill from iTunes + lrclib, then Netease, QQ, and Kugou. Existing fields are kept. Lyrics land in a sidecar `lrc/` file; audio files are not rewritten. SPlayer is only for `?` search/download.
 
+## AutoMix
+
+`m` cycles `CUT` / `FADE` / `AUTO`. In `AUTO` each track is analysed once, cached in `~/.cache/zradio/analysis.json`, for tempo and beat phase, key (Camelot), BS.1770 loudness, peak, and where the music starts and ends.
+
+- Next track: with shuffle off and loop not `all`, the best scoring track in the play range by key, tempo and energy, plus taste. Tempos lock within 8%, or an octave apart (80 BPM beats with 160).
+- Level: every track plays at -14 LUFS, or lower if its peak through the crossover would pass -1 dBFS.
+- Transition: when the tempos lock, the outgoing tail glides to the incoming tempo. The incoming track starts on the outgoing beat phase and is never resampled. The style follows the pair: `bass-swap` (a 160 Hz Linkwitz-Riley crossover hands the low end over mid-overlap), `filter` when the keys clash or the energy jumps, a 4 s `quick` when both do, a 4 s `echo-out` when the tempos do not lock.
+
+Render transitions offline through the same mixer:
+
+```sh
+cargo run --release --example automix_render -- -o /tmp/mix a.flac b.flac c.flac
+```
+
+Each neighbouring pair becomes `NN.wav`: 12 s before the overlap, the overlap, then 6 s after. The log line gives the style, bend, fade, score, peak, and clipped samples. `--analyze` prints the analysis only. `--skip SECS` mixes as a skip at that point. `--mode fade|cut`, `--before`, `--after` and `--rate` are also accepted.
+
 ## Visualize
 
 - `bars` — packed columns
