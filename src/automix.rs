@@ -73,6 +73,25 @@ pub fn select_style(
     }
 }
 
+/// Loudness AutoMix plays every track at, so neither side of a mix jumps out.
+const TARGET_LUFS: f32 = -14.0;
+/// Highest sample peak a track may be raised to, in dBFS.
+const PEAK_CEILING_DB: f32 = -1.0;
+
+/// Gain that brings a track to `TARGET_LUFS`, raising a quiet one only as far as its peak
+/// stays under `PEAK_CEILING_DB`. Tracks never measured play as they are.
+pub fn level_gain(a: Option<&TrackAnalysis>) -> f32 {
+    let Some((lufs, peak)) = a.and_then(|a| a.loudness.map(|l| (l, a.peak))) else {
+        return 1.0;
+    };
+    let mut db = TARGET_LUFS - lufs;
+    if db > 0.0 {
+        let headroom = PEAK_CEILING_DB - 20.0 * peak.max(1e-6).log10();
+        db = db.min(headroom.max(0.0));
+    }
+    10f32.powf(db / 20.0)
+}
+
 pub fn beat_seconds(bpm: f32) -> f32 {
     if bpm <= 1.0 {
         0.5
@@ -423,7 +442,42 @@ mod tests {
             mix_out: 180.0,
             first_beat: 0.0,
             duration: 200.0,
+            loudness: None,
+            peak: 0.0,
         }
+    }
+
+    #[test]
+    fn level_gain_meets_the_target_without_clipping() {
+        let db = |g: f32| 20.0 * g.log10();
+        let at = |lufs: f32, peak_db: f32| TrackAnalysis {
+            loudness: Some(lufs),
+            peak: 10f32.powf(peak_db / 20.0),
+            ..analysis(
+                120.0,
+                Camelot {
+                    number: 8,
+                    minor: false,
+                },
+                0.2,
+            )
+        };
+        // A loud master comes down to the target; a quiet one goes up while its peak fits.
+        assert!((db(level_gain(Some(&at(-6.0, 0.0)))) + 8.0).abs() < 1e-3);
+        assert!((db(level_gain(Some(&at(-20.0, -10.0)))) - 6.0).abs() < 1e-3);
+        // A quiet track whose peak is near full scale only goes up to the ceiling...
+        assert!((db(level_gain(Some(&at(-20.0, -4.0)))) - 3.0).abs() < 1e-3);
+        // ...and is never turned down for being quiet.
+        assert_eq!(level_gain(Some(&at(-20.0, 0.0))), 1.0);
+        // Unmeasured tracks play as they are.
+        assert_eq!(level_gain(None), 1.0);
+        assert_eq!(
+            level_gain(Some(&TrackAnalysis {
+                loudness: None,
+                ..at(-6.0, 0.0)
+            })),
+            1.0
+        );
     }
 
     fn track(name: &str) -> Track {

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::decode::AudioBuf;
 use crate::storage::write_json_atomic;
 
-const ANALYSIS_VERSION: u32 = 4;
+const ANALYSIS_VERSION: u32 = 5;
 const ENV_HZ: f32 = 50.0;
 const BPM_MIN: f32 = 70.0;
 const BPM_MAX: f32 = 180.0;
@@ -73,6 +73,12 @@ pub struct TrackAnalysis {
     pub mix_out: f32,
     pub first_beat: f32,
     pub duration: f32,
+    /// Integrated loudness in LUFS (BS.1770); none for silence.
+    #[serde(default)]
+    pub loudness: Option<f32>,
+    /// Sample peak, 1 at full scale.
+    #[serde(default)]
+    pub peak: f32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -118,6 +124,8 @@ pub fn analyze_buffer(buf: &AudioBuf) -> TrackAnalysis {
         mix_out,
         first_beat: first,
         duration,
+        loudness: loudness(buf),
+        peak: peak(buf),
     }
 }
 
@@ -160,6 +168,102 @@ fn rms_envelope(buf: &AudioBuf, env_hz: f32) -> Vec<f32> {
         i = end;
     }
     out
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Biquad {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: f64,
+    z2: f64,
+}
+
+impl Biquad {
+    fn process(&mut self, x: f64) -> f64 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        y
+    }
+}
+
+/// The BS.1770 K-weighting, a high shelf then a high-pass, designed from its analogue
+/// prototype so it holds at any rate.
+fn k_weighting(sample_rate: u32) -> [Biquad; 2] {
+    let fs = sample_rate.max(1) as f64;
+    let (f0, gain_db, q) = (
+        1_681.974_450_955_533,
+        3.999_843_853_973_347,
+        0.707_175_236_955_419_6,
+    );
+    let k = (std::f64::consts::PI * f0 / fs).tan();
+    let vh = 10f64.powf(gain_db / 20.0);
+    let vb = vh.powf(0.499_666_774_154_541_6);
+    let a0 = 1.0 + k / q + k * k;
+    let shelf = Biquad {
+        b0: (vh + vb * k / q + k * k) / a0,
+        b1: 2.0 * (k * k - vh) / a0,
+        b2: (vh - vb * k / q + k * k) / a0,
+        a1: 2.0 * (k * k - 1.0) / a0,
+        a2: (1.0 - k / q + k * k) / a0,
+        ..Biquad::default()
+    };
+    let (f0, q) = (38.135_470_876_024_44, 0.500_327_037_323_877_3);
+    let k = (std::f64::consts::PI * f0 / fs).tan();
+    let a0 = 1.0 + k / q + k * k;
+    let high_pass = Biquad {
+        b0: 1.0,
+        b1: -2.0,
+        b2: 1.0,
+        a1: 2.0 * (k * k - 1.0) / a0,
+        a2: (1.0 - k / q + k * k) / a0,
+        ..Biquad::default()
+    };
+    [shelf, high_pass]
+}
+
+/// Gated integrated loudness of the stereo mix (BS.1770-4): 400 ms blocks every 100 ms, an
+/// absolute gate at -70 LUFS and a relative one 10 LU under what passes it.
+fn loudness(buf: &AudioBuf) -> Option<f32> {
+    let step = (buf.sample_rate as usize / 10).max(1);
+    let mut filters = [k_weighting(buf.sample_rate); 2];
+    // Summed mean square of both channels over each 100 ms step.
+    let mut steps = Vec::with_capacity(buf.frames() / step + 1);
+    let mut acc = 0.0f64;
+    for i in 0..buf.frames() {
+        let x = buf.stereo_at(i);
+        for ([shelf, high_pass], s) in filters.iter_mut().zip(x) {
+            let y = high_pass.process(shelf.process(f64::from(s)));
+            acc += y * y;
+        }
+        if (i + 1) % step == 0 {
+            steps.push(acc / step as f64);
+            acc = 0.0;
+        }
+    }
+    let blocks: Vec<f64> = steps
+        .windows(4)
+        .map(|w| w.iter().sum::<f64>() / 4.0)
+        .collect();
+    let lufs = |power: f64| -0.691 + 10.0 * power.log10();
+    let mean_over = |floor: f64| {
+        let kept: Vec<f64> = blocks
+            .iter()
+            .copied()
+            .filter(|&p| lufs(p) > floor)
+            .collect();
+        (!kept.is_empty()).then(|| kept.iter().sum::<f64>() / kept.len() as f64)
+    };
+    let ungated = mean_over(-70.0)?;
+    let gated = mean_over((lufs(ungated) - 10.0).max(-70.0))?;
+    Some(lufs(gated) as f32)
+}
+
+fn peak(buf: &AudioBuf) -> f32 {
+    buf.samples.iter().fold(0.0, |m, s| m.max(s.abs()))
 }
 
 /// Onset strength: spectral flux at ONSET_HZ, the low, mid and high bands weighted alike.
@@ -837,6 +941,89 @@ mod tests {
                 off * 1e3
             );
         }
+    }
+
+    /// A stereo 1 kHz sine in `(seconds, dBFS)` segments; it reads as its level in LUFS.
+    fn tone(rate: u32, segments: &[(f64, f64)]) -> AudioBuf {
+        let mut samples = Vec::new();
+        let mut n = 0usize;
+        for &(secs, db) in segments {
+            let amp = 10f64.powf(db / 20.0);
+            for _ in 0..(secs * rate as f64) as usize {
+                let x = std::f64::consts::TAU * 1000.0 * n as f64 / rate as f64;
+                let s = (amp * x.sin()) as f32;
+                samples.extend([s, s]);
+                n += 1;
+            }
+        }
+        AudioBuf {
+            samples,
+            sample_rate: rate,
+            channels: 2,
+        }
+    }
+
+    #[test]
+    fn k_weighting_matches_bs1770_at_48k() {
+        let want = [
+            [
+                1.53512485958697,
+                -2.69169618940638,
+                1.19839281085285,
+                -1.69065929318241,
+                0.73248077421585,
+            ],
+            [1.0, -2.0, 1.0, -1.99004745483398, 0.99007225036621],
+        ];
+        for (f, want) in k_weighting(48_000).iter().zip(want) {
+            let got = [f.b0, f.b1, f.b2, f.a1, f.a2];
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < 1e-9, "{got:?} is not {want:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn loudness_follows_bs1770() {
+        // EBU Tech 3341 cases 1 to 4: steady tones, then quiet and silent stretches the
+        // gates must leave out.
+        let cases: [(&[(f64, f64)], f64); 4] = [
+            (&[(20.0, -23.0)], -23.0),
+            (&[(20.0, -33.0)], -33.0),
+            (&[(10.0, -36.0), (60.0, -23.0), (10.0, -36.0)], -23.0),
+            (
+                &[
+                    (10.0, -72.0),
+                    (10.0, -36.0),
+                    (60.0, -23.0),
+                    (10.0, -36.0),
+                    (10.0, -72.0),
+                ],
+                -23.0,
+            ),
+        ];
+        for rate in [48_000, 44_100] {
+            for (segments, want) in cases {
+                let got = loudness(&tone(rate, segments)).expect("loudness") as f64;
+                assert!(
+                    (got - want).abs() < 0.1,
+                    "{segments:?} at {rate} Hz read {got:.2} LUFS"
+                );
+            }
+        }
+        assert_eq!(loudness(&tone(48_000, &[(5.0, f64::NEG_INFINITY)])), None);
+    }
+
+    #[test]
+    fn analysis_measures_loudness_and_peak() {
+        let a = analyze_buffer(&tone(48_000, &[(3.0, -6.0)]));
+        let lufs = a.loudness.expect("loudness");
+        assert!((lufs + 6.0).abs() < 0.1, "read {lufs} LUFS");
+        assert!(
+            (a.peak - 10f32.powf(-6.0 / 20.0)).abs() < 1e-4,
+            "peak {}",
+            a.peak
+        );
     }
 
     #[test]

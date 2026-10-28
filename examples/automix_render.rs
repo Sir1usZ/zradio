@@ -86,10 +86,20 @@ fn describe(path: &Path, a: &TrackAnalysis) -> String {
         .map(|b| format!("{b:.2}"))
         .unwrap_or_else(|| "--".into());
     let key = a.camelot.map(|c| c.label()).unwrap_or_else(|| "--".into());
+    let lufs = a
+        .loudness
+        .map(|l| format!("{l:.1}"))
+        .unwrap_or_else(|| "--".into());
     format!(
         "{name}\n  {:.1}s  bpm {bpm} ({:.2})  key {key}  energy {:.3}  \
-         first beat {:.3}s  mix in {:.2}s  mix out {:.2}s",
-        a.duration, a.bpm_confidence, a.energy, a.first_beat, a.mix_in, a.mix_out
+         {lufs} LUFS  peak {:.1} dBFS  first beat {:.3}s  mix in {:.2}s  mix out {:.2}s",
+        a.duration,
+        a.bpm_confidence,
+        a.energy,
+        20.0 * a.peak.max(1e-6).log10(),
+        a.first_beat,
+        a.mix_in,
+        a.mix_out
     )
 }
 

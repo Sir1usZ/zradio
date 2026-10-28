@@ -10,7 +10,7 @@ use cpal::{Sample, SampleFormat, Stream, StreamConfig};
 
 use crate::analysis::TrackAnalysis;
 use crate::automix::{
-    at_tempo, cue, fade_secs_for, place, plan_for, plan_pair, Cue, MixStyle, TailBend,
+    at_tempo, cue, fade_secs_for, level_gain, place, plan_for, plan_pair, Cue, MixStyle, TailBend,
     TransitionPlan, PREFETCH_LEAD_SECS, RAMP_MAX_SECS,
 };
 use crate::decode::{decode_file, AudioBuf};
@@ -183,6 +183,8 @@ struct Deck {
     tail: Option<BentTail>,
     /// Playback speed relative to the analysed audio; a remix resamples the buffer.
     tempo: f32,
+    /// Level AutoMix plays the deck at.
+    gain: f32,
 }
 
 /// From `start` on the deck plays `samples`, its source rendered through `map`.
@@ -200,6 +202,7 @@ impl Deck {
             channels: buf.channels.max(1),
             tail: None,
             tempo: 1.0,
+            gain: 1.0,
         }
     }
 
@@ -264,6 +267,17 @@ impl Deck {
         } else {
             [samples[i], samples.get(i + 1).copied().unwrap_or(0.0)]
         }
+    }
+
+    /// The frame at `at` as `mode` plays it: AutoMix levels every deck.
+    fn play_frame(&self, at: usize, mode: MixMode) -> [f32; 2] {
+        let [l, r] = self.frame(at);
+        let gain = if mode == MixMode::AutoMix {
+            self.gain
+        } else {
+            1.0
+        };
+        [l * gain, r * gain]
     }
 }
 
@@ -458,6 +472,24 @@ impl Mixer {
             self.analyses.resize(index + 1, None);
         }
         self.analyses[index] = Some(analysis);
+        let gain = self.level_of(index);
+        let decks = [
+            (self.current_idx, self.current.as_mut()),
+            (self.incoming_idx, self.incoming.as_mut()),
+            (
+                self.armed.as_ref().map(|a| a.index),
+                self.armed.as_mut().map(|a| &mut a.deck),
+            ),
+        ];
+        for (at, deck) in decks {
+            if let (Some(deck), true) = (deck, at == Some(index)) {
+                deck.gain = gain;
+            }
+        }
+    }
+
+    fn level_of(&self, index: usize) -> f32 {
+        level_gain(self.analysis_at(index))
     }
 
     pub fn analysis_at(&self, index: usize) -> Option<&TrackAnalysis> {
@@ -630,6 +662,7 @@ impl Mixer {
 
     fn play_deck(&mut self, index: usize, mut deck: Deck) {
         deck.pos = 0;
+        deck.gain = self.level_of(index);
         self.remember_played(index);
         self.current_idx = Some(index);
         self.incoming_idx = None;
@@ -722,6 +755,7 @@ impl Mixer {
         self.drop_armed();
         let mut incoming = Deck::from_buf(buf);
         incoming.tempo = tempo;
+        incoming.gain = self.level_of(index);
         if !self.mix.uses_fade() || self.current.as_ref().is_none_or(|d| d.remaining() < 2) {
             self.play_deck(index, incoming);
             return;
@@ -1219,7 +1253,7 @@ impl Mixer {
                 return [0.0, 0.0];
             }
         }
-        let frame = deck.frame(deck.pos);
+        let frame = deck.play_frame(deck.pos, self.mix);
         deck.pos += 1;
         if deck.pos >= deck.frames() {
             if self.loop_mode == LoopMode::One {
@@ -1240,12 +1274,12 @@ impl Mixer {
         let a = self
             .current
             .as_ref()
-            .map(|d| d.frame(d.pos))
+            .map(|d| d.play_frame(d.pos, self.mix))
             .unwrap_or([0.0, 0.0]);
         let b = self
             .incoming
             .as_ref()
-            .map(|d| d.frame(d.pos))
+            .map(|d| d.play_frame(d.pos, self.mix))
             .unwrap_or([0.0, 0.0]);
         if let Some(deck) = self.current.as_mut() {
             if deck.pos < deck.frames() {
@@ -1677,6 +1711,31 @@ mod tests {
             mix_out,
             first_beat: mix_in,
             duration,
+            loudness: None,
+            peak: 0.0,
+        }
+    }
+
+    #[test]
+    fn automix_levels_the_deck_even_when_its_analysis_lands_late() {
+        // -6 LUFS with a full-scale peak comes down 8 dB to the -14 LUFS target.
+        let loud = crate::analysis::TrackAnalysis {
+            loudness: Some(-6.0),
+            peak: 1.0,
+            ..analysis_at(0.0, 16.0, 20.0)
+        };
+        let want = 0.5 * 10f32.powf(-8.0 / 20.0);
+        for (mode, gain) in [(MixMode::AutoMix, want), (MixMode::Crossfade, 0.5)] {
+            let mut mixer = Mixer::new(48_000, 2);
+            mixer.set_tracks(two_tracks());
+            mixer.mix = mode;
+            mixer.play_decoded(0, const_deck(48_000, 0.5));
+            mixer.set_analysis(0, loud.clone());
+            let got = mixer.next_stereo()[0];
+            assert!(
+                (got - gain).abs() < 1e-5,
+                "{mode:?} played {got}, not {gain}"
+            );
         }
     }
 

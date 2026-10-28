@@ -286,6 +286,8 @@ mod tests {
             mix_out,
             first_beat,
             duration: secs,
+            loudness: None,
+            peak: 0.0,
         }
     }
 
@@ -373,6 +375,54 @@ mod tests {
                 "the incoming track is not 120 BPM"
             );
         }
+    }
+
+    /// A 1 kHz sine at `amp` with the loudness and peak a stereo sine reads as.
+    fn sine(secs: f32, amp: f32, bpm: f32) -> Side {
+        let samples = (0..(secs * SR as f32) as usize)
+            .flat_map(|f| {
+                let v = amp * (std::f32::consts::TAU * 1000.0 * f as f32 / SR as f32).sin();
+                [v, v]
+            })
+            .collect();
+        let mut analysis = analysis(bpm, 0.0, 0.0, secs - 10.0, secs);
+        analysis.loudness = Some(20.0 * amp.log10());
+        analysis.peak = amp;
+        side(
+            "sine.wav",
+            AudioBuf {
+                samples,
+                sample_rate: SR,
+                channels: 2,
+            },
+            analysis,
+        )
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt()
+    }
+
+    #[test]
+    fn automix_plays_both_tracks_at_the_same_loudness() {
+        // About -2 and -26 LUFS: one has to come down and the other up.
+        let (a, b) = (sine(40.0, 0.8, 120.0), sine(40.0, 0.05, 120.0));
+        let mix = render(a, b, &Options::default()).unwrap();
+        let window = 2 * SR as usize * mix.channels;
+        let start = mix.overlap.start * mix.channels;
+        let end = mix.overlap.end * mix.channels;
+        let before = rms(&mix.samples[start - window..start]);
+        let after = rms(&mix.samples[end..end + window]);
+        let db = |x: f32| 20.0 * x.log10();
+        // -14 LUFS is a 0.2 sine, 0.141 RMS.
+        let target = 0.2 / std::f32::consts::SQRT_2;
+        assert!(
+            (db(before) - db(target)).abs() < 0.2 && (db(after) - db(target)).abs() < 0.2,
+            "{:.1} dB before the mix and {:.1} dB after it, not {:.1}",
+            db(before),
+            db(after),
+            db(target)
+        );
     }
 
     #[test]
