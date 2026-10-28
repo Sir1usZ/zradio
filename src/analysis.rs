@@ -8,9 +8,10 @@ use rustfft::FftPlanner;
 use serde::{Deserialize, Serialize};
 
 use crate::decode::AudioBuf;
+use crate::dsp::{Biquad, CROSSOVER_HZ};
 use crate::storage::write_json_atomic;
 
-const ANALYSIS_VERSION: u32 = 5;
+const ANALYSIS_VERSION: u32 = 6;
 const ENV_HZ: f32 = 50.0;
 const BPM_MIN: f32 = 70.0;
 const BPM_MAX: f32 = 180.0;
@@ -76,7 +77,7 @@ pub struct TrackAnalysis {
     /// Integrated loudness in LUFS (BS.1770); none for silence.
     #[serde(default)]
     pub loudness: Option<f32>,
-    /// Sample peak, 1 at full scale.
+    /// Sample peak as AutoMix plays the track, through its crossover, 1 at full scale.
     #[serde(default)]
     pub peak: f32,
 }
@@ -170,26 +171,6 @@ fn rms_envelope(buf: &AudioBuf, env_hz: f32) -> Vec<f32> {
     out
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct Biquad {
-    b0: f64,
-    b1: f64,
-    b2: f64,
-    a1: f64,
-    a2: f64,
-    z1: f64,
-    z2: f64,
-}
-
-impl Biquad {
-    fn process(&mut self, x: f64) -> f64 {
-        let y = self.b0 * x + self.z1;
-        self.z1 = self.b1 * x - self.a1 * y + self.z2;
-        self.z2 = self.b2 * x - self.a2 * y;
-        y
-    }
-}
-
 /// The BS.1770 K-weighting, a high shelf then a high-pass, designed from its analogue
 /// prototype so it holds at any rate.
 fn k_weighting(sample_rate: u32) -> [Biquad; 2] {
@@ -203,25 +184,21 @@ fn k_weighting(sample_rate: u32) -> [Biquad; 2] {
     let vh = 10f64.powf(gain_db / 20.0);
     let vb = vh.powf(0.499_666_774_154_541_6);
     let a0 = 1.0 + k / q + k * k;
-    let shelf = Biquad {
-        b0: (vh + vb * k / q + k * k) / a0,
-        b1: 2.0 * (k * k - vh) / a0,
-        b2: (vh - vb * k / q + k * k) / a0,
-        a1: 2.0 * (k * k - 1.0) / a0,
-        a2: (1.0 - k / q + k * k) / a0,
-        ..Biquad::default()
-    };
+    let shelf = Biquad::new(
+        [
+            (vh + vb * k / q + k * k) / a0,
+            2.0 * (k * k - vh) / a0,
+            (vh - vb * k / q + k * k) / a0,
+        ],
+        [2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0],
+    );
     let (f0, q) = (38.135_470_876_024_44, 0.500_327_037_323_877_3);
     let k = (std::f64::consts::PI * f0 / fs).tan();
     let a0 = 1.0 + k / q + k * k;
-    let high_pass = Biquad {
-        b0: 1.0,
-        b1: -2.0,
-        b2: 1.0,
-        a1: 2.0 * (k * k - 1.0) / a0,
-        a2: (1.0 - k / q + k * k) / a0,
-        ..Biquad::default()
-    };
+    let high_pass = Biquad::new(
+        [1.0, -2.0, 1.0],
+        [2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0],
+    );
     [shelf, high_pass]
 }
 
@@ -262,8 +239,17 @@ fn loudness(buf: &AudioBuf) -> Option<f32> {
     Some(lufs(gated) as f32)
 }
 
+/// The crossover only turns the phase of the bass, but on a limited master that alone lifts
+/// the peaks by several dB.
 fn peak(buf: &AudioBuf) -> f32 {
-    buf.samples.iter().fold(0.0, |m, s| m.max(s.abs()))
+    let mut sums = [Biquad::crossover_sum(buf.sample_rate, CROSSOVER_HZ); 2];
+    let mut peak = 0.0f64;
+    for i in 0..buf.frames() {
+        for (sum, s) in sums.iter_mut().zip(buf.stereo_at(i)) {
+            peak = peak.max(sum.process(f64::from(s)).abs());
+        }
+    }
+    peak as f32
 }
 
 /// Onset strength: spectral flux at ONSET_HZ, the low, mid and high bands weighted alike.
@@ -1016,12 +1002,20 @@ mod tests {
 
     #[test]
     fn analysis_measures_loudness_and_peak() {
-        let a = analyze_buffer(&tone(48_000, &[(3.0, -6.0)]));
+        let buf = tone(48_000, &[(3.0, -6.0)]);
+        let a = analyze_buffer(&buf);
         let lufs = a.loudness.expect("loudness");
         assert!((lufs + 6.0).abs() < 0.1, "read {lufs} LUFS");
+        // The peak AutoMix's crossover plays, the tone's onset ringing through it included.
+        let mut split = crate::dsp::Crossover::new(48_000, CROSSOVER_HZ);
+        let played = buf
+            .samples
+            .chunks(2)
+            .flat_map(|f| split.split([f[0], f[1]]).sum())
+            .fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(
-            (a.peak - 10f32.powf(-6.0 / 20.0)).abs() < 1e-4,
-            "peak {}",
+            (a.peak - played).abs() < 1e-5 && played > 10f32.powf(-6.0 / 20.0),
+            "peak {} where AutoMix plays {played}",
             a.peak
         );
     }

@@ -92,7 +92,7 @@ fn describe(path: &Path, a: &TrackAnalysis) -> String {
         .unwrap_or_else(|| "--".into());
     format!(
         "{name}\n  {:.1}s  bpm {bpm} ({:.2})  key {key}  energy {:.3}  \
-         {lufs} LUFS  peak {:.1} dBFS  first beat {:.3}s  mix in {:.2}s  mix out {:.2}s",
+         {lufs} LUFS  peak {:+.1} dBFS  first beat {:.3}s  mix in {:.2}s  mix out {:.2}s",
         a.duration,
         a.bpm_confidence,
         a.energy,

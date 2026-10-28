@@ -377,26 +377,31 @@ mod tests {
         }
     }
 
-    /// A 1 kHz sine at `amp` with the loudness and peak a stereo sine reads as.
-    fn sine(secs: f32, amp: f32, bpm: f32) -> Side {
+    /// A stereo `hz` sine at `amp`, mixing out 10 s before its end.
+    fn tone(secs: f32, hz: f32, amp: f32, bpm: f32) -> Side {
         let samples = (0..(secs * SR as f32) as usize)
             .flat_map(|f| {
-                let v = amp * (std::f32::consts::TAU * 1000.0 * f as f32 / SR as f32).sin();
+                let v = amp * (std::f32::consts::TAU * hz * f as f32 / SR as f32).sin();
                 [v, v]
             })
             .collect();
-        let mut analysis = analysis(bpm, 0.0, 0.0, secs - 10.0, secs);
-        analysis.loudness = Some(20.0 * amp.log10());
-        analysis.peak = amp;
         side(
-            "sine.wav",
+            "tone.wav",
             AudioBuf {
                 samples,
                 sample_rate: SR,
                 channels: 2,
             },
-            analysis,
+            analysis(bpm, 0.0, 0.0, secs - 10.0, secs),
         )
+    }
+
+    /// A 1 kHz sine at `amp` with the loudness and peak a stereo sine reads as.
+    fn sine(secs: f32, amp: f32, bpm: f32) -> Side {
+        let mut side = tone(secs, 1000.0, amp, bpm);
+        side.analysis.loudness = Some(20.0 * amp.log10());
+        side.analysis.peak = amp;
+        side
     }
 
     fn rms(samples: &[f32]) -> f32 {
@@ -422,6 +427,37 @@ mod tests {
             db(before),
             db(after),
             db(target)
+        );
+    }
+
+    #[test]
+    fn bass_swap_never_plays_two_bass_lines() {
+        // A 50 Hz bass line on one side and silence on the other, rendered with `t` running
+        // over the overlap: returns the bass left over where `muted` says its low band is off.
+        let leak = |outgoing: bool, muted: fn(f32) -> bool| {
+            let (bass, silence) = (tone(40.0, 50.0, 0.5, 120.0), tone(40.0, 50.0, 0.0, 120.0));
+            let (a, b) = if outgoing {
+                (bass, silence)
+            } else {
+                (silence, bass)
+            };
+            let mix = render(a, b, &Options::default()).unwrap();
+            assert_eq!(mix.plan.expect("a planned mix").style, MixStyle::BassSwap);
+            let len = mix.overlap.len() as f32;
+            let left: Vec<f32> = mix.samples[mix.overlap.start * 2..mix.overlap.end * 2]
+                .chunks(2)
+                .enumerate()
+                .filter(|(at, _)| muted(*at as f32 / len))
+                .map(|(_, f)| f[0])
+                .collect();
+            20.0 * (rms(&left) / (0.5 / std::f32::consts::SQRT_2)).log10()
+        };
+        // The incoming bass waits for the swap and the outgoing bass stops at it.
+        let incoming = leak(false, |t| t < 0.42);
+        let outgoing = leak(true, |t| t > 0.6);
+        assert!(
+            incoming < -30.0 && outgoing < -30.0,
+            "bass leaks through the high band: incoming {incoming:.1} dB, outgoing {outgoing:.1} dB"
         );
     }
 

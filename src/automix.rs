@@ -75,21 +75,18 @@ pub fn select_style(
 
 /// Loudness AutoMix plays every track at, so neither side of a mix jumps out.
 const TARGET_LUFS: f32 = -14.0;
-/// Highest sample peak a track may be raised to, in dBFS.
+/// Highest sample peak AutoMix plays a track at, in dBFS.
 const PEAK_CEILING_DB: f32 = -1.0;
 
-/// Gain that brings a track to `TARGET_LUFS`, raising a quiet one only as far as its peak
-/// stays under `PEAK_CEILING_DB`. Tracks never measured play as they are.
+/// Gain that brings a track to `TARGET_LUFS`, or as close as its peak allows under
+/// `PEAK_CEILING_DB`: the crossover can lift a master's peaks past full scale, so even a
+/// quiet one may have to come down. Tracks never measured play as they are.
 pub fn level_gain(a: Option<&TrackAnalysis>) -> f32 {
     let Some((lufs, peak)) = a.and_then(|a| a.loudness.map(|l| (l, a.peak))) else {
         return 1.0;
     };
-    let mut db = TARGET_LUFS - lufs;
-    if db > 0.0 {
-        let headroom = PEAK_CEILING_DB - 20.0 * peak.max(1e-6).log10();
-        db = db.min(headroom.max(0.0));
-    }
-    10f32.powf(db / 20.0)
+    let headroom = PEAK_CEILING_DB - 20.0 * peak.max(1e-6).log10();
+    10f32.powf((TARGET_LUFS - lufs).min(headroom) / 20.0)
 }
 
 pub fn beat_seconds(bpm: f32) -> f32 {
@@ -467,8 +464,9 @@ mod tests {
         assert!((db(level_gain(Some(&at(-20.0, -10.0)))) - 6.0).abs() < 1e-3);
         // A quiet track whose peak is near full scale only goes up to the ceiling...
         assert!((db(level_gain(Some(&at(-20.0, -4.0)))) - 3.0).abs() < 1e-3);
-        // ...and is never turned down for being quiet.
-        assert_eq!(level_gain(Some(&at(-20.0, 0.0))), 1.0);
+        // ...and one whose peak would pass it comes down, loud or quiet.
+        assert!((db(level_gain(Some(&at(-20.0, 2.0)))) + 3.0).abs() < 1e-3);
+        assert!((db(level_gain(Some(&at(-10.0, 6.0)))) + 7.0).abs() < 1e-3);
         // Unmeasured tracks play as they are.
         assert_eq!(level_gain(None), 1.0);
         assert_eq!(
