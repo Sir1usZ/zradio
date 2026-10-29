@@ -174,16 +174,25 @@ fn handle_connection(
     let path = parts[1];
 
     let mut content_length: usize = 0;
+    let mut host = None;
+    let mut origin = None;
     loop {
         let Some(line) = read_head_line(&mut buf_reader, &mut budget)? else {
             return send_json(&mut stream, 431, &err("request head too large"));
         };
-        let trimmed = line.trim().to_lowercase();
+        let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
         }
-        if let Some(val) = trimmed.strip_prefix("content-length:") {
-            content_length = val.trim().parse().unwrap_or(0);
+        let Some((name, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-length" => content_length = value.parse().unwrap_or(0),
+            "host" => host = Some(value.to_string()),
+            "origin" => origin = Some(value.to_string()),
+            _ => {}
         }
     }
 
@@ -199,8 +208,16 @@ fn handle_connection(
         String::new()
     };
 
+    if !origin_allowed(origin.as_deref(), host.as_deref()) {
+        return send_json(
+            &mut stream,
+            403,
+            &err("cross-origin requests are not allowed"),
+        );
+    }
+
     if method == "OPTIONS" {
-        return send_cors_preflight(&mut stream);
+        return send_options(&mut stream);
     }
 
     if method == "GET" && path.starts_with("/cover/") {
@@ -212,6 +229,22 @@ fn handle_connection(
 
     let response = route(method, path, &body, tx, state);
     send_json(&mut stream, 200, &response)
+}
+
+/// 浏览器给跨站请求带 `Origin`。只放行和 `Host` 同源的页面，
+/// 这样别的网站既读不到资料库，也不能用表单 POST 控制播放。
+/// curl、MCP 这类非浏览器客户端不带 `Origin`，照常放行。
+fn origin_allowed(origin: Option<&str>, host: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    let authority = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"));
+    match (authority, host) {
+        (Some(authority), Some(host)) => authority.eq_ignore_ascii_case(host),
+        _ => false,
+    }
 }
 
 fn route(
@@ -892,6 +925,7 @@ fn http_status_text(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
@@ -905,9 +939,6 @@ fn send_bytes(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> s
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: {mime}\r\n\
          Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
          Connection: close\r\n\r\n",
         body.len()
     );
@@ -923,9 +954,6 @@ fn send_json(stream: &mut TcpStream, status: u16, body: &serde_json::Value) -> s
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: application/json; charset=utf-8\r\n\
          Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
          Connection: close\r\n\r\n",
         json.len()
     );
@@ -934,11 +962,9 @@ fn send_json(stream: &mut TcpStream, status: u16, body: &serde_json::Value) -> s
     Ok(())
 }
 
-fn send_cors_preflight(stream: &mut TcpStream) -> std::io::Result<()> {
+fn send_options(stream: &mut TcpStream) -> std::io::Result<()> {
     let header = "HTTP/1.1 204 No Content\r\n\
-                  Access-Control-Allow-Origin: *\r\n\
-                  Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-                  Access-Control-Allow-Headers: Content-Type\r\n\
+                  Allow: GET, POST, OPTIONS\r\n\
                   Content-Length: 0\r\n\
                   Connection: close\r\n\r\n";
     stream.write_all(header.as_bytes())
@@ -999,13 +1025,18 @@ mod tests {
     }
 
     fn serve_once(req: &[u8]) -> String {
+        serve_queued(req).0
+    }
+
+    /// 处理一个请求，返回响应和它排进控制队列的命令。
+    fn serve_queued(req: &[u8]) -> (String, Vec<ControlCmd>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
             let _ = handle_connection(stream, &tx, &new_shared_state());
-            drop(rx);
+            rx.try_iter().collect::<Vec<_>>()
         });
         let mut client = TcpStream::connect(addr).unwrap();
         client
@@ -1014,8 +1045,67 @@ mod tests {
         client.write_all(req).unwrap();
         let mut resp = String::new();
         let _ = client.read_to_string(&mut resp);
-        server.join().unwrap();
-        resp
+        let queued = server.join().unwrap();
+        (resp, queued)
+    }
+
+    fn post_next(headers: &str) -> String {
+        let body = r#"{"action":"next"}"#;
+        format!(
+            "POST /control HTTP/1.1\r\n{headers}Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn cross_origin_pages_can_neither_read_nor_control() {
+        let (resp, queued) =
+            serve_queued(b"GET /library/full HTTP/1.1\r\nHost: localhost:18765\r\nOrigin: https://evil.example\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 403 "), "got {resp:?}");
+        assert!(!resp.contains("tracks"), "got {resp:?}");
+        assert!(queued.is_empty());
+
+        let req = post_next("Host: 127.0.0.1:18765\r\nOrigin: http://evil.example\r\n");
+        let (resp, queued) = serve_queued(req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 403 "), "got {resp:?}");
+        assert!(
+            queued.is_empty(),
+            "a cross-site form post must not queue {queued:?}"
+        );
+
+        let req = post_next("Host: 127.0.0.1:18765\r\nOrigin: null\r\n");
+        let (resp, queued) = serve_queued(req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 403 "), "got {resp:?}");
+        assert!(queued.is_empty());
+
+        let resp = serve_once(
+            b"OPTIONS /control HTTP/1.1\r\nHost: localhost:18765\r\nOrigin: https://evil.example\r\nAccess-Control-Request-Method: POST\r\n\r\n",
+        );
+        assert!(
+            !resp
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "got {resp:?}"
+        );
+    }
+
+    #[test]
+    fn same_origin_and_non_browser_clients_still_work() {
+        let req = post_next("Host: localhost:18765\r\nOrigin: http://localhost:18765\r\n");
+        let (resp, queued) = serve_queued(req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 200 "), "got {resp:?}");
+        assert!(matches!(queued[..], [ControlCmd::Next]), "got {queued:?}");
+
+        let req = post_next("Host: 127.0.0.1:18765\r\n");
+        let (resp, queued) = serve_queued(req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 200 "), "got {resp:?}");
+        assert!(matches!(queued[..], [ControlCmd::Next]), "got {queued:?}");
+        assert!(
+            !resp
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "got {resp:?}"
+        );
     }
 
     #[test]
