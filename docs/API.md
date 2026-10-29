@@ -1,6 +1,6 @@
 # ZRadio Remote Control API
 
-HTTP JSON API，用于远程控制 ZRadio 播放器。监听 `0.0.0.0:18765`，支持 CORS。除 `GET /cover/:index` 返回图片字节外，其余响应都是 JSON。
+HTTP JSON API，用于远程控制 ZRadio 播放器。默认只监听本机 `127.0.0.1:18765`，在设置里打开「局域网遥控」后监听 `0.0.0.0:18765`。除 `GET /cover/:index` 返回图片字节外，其余响应都是 JSON。
 
 ## 快速开始
 
@@ -26,10 +26,27 @@ curl -s http://localhost:18765/cover/3 -o cover.jpg
 
 ## 基础信息
 
-- **地址:** `http://<host>:18765`
+- **地址:** 本机 `http://localhost:18765`；开了局域网遥控后也可以用 `http://<本机局域网 IP>:18765`
 - **协议:** HTTP/1.1。默认 JSON；`GET /cover/:index` 成功时是图片字节
-- **CORS:** `Access-Control-Allow-Origin: *`
-- **认证:** 无（仅限本地/可信网络）
+- **跨域:** 不发 CORS 头。带 `Origin` 且和 `Host` 不同源的请求返回 `403`，别的网站既读不到资料库，也不能用表单 POST 控制播放
+- **认证:** 见下节
+
+## 访问控制
+
+| 请求来自 | 需要 token |
+|---|---|
+| 本机，`Host` 是 `localhost` / `*.localhost` / `127.x.x.x` / `[::1]`（curl、MCP、本机脚本） | 不需要 |
+| 本机，但 `Host` 是别的名字（例如 DNS rebinding 的网页） | 需要 |
+| 局域网里的其他设备（要先打开局域网遥控） | 需要 |
+
+需要 token 时带上 `Authorization: Bearer <token>`，没带或不对返回 `401`。
+
+token 在第一次打开局域网遥控时生成，存在 `~/.config/zradio/api-token`（有 `XDG_CONFIG_HOME` 时是 `$XDG_CONFIG_HOME/zradio/api-token`），文件权限 `0600`，ZRadio 不会把它打印出来。也可以自己往这个文件里写一个，删掉它再打开局域网遥控会重新生成。
+
+```bash
+# 在另一台设备上（先把 token 复制过去）
+curl -s -H "Authorization: Bearer $TOKEN" http://192.168.1.5:18765/status | jq
+```
 
 ## 响应格式
 
