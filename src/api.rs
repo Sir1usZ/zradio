@@ -278,9 +278,10 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     file.write_all(contents.as_bytes())
 }
 
-/// 本机来的请求直接放行；别的机器必须带 `Authorization: Bearer <token>`。
-fn authorized(peer: IpAddr, bearer: Option<&str>, token: Option<&str>) -> bool {
-    if peer.to_canonical().is_loopback() {
+/// 本机来、且 `Host` 也是本机名字的请求直接放行；其余必须带 `Authorization: Bearer <token>`。
+/// 只看连接来源不够：DNS rebinding 能让别的网站的页面从本机连进来，那时 `Host` 是它的域名。
+fn authorized(peer: IpAddr, host: Option<&str>, bearer: Option<&str>, token: Option<&str>) -> bool {
+    if peer.to_canonical().is_loopback() && host.is_none_or(host_is_loopback) {
         return true;
     }
     match (bearer, token) {
@@ -289,6 +290,19 @@ fn authorized(peer: IpAddr, bearer: Option<&str>, token: Option<&str>) -> bool {
         }
         _ => false,
     }
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name == "localhost"
+        || name.ends_with(".localhost")
+        || name
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -364,7 +378,7 @@ fn handle_connection(
     };
 
     let bearer = authorization.as_deref().and_then(bearer_token);
-    if !authorized(peer, bearer, token) {
+    if !authorized(peer, host.as_deref(), bearer, token) {
         return send_json(&mut stream, 401, &err("missing or wrong API token"));
     }
 
@@ -1305,6 +1319,41 @@ mod tests {
             assert!(resp.starts_with("HTTP/1.1 200 "), "{peer} got {resp:?}");
             assert!(matches!(queued[..], [ControlCmd::Next]), "got {queued:?}");
         }
+    }
+
+    #[test]
+    fn dns_rebinding_pages_are_treated_as_remote() {
+        let me = IpAddr::from(Ipv4Addr::LOCALHOST);
+        // evil.example 的 DNS 被换成 127.0.0.1：连接来自本机，Host 和 Origin 却是攻击者的域名
+        let req = b"GET /library/full HTTP/1.1\r\nHost: evil.example:18765\r\nOrigin: http://evil.example:18765\r\n\r\n";
+        for token in [Some("s3cret"), None] {
+            let (resp, _) = serve_from(me, token, req);
+            assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+            assert!(!resp.contains("tracks"), "got {resp:?}");
+        }
+        let req = post_next("Host: evil.example:18765\r\nOrigin: http://evil.example:18765\r\n");
+        let (resp, queued) = serve_from(me, None, req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+        assert!(queued.is_empty(), "queued {queued:?}");
+
+        for host in [
+            "localhost:18765",
+            "LOCALHOST",
+            "localhost.:18765",
+            "zradio.localhost:18765",
+            "127.0.0.1:18765",
+            "127.0.0.2",
+            "[::1]:18765",
+        ] {
+            let req = format!("GET /health HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            let (resp, _) = serve_from(me, None, req.as_bytes());
+            assert!(resp.starts_with("HTTP/1.1 200 "), "{host} got {resp:?}");
+        }
+
+        let req =
+            b"GET /health HTTP/1.1\r\nHost: myhost:18765\r\nAuthorization: Bearer s3cret\r\n\r\n";
+        let (resp, _) = serve_from(me, Some("s3cret"), req);
+        assert!(resp.starts_with("HTTP/1.1 200 "), "got {resp:?}");
     }
 
     #[test]
