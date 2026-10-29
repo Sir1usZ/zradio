@@ -29,6 +29,8 @@ cargo build --release
 
 Optional argument: a library directory.
 
+`cargo build --release --no-default-features` leaves out [Beat This!](#beat-this); the binary drops from about 40 MB to 10 MB.
+
 ## Keys
 
 | Key | Action |
@@ -60,7 +62,7 @@ Optional argument: a library directory.
 
 Playlists live in `~/.local/share/zradio/playlists.json`. Slot `1` is the whole library; slots `2`–`9` are user lists. The music tab shows the current list only; `p` slides a 9-slot picker up from the bottom. The current list is the play range for `n` / shuffle / loop. Missing files stay in the JSON, render gray, and are skipped.
 
-Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume.
+Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume, [Beat This!](#beat-this).
 
 Missing tags / covers / lyrics fill from iTunes + lrclib, then Netease, QQ, and Kugou. Existing fields are kept. Lyrics land in a sidecar `lrc/` file; audio files are not rewritten. SPlayer is only for `?` search/download.
 
@@ -78,7 +80,15 @@ Render transitions offline through the same mixer:
 cargo run --release --example automix_render -- -o /tmp/mix a.flac b.flac c.flac
 ```
 
-Each neighbouring pair becomes `NN.wav`: 12 s before the overlap, the overlap, then 6 s after. The log line gives the style, bend, fade, score, peak, and clipped samples. `--analyze` prints the analysis only. `--skip SECS` mixes as a skip at that point. `--mode fade|cut`, `--before`, `--after` and `--rate` are also accepted.
+Each neighbouring pair becomes `NN.wav`: 12 s before the overlap, the overlap, then 6 s after. The log line gives the style, bend, fade, score, peak, and clipped samples. `--analyze` prints the analysis only. `--skip SECS` mixes as a skip at that point. `--mode fade|cut`, `--before`, `--after` and `--rate` are also accepted. `--beat-this path/to/beat_this.onnx` mixes on the model's grid.
+
+### Beat This!
+
+Off by default. Turning it on in settings fetches the [Beat This!](https://github.com/CPJKU/beat_this) beat and downbeat model (Foscarin, Schlüter and Widmer, ISMIR 2024; MIT): 83 MB, the ONNX export in [beat_this_cpp](https://github.com/mosynthkey/beat_this_cpp) (MIT), pinned to a commit and checked against its sha256, into `~/.local/share/zradio/models/`. Nothing but the request for that file leaves the machine.
+
+While it is on, the track playing and the one predicted next are scored on one background thread, 15 to 25 s of CPU and up to 340 MB of memory a track. The model's grid replaces the onset tracker's tempo and beat phase and adds the bar line, so the incoming track mixes in on the first bar its music is heard on. A rescored track reaches the mixer only between mixes, never under one already planned. A track the model hears no steady grid in keeps its own. Turned off, tracks go back to the onset grid as they play.
+
+On 40 library tracks, the model held a steady grid in 35. On 27 of those it heard the onset tracker's tempo, and put the bar line elsewhere on 9 of the 27; on 7 it heard twice or half the tempo, on 1 three halves.
 
 ## Visualize
 
