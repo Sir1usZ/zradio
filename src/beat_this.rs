@@ -18,8 +18,9 @@ const F_MIN: f64 = 30.0;
 const F_MAX: f64 = 11_000.0;
 const LOG_MULTIPLIER: f32 = 1000.0;
 
-/// Frames the model scores at once: 30 s, the excerpt length it was trained on.
-pub const CHUNK_FRAMES: usize = 1500;
+/// Frames the model scores at once: 15 s. It was trained on 30 s excerpts, but scoring those
+/// takes 740 MB of memory against 280 MB, for the same tempo and bar line on nearly every track.
+pub const CHUNK_FRAMES: usize = 750;
 /// Frames at either edge of a chunk the model was not trained to score; neighbouring chunks
 /// overlap by this much and each keeps only its inner frames.
 const BORDER_FRAMES: usize = 6;
