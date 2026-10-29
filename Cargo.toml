@@ -22,9 +22,11 @@ symphonia = { version = "0.5", features = ["all"] }
 tract-onnx = { version = "0.23", default-features = false, optional = true }
 
 [features]
-default = ["beat-this"]
+default = ["beat-this", "stems"]
 # Runs the Beat This! beat and downbeat model when the user turns it on.
 beat-this = ["dep:tract-onnx", "dep:sha2"]
+# Separates vocals with htdemucs when the user turns it on; shares Beat This!'s runtime.
+stems = ["beat-this"]
 
 [lib]
 name = "zradio"
