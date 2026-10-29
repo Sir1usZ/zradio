@@ -127,6 +127,129 @@ pub fn pick(beat: &[f32], downbeat: &[f32]) -> Beats {
     Beats { beats, downbeats }
 }
 
+/// A steady tempo through a track's beats.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Grid {
+    pub bpm: f64,
+    /// A beat line within the first bar; the first downbeat when `bar_known`.
+    pub first: f64,
+    /// Whether the downbeats agree on which beat starts the bar, counting four to a bar.
+    pub bar_known: bool,
+}
+
+/// How far a beat may sit from its grid line and still be on it: Beat This!'s own 70 ms.
+const ON_LINE_SECS: f64 = 0.07;
+const GRID_BPM_MIN: f64 = 40.0;
+const GRID_BPM_MAX: f64 = 240.0;
+/// Beats a grid needs before it is believed, and the share of them that must be on it.
+const GRID_MIN_BEATS: usize = 16;
+const GRID_ON_LINE: f64 = 0.8;
+/// Share of the downbeats that must start the bar on the same beat line.
+const BAR_AGREEMENT: f64 = 0.6;
+/// A grid at half or a third of the tempo holds the beats when they line up on it nearly
+/// as well as on the best.
+const SLOWER_HOLDS: f64 = 0.9;
+
+impl Beats {
+    /// The steady grid through the beats, or none when too few of them keep to one.
+    ///
+    /// The tempo is the one the beats line up on best, searched in steps that move the far
+    /// end of the track by a sixteenth of a beat, then the slowest
+    /// tempo at a half or a third of it that holds them about as well: the model keeps to
+    /// half time on some tracks and to the full beat on others, and on a track where it
+    /// switches only the full beat holds both. A least squares fit through the beats on
+    /// it settles the tempo and phase.
+    pub fn grid(&self) -> Option<Grid> {
+        let b = &self.beats;
+        let (&start, &end) = (b.first()?, b.last()?);
+        let span = end - start;
+        if b.len() < GRID_MIN_BEATS || span <= 0.0 {
+            return None;
+        }
+        // The beats as phasors at `bpm`: their mean has length 1 when every beat is on a
+        // line, and its angle is where the lines fall.
+        let phasor = |bpm: f64| {
+            let w = std::f64::consts::TAU * bpm / 60.0;
+            let (s, c) = b.iter().fold((0.0, 0.0), |(s, c), &t| {
+                let (ps, pc) = (w * (t - start)).sin_cos();
+                (s + ps, c + pc)
+            });
+            (s.hypot(c) / b.len() as f64, s.atan2(c))
+        };
+        let step = 60.0 / (16.0 * span);
+        let candidates = ((GRID_BPM_MAX - GRID_BPM_MIN) / step).ceil() as usize;
+        let (mut bpm, best) = (0..=candidates)
+            .map(|i| GRID_BPM_MIN + i as f64 * step)
+            .map(|bpm| (bpm, phasor(bpm).0))
+            .fold((GRID_BPM_MIN, 0.0), |a, c| if c.1 > a.1 { c } else { a });
+        while let Some(slower) = [2.0, 3.0]
+            .into_iter()
+            .map(|k| bpm / k)
+            .filter(|&s| s >= GRID_BPM_MIN)
+            .find(|&s| phasor(s).0 >= SLOWER_HOLDS * best)
+        {
+            bpm = slower;
+        }
+        let mut period = 60.0 / bpm;
+        let mut offset = start + phasor(bpm).1 / std::f64::consts::TAU * period;
+        let line = |t: f64, offset: f64, period: f64| {
+            let k = ((t - offset) / period).round();
+            (k, t - (offset + k * period))
+        };
+        for _ in 0..2 {
+            let on: Vec<(f64, f64)> = b
+                .iter()
+                .map(|&t| (line(t, offset, period), t))
+                .filter(|&((_, res), _)| res.abs() <= ON_LINE_SECS)
+                .map(|((k, _), t)| (k, t))
+                .collect();
+            if on.len() < 2 {
+                return None;
+            }
+            let n = on.len() as f64;
+            let (sk, st) = on.iter().fold((0.0, 0.0), |(a, b), &(k, t)| (a + k, b + t));
+            let (mk, mt) = (sk / n, st / n);
+            let (skk, skt) = on.iter().fold((0.0, 0.0), |(a, b), &(k, t)| {
+                (a + (k - mk) * (k - mk), b + (k - mk) * (t - mt))
+            });
+            if skk <= 0.0 {
+                return None;
+            }
+            period = skt / skk;
+            offset = mt - period * mk;
+        }
+        let on_line = b
+            .iter()
+            .filter(|&&t| line(t, offset, period).1.abs() <= ON_LINE_SECS)
+            .count();
+        if (on_line as f64) < GRID_ON_LINE * b.len() as f64 {
+            return None;
+        }
+        let mut votes = [0usize; 4];
+        for &d in &self.downbeats {
+            let (k, res) = line(d, offset, period);
+            if res.abs() <= ON_LINE_SECS {
+                votes[(k as i64).rem_euclid(4) as usize] += 1;
+            }
+        }
+        let (phase, top) = (0..4).fold(
+            (0, 0),
+            |a, i| if votes[i] > a.1 { (i, votes[i]) } else { a },
+        );
+        let bar_known = top >= 4 && top as f64 >= BAR_AGREEMENT * self.downbeats.len() as f64;
+        let first = if bar_known {
+            (offset + phase as f64 * period).rem_euclid(4.0 * period)
+        } else {
+            offset.rem_euclid(period)
+        };
+        Some(Grid {
+            bpm: 60.0 / period,
+            first,
+            bar_known,
+        })
+    }
+}
+
 /// The Beat This! network, loaded from its ONNX export.
 #[cfg(feature = "beat-this")]
 pub struct Model {
@@ -527,6 +650,148 @@ mod tests {
         let picked = pick(&[-1.0; 10], &downbeat);
         assert!(picked.beats.is_empty());
         assert_eq!(picked.downbeats, [0.08]);
+    }
+
+    /// Times as the model reports them, on its 50 fps frame grid.
+    fn on_frames(times: impl IntoIterator<Item = f64>) -> Vec<f64> {
+        times.into_iter().map(|t| (t * FPS).round() / FPS).collect()
+    }
+
+    fn steady(bpm: f64, from: f64, to: f64) -> Vec<f64> {
+        let beat = 60.0 / bpm;
+        (0..)
+            .map(|k| from + k as f64 * beat)
+            .take_while(|&t| t < to)
+            .collect()
+    }
+
+    #[test]
+    fn the_grid_runs_through_the_beats_and_starts_the_bar_on_the_downbeats() {
+        // Tempos the search steps past, on frames 20 ms apart; the five-minute one has a
+        // beatless breakdown and a few strays off the beat.
+        for (bpm, first, secs) in [
+            (87.3, 0.11, 150.0),
+            (104.9, 0.52, 150.0),
+            (123.4, 0.37, 300.0),
+            (133.1, 0.05, 150.0),
+            (171.7, 0.3, 150.0),
+        ] {
+            let beat = 60.0 / bpm;
+            let index = |t: f64| ((t - first) / beat).round() as i64;
+            let lines: Vec<f64> = steady(bpm, first, secs)
+                .into_iter()
+                .filter(|t| secs < 300.0 || !(100.0..120.0).contains(t))
+                .collect();
+            let strays = if secs < 300.0 {
+                vec![]
+            } else {
+                vec![10.1, 55.3, 200.2]
+            };
+            let mut beats = on_frames(lines.iter().copied().chain(strays));
+            beats.sort_by(f64::total_cmp);
+            // The bar starts on the second beat line.
+            let downbeats = on_frames(
+                lines
+                    .iter()
+                    .copied()
+                    .filter(|&t| index(t).rem_euclid(4) == 1),
+            );
+            let grid = Beats { beats, downbeats }.grid().expect("grid");
+            assert!(grid.bar_known, "{bpm}");
+            assert!(
+                (grid.first - (first + beat)).abs() < 0.005,
+                "{bpm}: first downbeat at {}",
+                grid.first
+            );
+            let step = 60.0 / grid.bpm;
+            let worst = steady(bpm, first, secs)
+                .into_iter()
+                .map(|t| (t - (grid.first + ((t - grid.first) / step).round() * step)).abs())
+                .fold(0.0, f64::max);
+            assert!(worst < 0.0015, "{bpm}: a beat is {:.1} ms off", worst * 1e3);
+        }
+    }
+
+    #[test]
+    fn the_grid_keeps_the_slowest_beat_the_model_holds_to_throughout() {
+        let slow = Beats {
+            beats: on_frames(steady(70.0, 0.5, 200.0)),
+            downbeats: Vec::new(),
+        };
+        let grid = slow.grid().expect("grid");
+        assert!((grid.bpm - 70.0).abs() < 0.01, "{}", grid.bpm);
+        assert!(!grid.bar_known);
+        // A fill the model hears on the off-beats, or in triplets, lines up best on a
+        // faster grid; the beat is still the slow one.
+        for between in [0.5, 1.0 / 3.0] {
+            let beat = 60.0 / 70.0;
+            let mut beats = steady(70.0, 0.5, 200.0);
+            beats.extend((100..108).map(|k| 0.5 + (k as f64 + between) * beat));
+            beats.sort_by(f64::total_cmp);
+            let grid = Beats {
+                beats: on_frames(beats),
+                downbeats: Vec::new(),
+            }
+            .grid()
+            .expect("grid");
+            assert!(
+                (grid.bpm - 70.0).abs() < 0.01,
+                "fill {between} of a beat late: {}",
+                grid.bpm
+            );
+        }
+        // Half time for a minute, then the full beat: only the full beat holds them all.
+        let switching = steady(150.0, 0.5, 200.0)
+            .into_iter()
+            .enumerate()
+            .filter(|&(k, t)| t >= 60.0 || k % 2 == 0)
+            .map(|(_, t)| t);
+        let grid = Beats {
+            beats: on_frames(switching),
+            downbeats: Vec::new(),
+        }
+        .grid()
+        .expect("grid");
+        assert!((grid.bpm - 150.0).abs() < 0.01, "{}", grid.bpm);
+    }
+
+    #[test]
+    fn beats_that_keep_no_tempo_give_no_grid() {
+        let mut seed = 0x2545_f491_u64;
+        let mut t = 0.0;
+        let wandering: Vec<f64> = (0..300)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                t += 0.3 + 0.6 * (seed % 1000) as f64 / 1000.0;
+                t
+            })
+            .collect();
+        let none = |beats: Vec<f64>| {
+            Beats {
+                beats: on_frames(beats),
+                downbeats: Vec::new(),
+            }
+            .grid()
+        };
+        assert_eq!(none(wandering), None);
+        assert_eq!(none(steady(120.0, 0.0, 4.0)), None, "too few beats to tell");
+    }
+
+    #[test]
+    fn downbeats_that_disagree_leave_the_bar_unknown() {
+        let beats = on_frames(steady(120.0, 0.2, 200.0));
+        // Each bar starts a beat later than the one before.
+        let downbeats = on_frames((0..100).map(|bar| 0.2 + (4 * bar + bar % 4) as f64 * 0.5));
+        let grid = Beats { beats, downbeats }.grid().expect("grid");
+        assert!(!grid.bar_known);
+        assert!((grid.bpm - 120.0).abs() < 0.01, "{}", grid.bpm);
+        assert!(
+            (grid.first - 0.2).abs() < 0.005,
+            "first beat at {}",
+            grid.first
+        );
     }
 
     /// 120 BPM kicks from 0.3 s, every fourth one louder and brighter.
