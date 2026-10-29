@@ -1969,7 +1969,11 @@ impl App {
                 self.prefs.save();
                 self.api_server.set_lan(self.prefs.api_lan);
                 self.status = if self.prefs.api_lan {
-                    format!("API 对局域网开放 :{}", api::PORT)
+                    format!(
+                        "API 对局域网开放 :{}，token 在 {}",
+                        api::PORT,
+                        api::token_path().display()
+                    )
                 } else {
                     format!("API 只听本机 127.0.0.1:{}", api::PORT)
                 };

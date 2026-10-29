@@ -218,12 +218,16 @@ impl Prefs {
     }
 }
 
-fn prefs_path() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("zradio").join("prefs.json")
+    base.join("zradio")
+}
+
+fn prefs_path() -> PathBuf {
+    config_dir().join("prefs.json")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

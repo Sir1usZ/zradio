@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -156,13 +156,19 @@ impl ApiServer {
 }
 
 pub fn start(lan: bool, tx: Sender<ControlCmd>, state: SharedState) -> ApiServer {
-    start_on(PORT, lan, tx, state)
+    start_on(PORT, lan, token_path(), tx, state)
 }
 
-fn start_on(port: u16, lan: bool, tx: Sender<ControlCmd>, state: SharedState) -> ApiServer {
+fn start_on(
+    port: u16,
+    lan: bool,
+    token_path: PathBuf,
+    tx: Sender<ControlCmd>,
+    state: SharedState,
+) -> ApiServer {
     let lan = Arc::new(AtomicBool::new(lan));
     let flag = Arc::clone(&lan);
-    let handle = thread::spawn(move || serve(port, &flag, &tx, &state));
+    let handle = thread::spawn(move || serve(port, &flag, &token_path, &tx, &state));
     ApiServer {
         port,
         lan,
@@ -179,7 +185,13 @@ fn listen_addr(lan: bool, port: u16) -> SocketAddr {
     SocketAddr::from((ip, port))
 }
 
-fn serve(port: u16, lan: &AtomicBool, tx: &Sender<ControlCmd>, state: &SharedState) {
+fn serve(
+    port: u16,
+    lan: &AtomicBool,
+    token_path: &Path,
+    tx: &Sender<ControlCmd>,
+    state: &SharedState,
+) {
     loop {
         let want = lan.load(Ordering::SeqCst);
         let addr = listen_addr(want, port);
@@ -194,14 +206,23 @@ fn serve(port: u16, lan: &AtomicBool, tx: &Sender<ControlCmd>, state: &SharedSta
             }
         };
         eprintln!("[api] 远程控制监听 {addr}");
+        let token: Option<Arc<str>> = load_token(token_path, want).map(Arc::from);
+        if want && token.is_none() {
+            eprintln!("[api] 没有可用的 token，局域网请求会被拒绝");
+        }
         for stream in listener.incoming().flatten() {
             if lan.load(Ordering::SeqCst) != want {
                 break;
             }
+            let Ok(peer) = stream.peer_addr() else {
+                continue;
+            };
             let tx = tx.clone();
             let state = Arc::clone(state);
+            let token = token.clone();
             thread::spawn(move || {
-                if let Err(e) = handle_connection(stream, &tx, &state) {
+                if let Err(e) = handle_connection(stream, peer.ip(), token.as_deref(), &tx, &state)
+                {
                     eprintln!("[api] 连接错误: {e}");
                 }
             });
@@ -209,8 +230,83 @@ fn serve(port: u16, lan: &AtomicBool, tx: &Sender<ControlCmd>, state: &SharedSta
     }
 }
 
+/// 局域网客户端要带的 token 存在这里，权限 0600。
+pub fn token_path() -> PathBuf {
+    crate::prefs::config_dir().join("api-token")
+}
+
+/// 读出 token；文件不存在或为空且 `create` 时生成一个新的写进去。
+fn load_token(path: &Path, create: bool) -> Option<String> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let existing = existing.trim();
+    if !existing.is_empty() {
+        return Some(existing.to_string());
+    }
+    if !create {
+        return None;
+    }
+    let token = random_token()?;
+    match write_private(path, &format!("{token}\n")) {
+        Ok(()) => Some(token),
+        Err(e) => {
+            eprintln!("[api] 写 {} 失败: {e}", path.display());
+            None
+        }
+    }
+}
+
+fn random_token() -> Option<String> {
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    // 文件已存在时 mode() 不生效，先收紧权限再写内容
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    file.write_all(contents.as_bytes())
+}
+
+/// 本机来的请求直接放行；别的机器必须带 `Authorization: Bearer <token>`。
+fn authorized(peer: IpAddr, bearer: Option<&str>, token: Option<&str>) -> bool {
+    if peer.to_canonical().is_loopback() {
+        return true;
+    }
+    match (bearer, token) {
+        (Some(bearer), Some(token)) if !token.is_empty() => {
+            constant_time_eq(bearer.as_bytes(), token.as_bytes())
+        }
+        _ => false,
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn bearer_token(authorization: &str) -> Option<&str> {
+    let (scheme, token) = authorization.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim())
+        .filter(|t| !t.is_empty())
+}
+
 fn handle_connection(
     mut stream: TcpStream,
+    peer: IpAddr,
+    token: Option<&str>,
     tx: &Sender<ControlCmd>,
     state: &SharedState,
 ) -> std::io::Result<()> {
@@ -233,6 +329,7 @@ fn handle_connection(
     let mut content_length: usize = 0;
     let mut host = None;
     let mut origin = None;
+    let mut authorization = None;
     loop {
         let Some(line) = read_head_line(&mut buf_reader, &mut budget)? else {
             return send_json(&mut stream, 431, &err("request head too large"));
@@ -249,6 +346,7 @@ fn handle_connection(
             "content-length" => content_length = value.parse().unwrap_or(0),
             "host" => host = Some(value.to_string()),
             "origin" => origin = Some(value.to_string()),
+            "authorization" => authorization = Some(value.to_string()),
             _ => {}
         }
     }
@@ -264,6 +362,11 @@ fn handle_connection(
     } else {
         String::new()
     };
+
+    let bearer = authorization.as_deref().and_then(bearer_token);
+    if !authorized(peer, bearer, token) {
+        return send_json(&mut stream, 401, &err("missing or wrong API token"));
+    }
 
     if !origin_allowed(origin.as_deref(), host.as_deref()) {
         return send_json(
@@ -982,6 +1085,7 @@ fn http_status_text(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         413 => "Payload Too Large",
@@ -1085,14 +1189,19 @@ mod tests {
         serve_queued(req).0
     }
 
-    /// 处理一个请求，返回响应和它排进控制队列的命令。
     fn serve_queued(req: &[u8]) -> (String, Vec<ControlCmd>) {
+        serve_from(IpAddr::from(Ipv4Addr::LOCALHOST), None, req)
+    }
+
+    /// 假装请求来自 `peer`、服务端 token 是 `token`，返回响应和排进控制队列的命令。
+    fn serve_from(peer: IpAddr, token: Option<&str>, req: &[u8]) -> (String, Vec<ControlCmd>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let token = token.map(str::to_string);
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
-            let _ = handle_connection(stream, &tx, &new_shared_state());
+            let _ = handle_connection(stream, peer, token.as_deref(), &tx, &new_shared_state());
             rx.try_iter().collect::<Vec<_>>()
         });
         let mut client = TcpStream::connect(addr).unwrap();
@@ -1144,6 +1253,100 @@ mod tests {
                 .contains("access-control-allow-origin"),
             "got {resp:?}"
         );
+    }
+
+    #[test]
+    fn lan_clients_need_the_token() {
+        let phone = IpAddr::from([192, 168, 1, 23]);
+        let (resp, _) = serve_from(
+            phone,
+            Some("s3cret"),
+            b"GET /library/full HTTP/1.1\r\nHost: 192.168.1.5:18765\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+        assert!(!resp.contains("tracks"), "got {resp:?}");
+
+        for auth in [
+            "",
+            "Authorization: Bearer wrong\r\n",
+            "Authorization: s3cret\r\n",
+        ] {
+            let req = post_next(&format!("Host: 192.168.1.5:18765\r\n{auth}"));
+            let (resp, queued) = serve_from(phone, Some("s3cret"), req.as_bytes());
+            assert!(resp.starts_with("HTTP/1.1 401 "), "{auth:?} got {resp:?}");
+            assert!(queued.is_empty(), "{auth:?} queued {queued:?}");
+        }
+
+        for auth in [
+            "Authorization: Bearer s3cret\r\n",
+            "authorization: bearer s3cret\r\n",
+        ] {
+            let req = post_next(&format!("Host: 192.168.1.5:18765\r\n{auth}"));
+            let (resp, queued) = serve_from(phone, Some("s3cret"), req.as_bytes());
+            assert!(resp.starts_with("HTTP/1.1 200 "), "{auth:?} got {resp:?}");
+            assert!(matches!(queued[..], [ControlCmd::Next]), "got {queued:?}");
+        }
+
+        // 没有 token（文件写不出来）时局域网一律拒绝，空 Bearer 也不算数
+        let req = post_next("Host: 192.168.1.5:18765\r\nAuthorization: Bearer \r\n");
+        let (resp, queued) = serve_from(phone, None, req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn loopback_clients_need_no_token() {
+        for peer in [
+            IpAddr::from(Ipv4Addr::LOCALHOST),
+            IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+        ] {
+            let req = post_next("Host: localhost:18765\r\n");
+            let (resp, queued) = serve_from(peer, Some("s3cret"), req.as_bytes());
+            assert!(resp.starts_with("HTTP/1.1 200 "), "{peer} got {resp:?}");
+            assert!(matches!(queued[..], [ControlCmd::Next]), "got {queued:?}");
+        }
+    }
+
+    #[test]
+    fn api_token_is_created_private_and_kept() {
+        let dir = std::env::temp_dir().join(format!("zradio-api-token-{}", std::process::id()));
+        let path = dir.join("api-token");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(load_token(&path, false), None);
+        assert!(!path.exists(), "only switching LAN on may create the token");
+
+        let token = load_token(&path, true).unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(load_token(&path, true).as_deref(), Some(token.as_str()));
+        assert_eq!(load_token(&path, false).as_deref(), Some(token.as_str()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "token file mode {mode:o}");
+        }
+
+        std::fs::write(&path, "  my-phone-key \n").unwrap();
+        assert_eq!(load_token(&path, true).as_deref(), Some("my-phone-key"));
+        std::fs::write(&path, "\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let fresh = load_token(&path, true).unwrap();
+        assert_ne!(fresh, token);
+        assert_eq!(fresh.len(), 64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "rewritten token file mode {mode:o}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1201,8 +1404,9 @@ mod tests {
     #[test]
     fn api_listens_on_loopback_until_lan_is_switched_on() {
         let port = free_port();
+        let dir = std::env::temp_dir().join(format!("zradio-api-bind-{}", std::process::id()));
         let (tx, _rx) = std::sync::mpsc::channel();
-        let server = start_on(port, false, tx, new_shared_state());
+        let server = start_on(port, false, dir.join("api-token"), tx, new_shared_state());
         let local = SocketAddr::from(([127, 0, 0, 1], port));
         let other = SocketAddr::from(([127, 0, 0, 2], port));
         assert!(eventually(|| answers(local)));
@@ -1224,6 +1428,7 @@ mod tests {
             "switching LAN off must rebind"
         );
         assert!(answers(local));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
