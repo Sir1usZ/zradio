@@ -116,6 +116,121 @@ where
         .collect())
 }
 
+/// Blocks a voice's loudness is measured over.
+const BLOCK_SECS: f32 = 0.05;
+/// Quietest a played voice can be and still be heard over a mix leveled to -14 LUFS.
+const VOICE_FLOOR_DB: f32 = -40.0;
+/// A voice this far under the other is masked by it, so the two do not clash.
+const MASKED_DB: f32 = 12.0;
+/// Two voices heard together for less than this are left to overlap.
+const CLASH_MIN_SECS: f32 = 1.0;
+/// Each voice fades over this, the outgoing one out to the handoff, the incoming in after.
+const RAMP_SECS: f32 = 0.3;
+/// Handoffs that remove this much more voice than the least are as good as it.
+const COST_SLACK: f64 = 0.01;
+
+/// Where in an overlap the outgoing voice gives way to the incoming one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Handoff {
+    /// Overlap frame the outgoing voice is gone by and the incoming one starts at.
+    pub at: usize,
+    /// Frames each voice fades over.
+    pub ramp: usize,
+}
+
+impl Handoff {
+    /// How much of the outgoing and the incoming voice is kept at overlap frame `f`.
+    pub fn keep(&self, f: usize) -> (f32, f32) {
+        let ramp = self.ramp.max(1) as f64;
+        let smooth = |x: f64| {
+            let x = x.clamp(0.0, 1.0) as f32;
+            x * x * (3.0 - 2.0 * x)
+        };
+        let to = self.at as f64 - f as f64;
+        (smooth(to / ramp), smooth(-to / ramp))
+    }
+}
+
+fn block_frames(rate: u32) -> usize {
+    ((BLOCK_SECS * rate as f32).round() as usize).max(1)
+}
+
+/// Mean square of interleaved stereo `vocals`, block by block, each frame weighed by
+/// `gain(frame)` as the deck plays it.
+pub fn played_power(vocals: &[f32], rate: u32, gain: impl Fn(usize) -> f32) -> Vec<f64> {
+    let block = block_frames(rate);
+    vocals
+        .chunks(2 * block)
+        .enumerate()
+        .map(|(b, chunk)| {
+            let frames = chunk.as_chunks::<2>().0;
+            let sum: f64 = frames
+                .iter()
+                .enumerate()
+                .map(|(i, &[l, r])| {
+                    let g = f64::from(gain(b * block + i));
+                    g * g * (f64::from(l).powi(2) + f64::from(r).powi(2))
+                })
+                .sum();
+            sum / (2 * frames.len().max(1)) as f64
+        })
+        .collect()
+}
+
+/// Where to hand over when the two voices, as played (`out` and `inn`, from
+/// `played_power`), would otherwise be heard together for `CLASH_MIN_SECS` or more; None
+/// when they would not. Of `candidates` (overlap frames, beat lines say) that leave room
+/// for both fades in the `fade` frames of the overlap, it takes the one that removes the
+/// least voice, counted as if the handoff were a cut, and of those as good, the one
+/// nearest the middle.
+pub fn plan_handoff(
+    out: &[f64],
+    inn: &[f64],
+    rate: u32,
+    fade: usize,
+    candidates: &[usize],
+) -> Option<Handoff> {
+    let floor = 10f64.powf(f64::from(VOICE_FLOOR_DB) / 10.0);
+    let masked = 10f64.powf(f64::from(MASKED_DB) / 10.0);
+    let together = out
+        .iter()
+        .zip(inn)
+        .filter(|&(&o, &i)| o.min(i) >= floor && o.max(i) <= masked * o.min(i))
+        .count();
+    if together < (CLASH_MIN_SECS / BLOCK_SECS).round() as usize {
+        return None;
+    }
+    let ramp = (RAMP_SECS * rate as f32).round() as usize;
+    let block = block_frames(rate);
+    let sums = |p: &[f64]| {
+        std::iter::once(0.0)
+            .chain(p.iter().scan(0.0, |s, &x| {
+                *s += x;
+                Some(*s)
+            }))
+            .collect::<Vec<f64>>()
+    };
+    let (so, si) = (sums(out), sums(inn));
+    // A cut at `at` would remove the outgoing voice from its block on and the incoming
+    // one before it.
+    let cost = |at: usize| {
+        let b = (at + block / 2) / block;
+        so[out.len()] - so[b.min(out.len())] + si[b.min(inn.len())]
+    };
+    let fits: Vec<(usize, f64)> = candidates
+        .iter()
+        .filter(|&&c| c >= ramp && c + ramp <= fade)
+        .map(|&c| (c, cost(c)))
+        .collect();
+    let least = fits.iter().map(|&(_, c)| c).reduce(f64::min)?;
+    let at = fits
+        .iter()
+        .filter(|&&(_, c)| c <= least * (1.0 + COST_SLACK))
+        .map(|&(at, _)| at)
+        .min_by_key(|&at| (at.abs_diff(fade / 2), at))?;
+    Some(Handoff { at, ramp })
+}
+
 #[cfg(feature = "stems")]
 pub struct Model {
     plan: std::sync::Arc<tract_onnx::prelude::TypedRunnableModel>,
@@ -358,6 +473,119 @@ mod tests {
         let energy = |x: &[f32]| x.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
         let db = 10.0 * (energy(&vocals) / energy(&mix)).log10();
         assert!(db < -25.0, "vocals at {db:.1} dB of the mix");
+    }
+
+    // At 48 kHz a block is 2400 frames, and a 10 s overlap is 200 of them.
+    const FADE: usize = 480_000;
+    const RAMP: usize = 14_400;
+
+    /// A voice at `db` over `blocks` of the overlap, silence elsewhere.
+    fn voice(db: f32, blocks: std::ops::Range<usize>) -> Vec<f64> {
+        let p = 10f64.powf(f64::from(db) / 10.0);
+        (0..200)
+            .map(|b| if blocks.contains(&b) { p } else { 0.0 })
+            .collect()
+    }
+
+    /// Beat lines at 120 bpm, every 10 blocks.
+    fn beats() -> Vec<usize> {
+        (0..=20).map(|k| k * 24_000).collect()
+    }
+
+    fn handoff(out: &[f64], inn: &[f64], candidates: &[usize]) -> Option<usize> {
+        plan_handoff(out, inn, 48_000, FADE, candidates).map(|h| {
+            assert_eq!(h.ramp, RAMP);
+            h.at
+        })
+    }
+
+    #[test]
+    fn two_singers_hand_over_nearest_the_middle_of_their_overlap() {
+        let (out, inn) = (voice(-20.0, 0..120), voice(-20.0, 80..200));
+        assert_eq!(handoff(&out, &inn, &beats()), Some(240_000));
+    }
+
+    #[test]
+    fn the_handoff_falls_in_a_gap_between_lines() {
+        // The outgoing singer rests from block 60 to 100; the incoming one starts at 70.
+        let mut out = voice(-20.0, 0..60);
+        for (o, v) in out.iter_mut().zip(voice(-20.0, 100..140)) {
+            *o += v;
+        }
+        let inn = voice(-20.0, 70..200);
+        assert_eq!(handoff(&out, &inn, &beats()), Some(168_000));
+    }
+
+    #[test]
+    fn voices_that_do_not_clash_are_left_alone() {
+        let quiet = voice(-90.0, 0..0);
+        let lone = voice(-20.0, 0..200);
+        assert_eq!(handoff(&lone, &quiet, &beats()), None);
+        assert_eq!(handoff(&quiet, &lone, &beats()), None);
+        // Taking turns.
+        assert_eq!(
+            handoff(&voice(-20.0, 0..90), &voice(-20.0, 110..200), &beats()),
+            None
+        );
+        // Together for 0.9 s, then for 1.1 s.
+        let inn = voice(-20.0, 90..200);
+        assert_eq!(handoff(&voice(-20.0, 0..108), &inn, &beats()), None);
+        assert!(handoff(&voice(-20.0, 0..112), &inn, &beats()).is_some());
+        // One masked by the other, or both too quiet to hear under the mix.
+        assert_eq!(
+            handoff(&voice(-20.0, 0..120), &voice(-35.0, 80..200), &beats()),
+            None
+        );
+        assert_eq!(
+            handoff(&voice(-45.0, 0..120), &voice(-45.0, 80..200), &beats()),
+            None
+        );
+    }
+
+    #[test]
+    fn the_handoff_leaves_room_for_both_fades() {
+        let (out, inn) = (voice(-20.0, 0..120), voice(-20.0, 80..200));
+        assert_eq!(handoff(&out, &inn, &[0, FADE]), None);
+        assert_eq!(handoff(&out, &inn, &[RAMP - 1, FADE - RAMP + 1]), None);
+        assert_eq!(handoff(&out, &inn, &[]), None);
+        assert_eq!(handoff(&out, &inn, &[0, RAMP, FADE]), Some(RAMP));
+        assert_eq!(handoff(&out, &inn, &[FADE - RAMP]), Some(FADE - RAMP));
+    }
+
+    #[test]
+    fn the_two_voices_are_never_kept_together() {
+        let h = Handoff {
+            at: 240_000,
+            ramp: RAMP,
+        };
+        assert_eq!(h.keep(0), (1.0, 0.0));
+        assert_eq!(h.keep(240_000 - RAMP), (1.0, 0.0));
+        assert_eq!(h.keep(240_000), (0.0, 0.0));
+        assert_eq!(h.keep(240_000 + RAMP), (0.0, 1.0));
+        assert_eq!(h.keep(FADE), (0.0, 1.0));
+        let (o, _) = h.keep(240_000 - RAMP / 2);
+        let (_, i) = h.keep(240_000 + RAMP / 2);
+        assert!((o - 0.5).abs() < 1e-3 && (i - 0.5).abs() < 1e-3, "{o} {i}");
+        let mut last = (1.0, 0.0);
+        for f in (0..FADE).step_by(100) {
+            let (o, i) = h.keep(f);
+            assert!(o * i == 0.0, "{f}: both kept");
+            assert!(o <= last.0 && i >= last.1, "{f}: not monotonic");
+            last = (o, i);
+        }
+    }
+
+    #[test]
+    fn played_power_weighs_each_frame_as_the_deck_plays_it() {
+        let flat = vec![0.5f32; 2 * (3 * 2400 + 1200)];
+        let p = played_power(&flat, 48_000, |_| 1.0);
+        assert_eq!(p.len(), 4);
+        assert!(p.iter().all(|&x| (x - 0.25).abs() < 1e-9), "{p:?}");
+        let rising = played_power(&flat, 48_000, |f| (f as f32 / 4800.0).min(1.0));
+        let want = [0.25 / 12.0, 0.25 * 7.0 / 12.0, 0.25, 0.25];
+        for (got, want) in rising.iter().zip(want) {
+            assert!((got - want).abs() < want * 1e-3, "{rising:?}");
+        }
     }
 
     #[test]

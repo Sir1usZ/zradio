@@ -14,10 +14,7 @@ use crate::automix::{
     TransitionPlan, PREFETCH_LEAD_SECS, RAMP_MAX_SECS,
 };
 use crate::decode::{decode_file, AudioBuf};
-use crate::dsp::{
-    fade_frames, mix_bass_swap, mix_echo_out, mix_filter_blend, mix_stereo_frame, Bands, Crossover,
-    MixMode, CROSSOVER_HZ,
-};
+use crate::dsp::{fade_frames, mix_stereo_frame, Bands, Crossover, MixMode, CROSSOVER_HZ};
 use crate::eq::Equalizer;
 use crate::library::Track;
 use crate::prefs::ShuffleMode;
@@ -1345,15 +1342,10 @@ impl Mixer {
             .as_mut()
             .map(Deck::split_frame)
             .unwrap_or_default();
-        match self
-            .last_plan
+        self.last_plan
             .map(|p| p.style)
             .unwrap_or(MixStyle::BassSwap)
-        {
-            MixStyle::BassSwap => mix_bass_swap(a, b, t),
-            MixStyle::Filter => mix_filter_blend(a, b, t),
-            MixStyle::Echo | MixStyle::Quick => mix_echo_out(a.sum(), b.sum(), t),
-        }
+            .mix(a, b, t)
     }
 
     /// Both decks at `t` through the transition, as Cut and Crossfade mix them.

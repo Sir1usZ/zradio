@@ -1,5 +1,5 @@
 use crate::analysis::TrackAnalysis;
-use crate::dsp::{fade_frames, MixMode};
+use crate::dsp::{fade_frames, mix_bass_swap, mix_echo_out, mix_filter_blend, Bands, MixMode};
 use crate::library::Track;
 use crate::stretch::TimeMap;
 
@@ -29,6 +29,26 @@ impl MixStyle {
             Self::Echo => "echo-out",
             Self::Quick => "quick",
         }
+    }
+
+    /// Both decks, split at the crossover, `t` of the way through a mix in this style.
+    pub fn mix(self, a: Bands, b: Bands, t: f32) -> [f32; 2] {
+        match self {
+            Self::BassSwap => mix_bass_swap(a, b, t),
+            Self::Filter => mix_filter_blend(a, b, t),
+            Self::Echo | Self::Quick => mix_echo_out(a.sum(), b.sum(), t),
+        }
+    }
+
+    /// How loud each deck's voice is heard `t` of the way through: a voice sits above the
+    /// crossover, so this is what the style does to the high band.
+    pub fn voice_gains(self, t: f32) -> (f32, f32) {
+        let high = Bands {
+            low: [0.0; 2],
+            high: [1.0; 2],
+        };
+        let none = Bands::default();
+        (self.mix(high, none, t)[0], self.mix(none, high, t)[0])
     }
 }
 
@@ -439,6 +459,7 @@ pub fn pick_next(
 mod tests {
     use super::*;
     use crate::analysis::Camelot;
+    use crate::dsp::equal_power_gains;
     use std::path::PathBuf;
 
     fn analysis(bpm: f32, camelot: Camelot, energy: f32) -> TrackAnalysis {
@@ -462,6 +483,34 @@ mod tests {
             music_start: 0.0,
             music_end: 200.0,
             beat_this: false,
+        }
+    }
+
+    #[test]
+    fn every_style_hands_the_voice_over() {
+        for style in [
+            MixStyle::BassSwap,
+            MixStyle::Filter,
+            MixStyle::Echo,
+            MixStyle::Quick,
+        ] {
+            let (a0, b0) = style.voice_gains(0.0);
+            let (a1, b1) = style.voice_gains(1.0);
+            assert!(a0 > 0.9 && b0 < 0.2, "{style:?} at 0: {a0} {b0}");
+            assert!(a1 < 0.2 && b1 > 0.9, "{style:?} at 1: {a1} {b1}");
+        }
+    }
+
+    #[test]
+    fn a_bass_swap_fades_the_voices_at_equal_power() {
+        for i in 0..=20 {
+            let t = i as f32 / 20.0;
+            let (a, b) = MixStyle::BassSwap.voice_gains(t);
+            let (ea, eb) = equal_power_gains(t);
+            assert!(
+                (a - ea).abs() < 1e-6 && (b - eb).abs() < 1e-6,
+                "{t}: {a} {b}"
+            );
         }
     }
 
