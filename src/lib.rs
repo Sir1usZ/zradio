@@ -3,6 +3,7 @@ pub(crate) mod alsa_log;
 pub mod analysis;
 pub mod api;
 pub mod automix;
+pub mod beat_this;
 pub mod browse;
 pub mod cava;
 pub mod control;
