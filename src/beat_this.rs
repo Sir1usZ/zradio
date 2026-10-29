@@ -306,6 +306,115 @@ impl Model {
     }
 }
 
+/// The ONNX export of the final Beat This! checkpoint in beat_this_cpp (MIT), pinned to a
+/// commit and checked against its hash, so what is fetched is what was tested.
+pub const MODEL_URL: &str = "https://raw.githubusercontent.com/mosynthkey/beat_this_cpp/\
+07ab790a9ec2eda8093d52d249e3ec4f0510ee72/onnx/beat_this.onnx";
+pub const MODEL_BYTES: u64 = 83_077_778;
+pub const MODEL_SHA256: &str = "c5c1466e08abdb03fdeb50668a06f244b787d564c212490482231a9cfbe9ccbd";
+
+/// Where the model is kept: under `XDG_DATA_HOME`, or `~/.local/share`.
+pub fn model_path() -> std::path::PathBuf {
+    model_path_in(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+}
+
+fn model_path_in(
+    data_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    let base = data_home
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| std::path::PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("zradio").join("models").join("beat_this.onnx")
+}
+
+/// Whether the model has been fetched; its hash was checked when it was.
+pub fn model_ready() -> bool {
+    std::fs::metadata(model_path()).is_ok_and(|m| m.len() == MODEL_BYTES)
+}
+
+/// Fetches the model, reporting progress as "42%", unless it is already there.
+#[cfg(feature = "beat-this")]
+pub fn download_model(
+    progress: Option<std::sync::mpsc::Sender<String>>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let path = model_path();
+    if !model_ready() {
+        fetch_verified(MODEL_URL, MODEL_SHA256, &path, progress)?;
+    }
+    Ok(path)
+}
+
+/// Fetches `url` to `dest` through a file beside it, which only takes its place once its
+/// hash is `sha256`.
+#[cfg(feature = "beat-this")]
+fn fetch_verified(
+    url: &str,
+    sha256: &str,
+    dest: &std::path::Path,
+    progress: Option<std::sync::mpsc::Sender<String>>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::process::{Command, Stdio};
+    let dir = dest.parent().context("model path has no folder")?;
+    std::fs::create_dir_all(dir)?;
+    let mut part = dest.as_os_str().to_owned();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
+    let mut child = Command::new("curl")
+        .args(["-L", "--fail", "--progress-bar", "--connect-timeout", "15"])
+        // Gives up on a download that stalls for two minutes.
+        .args(["--speed-limit", "1", "--speed-time", "120", "-o"])
+        .arg(&part)
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("curl")?;
+    // Read even with no one to tell, or curl blocks once the pipe fills.
+    let stderr = child.stderr.take();
+    let pump = std::thread::spawn(move || {
+        if let Some(stderr) = stderr {
+            crate::splayer::pump_curl_progress(stderr, progress);
+        }
+    });
+    let status = child.wait().context("curl wait");
+    let _ = pump.join();
+    let fetched = match status {
+        Ok(s) if s.success() => sha256_hex(&part),
+        Ok(s) => Err(anyhow::anyhow!("download failed: curl {s}")),
+        Err(e) => Err(e),
+    };
+    let result = match fetched {
+        Ok(hash) if hash == sha256 => return Ok(std::fs::rename(&part, dest)?),
+        Ok(hash) => Err(anyhow::anyhow!(
+            "downloaded model hashes to {hash}, not {sha256}"
+        )),
+        Err(e) => Err(e),
+    };
+    let _ = std::fs::remove_file(&part);
+    result
+}
+
+#[cfg(feature = "beat-this")]
+fn sha256_hex(path: &std::path::Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// Zero crossings the resampling low-pass reaches on either side of its centre.
 const SINC_ZEROS: usize = 32;
 /// Table steps between two zero crossings; taps in between are interpolated.
@@ -837,5 +946,111 @@ mod tests {
         assert!(hits >= 76, "{hits}/80 beats found: {:?}", found.beats);
         let extra = found.beats.len().saturating_sub(hits);
         assert!(extra <= 4, "{extra} beats off the grid: {:?}", found.beats);
+    }
+
+    #[test]
+    fn the_model_is_kept_in_the_user_data_dir() {
+        let path = |data: Option<&str>| model_path_in(data.map(Into::into), Some("/home/u".into()));
+        let tail = "zradio/models/beat_this.onnx";
+        assert_eq!(
+            path(Some("/data")),
+            std::path::Path::new("/data").join(tail)
+        );
+        let fallback = std::path::Path::new("/home/u/.local/share").join(tail);
+        assert_eq!(path(None), fallback);
+        // The XDG spec has an empty or relative XDG_DATA_HOME ignored.
+        assert_eq!(path(Some("")), fallback);
+        assert_eq!(path(Some("share")), fallback);
+    }
+
+    /// Answers one request on a local port with `status` and `body`.
+    #[cfg(feature = "beat-this")]
+    fn serve_once(status: &'static str, body: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.read(&mut [0u8; 1024]);
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(body);
+        });
+        format!("http://{addr}/beat_this.onnx")
+    }
+
+    #[cfg(feature = "beat-this")]
+    #[test]
+    fn a_fetched_model_takes_its_place_only_when_its_hash_matches() {
+        if std::process::Command::new("curl")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("zradio-model-fetch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dest = dir.join("models").join("beat_this.onnx");
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let files = || {
+            let mut names: Vec<_> = std::fs::read_dir(dir.join("models"))
+                .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+
+        fetch_verified(&serve_once("200 OK", b"abc"), abc, &dest, None).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        assert_eq!(files(), ["beat_this.onnx"]);
+
+        // A file that is not the one pinned never replaces the one there.
+        assert!(fetch_verified(&serve_once("200 OK", b"abd"), abc, &dest, None).is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        assert_eq!(files(), ["beat_this.onnx"]);
+
+        std::fs::remove_file(&dest).unwrap();
+        let missing = serve_once("404 Not Found", b"gone");
+        assert!(fetch_verified(&missing, abc, &dest, None).is_err());
+        assert!(files().is_empty(), "{:?}", files());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fetches 83 MB from GitHub: `cargo test fetches_the_pinned_model -- --ignored`.
+    #[cfg(feature = "beat-this")]
+    #[test]
+    #[ignore]
+    fn fetches_the_pinned_model() {
+        let dir = std::env::temp_dir().join(format!("zradio-model-pinned-{}", std::process::id()));
+        let dest = dir.join("beat_this.onnx");
+        fetch_verified(MODEL_URL, MODEL_SHA256, &dest, None).unwrap();
+        let len = std::fs::metadata(&dest).unwrap().len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(len, MODEL_BYTES);
+    }
+
+    #[cfg(feature = "beat-this")]
+    #[test]
+    fn sha256_matches_the_standard_vectors() {
+        let path = std::env::temp_dir().join(format!("zradio-model-sha-{}", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        let empty = sha256_hex(&path).unwrap();
+        // Past one read buffer, so the file is hashed in more than one piece.
+        let a = vec![b'a'; 1_000_000];
+        std::fs::write(&path, &a).unwrap();
+        let million = sha256_hex(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            empty,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            million,
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
     }
 }

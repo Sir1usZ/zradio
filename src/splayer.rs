@@ -299,7 +299,7 @@ pub fn download(
     Ok(path)
 }
 
-fn pump_curl_progress(stderr: impl Read, progress: Option<Sender<String>>) {
+pub(crate) fn pump_curl_progress(stderr: impl Read, progress: Option<Sender<String>>) {
     let mut reader = BufReader::new(stderr);
     let mut buf = Vec::new();
     loop {
