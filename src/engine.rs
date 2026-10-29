@@ -21,7 +21,7 @@ use crate::prefs::ShuffleMode;
 use crate::remix::RemixMode;
 use crate::scope::{PcmRing, PcmSnapshot};
 use crate::spectrum::Spectrum;
-use crate::stems::Handoff;
+use crate::stems::{plan_handoff, played_power, Handoff};
 use crate::stretch::{render_tail, TimeMap};
 
 const FADE_SECS: f32 = 6.0;
@@ -29,6 +29,11 @@ const FADE_SECS: f32 = 6.0;
 const MODE_BLEND_SECS: f32 = 0.1;
 /// AutoMix moves a deck's level at most this many seconds per unit of gain.
 const LEVEL_GLIDE_SECS: f32 = 0.1;
+/// Audio separated on each side of an overlap, so its edges are not a segment's edges.
+const VOCAL_MARGIN_SECS: f32 = 1.0;
+/// Fetching the next track this much earlier leaves time to separate both decks' voices
+/// on one core, about 30 s, before the overlap starts.
+pub const STEMS_LEAD_SECS: f32 = 45.0;
 const STREAM_REBUILD_GAP: Duration = Duration::from_millis(500);
 
 struct StreamHealth {
@@ -178,6 +183,8 @@ struct ArmedMix {
     start_at: usize,
     plan: TransitionPlan,
     vocals: Option<VocalOverlay>,
+    /// Whether its voices were handed to a worker to separate.
+    vocals_asked: bool,
 }
 
 struct Deck {
@@ -309,6 +316,29 @@ impl Deck {
     }
 }
 
+/// Frames into an overlap of `fade` frames that start at `pos` in a deck analysed as `a`
+/// on which a beat falls.
+fn beat_lines(a: &TrackAnalysis, pos: usize, fade: usize, sample_rate: u32) -> Vec<usize> {
+    let Some(bpm) = a.bpm.filter(|&b| b > 0.0) else {
+        return Vec::new();
+    };
+    let sr = f64::from(sample_rate);
+    let beat = 60.0 / f64::from(bpm) * sr;
+    if beat < 1.0 {
+        return Vec::new();
+    }
+    let first = f64::from(a.first_beat) * sr;
+    let from = ((pos as f64 - first) / beat).ceil();
+    (0..)
+        .map(|k| {
+            (first + (from + f64::from(k)) * beat - pos as f64)
+                .round()
+                .max(0.0) as usize
+        })
+        .take_while(|&f| f < fade)
+        .collect()
+}
+
 fn approach(from: f32, to: f32, step: f32) -> f32 {
     if to > from {
         (from + step).min(to)
@@ -368,6 +398,59 @@ pub struct VocalOverlay {
     handoff: Handoff,
 }
 
+/// Everything a worker needs to separate the voices of an armed mix off the mixer lock.
+pub struct VocalJob {
+    arm: u64,
+    sample_rate: u32,
+    fade: usize,
+    style: MixStyle,
+    /// Level each deck plays at.
+    gains: (f32, f32),
+    /// Overlap frames on the incoming deck's beat lines.
+    beats: Vec<usize>,
+    /// Interleaved stereo as each deck plays it around the overlap, which starts `lead`
+    /// frames in.
+    out: Vec<f32>,
+    out_lead: usize,
+    inn: Vec<f32>,
+    inn_lead: usize,
+}
+
+impl VocalJob {
+    /// The overlay for the mix, with `separate` taking the voice out of interleaved
+    /// stereo at the mixer's rate; None when the two voices do not clash.
+    pub fn run(
+        self,
+        separate: impl FnMut(&[f32], u32) -> anyhow::Result<Vec<f32>>,
+    ) -> anyhow::Result<Option<VocalOverlay>> {
+        let mut separate = separate;
+        let fade = self.fade;
+        let mut overlap = |audio: &[f32], lead: usize| -> anyhow::Result<Vec<f32>> {
+            let voice = separate(audio, self.sample_rate)?;
+            anyhow::ensure!(
+                voice.len() == audio.len() && audio.len() >= 2 * (lead + fade),
+                "{} voice samples for {} of audio",
+                voice.len(),
+                audio.len()
+            );
+            Ok(voice[2 * lead..2 * (lead + fade)].to_vec())
+        };
+        let out = overlap(&self.out, self.out_lead)?;
+        let inn = overlap(&self.inn, self.inn_lead)?;
+        let (style, (ga, gb)) = (self.style, self.gains);
+        let t = |f: usize| f as f32 / fade as f32;
+        let out_power = played_power(&out, self.sample_rate, |f| ga * style.voice_gains(t(f)).0);
+        let in_power = played_power(&inn, self.sample_rate, |f| gb * style.voice_gains(t(f)).1);
+        let handoff = plan_handoff(&out_power, &in_power, self.sample_rate, fade, &self.beats);
+        Ok(handoff.map(|handoff| VocalOverlay {
+            arm: self.arm,
+            out,
+            inn,
+            handoff,
+        }))
+    }
+}
+
 impl VocalOverlay {
     fn fits(&self, arm: u64, fade: usize) -> bool {
         self.arm == arm && self.out.len() == 2 * fade && self.inn.len() == 2 * fade
@@ -403,6 +486,7 @@ pub struct Mixer {
     arm_seq: u64,
     /// Voices of the mix under way, if they were separated in time.
     vocals: Option<VocalOverlay>,
+    stems: bool,
     volume: f32,
     sample_rate: u32,
     channels: usize,
@@ -441,6 +525,7 @@ impl Mixer {
             armed: None,
             arm_seq: 0,
             vocals: None,
+            stems: false,
             volume: 0.9,
             sample_rate,
             channels: channels.max(1),
@@ -943,8 +1028,56 @@ impl Mixer {
             start_at: placed.start_at,
             plan,
             vocals: None,
+            vocals_asked: false,
         });
         self.status = format!("armed {}", plan.style.label());
+    }
+
+    /// Whether AutoMix separates the voices of its mixes, which needs the next track sooner.
+    pub fn set_stems(&mut self, on: bool) {
+        self.stems = on;
+    }
+
+    /// The armed mix's voices to separate, once per mix.
+    pub fn take_vocal_job(&mut self) -> Option<VocalJob> {
+        if !self.stems || self.mix != MixMode::AutoMix {
+            return None;
+        }
+        let armed = self.armed.as_ref().filter(|a| !a.vocals_asked)?;
+        let current = self.current.as_ref()?;
+        let fade = armed.fade;
+        let margin = (VOCAL_MARGIN_SECS * self.sample_rate as f32).round() as usize;
+        // Each deck from `margin` before the overlap to `margin` after it, as it plays.
+        let around = |deck: &Deck, pos: usize| {
+            let from = pos.saturating_sub(margin);
+            let audio: Vec<f32> = (from..pos + fade + margin)
+                .flat_map(|f| deck.frame(f))
+                .collect();
+            (audio, pos - from)
+        };
+        let (out, out_lead) = around(current, armed.start_at);
+        let (inn, inn_lead) = around(&armed.deck, armed.deck.pos);
+        let beats = self
+            .analysis_at(armed.index)
+            .map(|a| at_tempo(a, armed.deck.tempo))
+            .map(|a| beat_lines(&a, armed.deck.pos, fade, self.sample_rate))
+            .unwrap_or_default();
+        let job = VocalJob {
+            arm: armed.id,
+            sample_rate: self.sample_rate,
+            fade,
+            style: armed.plan.style,
+            gains: (current.gain, armed.deck.gain),
+            beats,
+            out,
+            out_lead,
+            inn,
+            inn_lead,
+        };
+        if let Some(armed) = self.armed.as_mut() {
+            armed.vocals_asked = true;
+        }
+        Some(job)
     }
 
     /// Hands the armed mix the voices separated for it; false, and they are dropped, if
@@ -1011,7 +1144,8 @@ impl Mixer {
                 let pos_secs = deck.pos as f32 / self.sample_rate.max(1) as f32;
                 let fade = fade_secs_for(self.mix, Some(&current), false);
                 // The tail starts bending up to RAMP_MAX_SECS before the overlap.
-                return pos_secs + fade + RAMP_MAX_SECS + PREFETCH_LEAD_SECS >= mix_out;
+                let stems = if self.stems { STEMS_LEAD_SECS } else { 0.0 };
+                return pos_secs + fade + RAMP_MAX_SECS + PREFETCH_LEAD_SECS + stems >= mix_out;
             }
         }
         let need = fade_frames(self.sample_rate, deck.frames(), FADE_SECS)
@@ -2313,12 +2447,17 @@ mod tests {
     /// Mixer with an AutoMix from `a` into `b` armed and its playhead where the overlap
     /// starts.
     fn armed_voices(a: AudioBuf, b: AudioBuf) -> Mixer {
+        armed_voices_into(a, b, 4.0)
+    }
+
+    /// As `armed_voices`, with `b` coming in at `mix_in` seconds.
+    fn armed_voices_into(a: AudioBuf, b: AudioBuf, mix_in: f32) -> Mixer {
         let mut mixer = Mixer::new(48_000, 2);
         mixer.set_tracks(two_tracks());
         mixer.mix = MixMode::AutoMix;
         mixer.play_decoded(0, a);
         mixer.set_analysis(0, analysis_at(0.0, 16.0, 20.0));
-        mixer.set_analysis(1, analysis_at(4.0, 18.0, 20.0));
+        mixer.set_analysis(1, analysis_at(mix_in, 18.0, 20.0));
         mixer.set_playhead(48_000 * 10);
         mixer.start_transition(1, b, false);
         let start_at = mixer.armed.as_ref().expect("armed").start_at;
@@ -2416,6 +2555,105 @@ mod tests {
         seeked.seek_by(0.0);
         assert!(seeked.armed.is_none() && seeked.vocals.is_none());
         assert!(!seeked.attach_vocals(overlay(arm, fade)));
+    }
+
+    // Neither repeats on a whole second, so voices taken from the wrong frames differ.
+    fn voice_a() -> AudioBuf {
+        sine(48_000 * 20, 1_000.5, 0.3)
+    }
+
+    fn voice_b() -> AudioBuf {
+        sine(48_000 * 20, 1_500.25, 0.3)
+    }
+
+    #[test]
+    fn voices_are_separated_once_per_armed_mix_and_only_with_stems_on() {
+        let mut mixer = armed_voices(voice_a(), voice_b());
+        assert!(mixer.take_vocal_job().is_none(), "stems are off");
+        mixer.set_stems(true);
+        assert!(mixer.take_vocal_job().is_some());
+        assert!(mixer.take_vocal_job().is_none(), "asked twice");
+    }
+
+    #[test]
+    fn separated_voices_line_up_with_the_overlap() {
+        // Coming in at 0.5 s leaves less than the margin before the overlap.
+        for mix_in in [4.0, 0.5] {
+            let mut mixer = armed_voices_into(voice_a(), voice_b(), mix_in);
+            mixer.set_stems(true);
+            let armed = mixer.armed.as_ref().unwrap();
+            let (fade, start_at, in_pos) = (armed.fade, armed.start_at, armed.deck.pos);
+            let want_out = deck_frames(mixer.current.as_ref().unwrap(), start_at, fade);
+            let want_in = deck_frames(&armed.deck, in_pos, fade);
+            let job = mixer.take_vocal_job().unwrap();
+            let mut calls = 0;
+            let overlay = job
+                .run(|x, rate| {
+                    assert_eq!(rate, 48_000);
+                    calls += 1;
+                    Ok(x.to_vec())
+                })
+                .unwrap()
+                .expect("two voices all through the overlap clash");
+            assert_eq!(calls, 2);
+            assert!(overlay.out == want_out, "{mix_in}: outgoing voice is off");
+            assert!(overlay.inn == want_in, "{mix_in}: incoming voice is off");
+            let at = in_pos + overlay.handoff.at;
+            assert_eq!(at % 24_000, 0, "{mix_in}: handoff at {at} is off the beat");
+            assert!(mixer.attach_vocals(overlay));
+        }
+    }
+
+    #[test]
+    fn voices_that_never_clash_get_no_overlay() {
+        let job = || {
+            let mut mixer = armed_voices(voice_a(), voice_b());
+            mixer.set_stems(true);
+            mixer.take_vocal_job().unwrap()
+        };
+        let none = job().run(|x, _| Ok(vec![0.0; x.len()])).unwrap();
+        assert!(none.is_none());
+        assert!(job().run(|_, _| Err(anyhow::anyhow!("no model"))).is_err());
+        let short = job().run(|x, _| Ok(x[..x.len() / 2].to_vec()));
+        assert!(
+            short.is_err(),
+            "a short voice must not be read past its end"
+        );
+    }
+
+    #[test]
+    fn beat_lines_fall_on_the_incoming_grid() {
+        let a = analysis_at(4.0, 18.0, 20.0);
+        let lines = |pos, fade| beat_lines(&a, pos, fade, 48_000);
+        assert_eq!(lines(192_000, 100_000), [0, 24_000, 48_000, 72_000, 96_000]);
+        assert_eq!(lines(198_000, 100_000), [18_000, 42_000, 66_000, 90_000]);
+        // The grid runs back before the first beat too.
+        assert_eq!(lines(0, 50_000), [0, 24_000, 48_000]);
+        let no_grid = TrackAnalysis {
+            bpm: None,
+            ..a.clone()
+        };
+        assert!(beat_lines(&no_grid, 192_000, 100_000, 48_000).is_empty());
+    }
+
+    #[test]
+    fn separating_voices_fetches_the_next_track_sooner() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.mix = MixMode::AutoMix;
+        mixer.play_decoded(0, const_deck(48_000 * 72, 0.5));
+        mixer.set_analysis(0, analysis_at(0.0, 70.0, 72.0));
+        let first = |mixer: &mut Mixer| {
+            (0..72).find(|&s| {
+                mixer.set_playhead(48_000 * s);
+                mixer.should_prefetch()
+            })
+        };
+        let plain = first(&mut mixer).expect("fetches");
+        mixer.set_stems(true);
+        let early = first(&mut mixer).expect("fetches");
+        assert!(early > 0, "clamped at the start");
+        assert_eq!(plain - early, STEMS_LEAD_SECS as usize);
     }
 
     #[test]
