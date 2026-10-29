@@ -4,23 +4,32 @@
 //!
 //! Each neighbouring pair becomes NN.wav in the output directory: `before` seconds of the
 //! outgoing track, the overlap, then `after` seconds of the incoming one.
+//!
+//! `--beat-this beat_this.onnx` moves every track onto the grid Beat This! hears in it first,
+//! as the player does with Beat This! on.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use zradio::analysis::{analyze_buffer, TrackAnalysis};
-use zradio::decode::decode_file;
+use zradio::beat_this::Grid;
+use zradio::decode::{decode_file, AudioBuf};
 use zradio::mixdown::{render, write_wav, Options, Side};
 use zradio::MixMode;
 
 const USAGE: &str = "usage: automix_render [--mode auto|fade|cut] [--skip SECS] \
-[--before SECS] [--after SECS] [--rate HZ] [-o DIR] [--analyze] FILE FILE [FILE ...]";
+[--before SECS] [--after SECS] [--rate HZ] [-o DIR] [--analyze] [--beat-this MODEL] \
+FILE FILE [FILE ...]";
+
+/// Refits a track's analysis on Beat This!'s grid, giving the grid too.
+type Regrid = dyn Fn(&AudioBuf, TrackAnalysis) -> anyhow::Result<(TrackAnalysis, Option<Grid>)>;
 
 struct Args {
     opts: Options,
     rate: u32,
     out: PathBuf,
     analyze_only: bool,
+    model: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
 
@@ -30,6 +39,7 @@ fn parse_args() -> anyhow::Result<Args> {
         rate: 48_000,
         out: PathBuf::from("automix-out"),
         analyze_only: false,
+        model: None,
         files: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
@@ -50,6 +60,7 @@ fn parse_args() -> anyhow::Result<Args> {
             "--rate" => args.rate = value()?.parse().context("--rate")?,
             "-o" | "--out" => args.out = PathBuf::from(value()?),
             "--analyze" => args.analyze_only = true,
+            "--beat-this" => args.model = Some(PathBuf::from(value()?)),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -65,10 +76,48 @@ fn parse_args() -> anyhow::Result<Args> {
     Ok(args)
 }
 
-fn load(path: &Path, rate: u32) -> anyhow::Result<Side> {
+#[cfg(feature = "beat-this")]
+fn regrid(model: &Path) -> anyhow::Result<Box<Regrid>> {
+    use zradio::beat_this::{to_model_rate, Model};
+    let model = Model::load(model).with_context(|| format!("load {}", model.display()))?;
+    Ok(Box::new(move |buf, analysis| {
+        let mono = to_model_rate(&buf.samples, buf.channels, buf.sample_rate);
+        let grid = model.beats(&mono)?.grid();
+        Ok((analysis.with_grid(grid), grid))
+    }))
+}
+
+#[cfg(not(feature = "beat-this"))]
+fn regrid(_: &Path) -> anyhow::Result<Box<Regrid>> {
+    bail!("--beat-this needs the beat-this feature")
+}
+
+fn load(path: &Path, rate: u32, regrid: Option<&Regrid>) -> anyhow::Result<Side> {
     let buf = decode_file(path, rate, 2)?;
-    let analysis = analyze_buffer(&buf);
+    let mut analysis = analyze_buffer(&buf);
     println!("{}", describe(path, &analysis));
+    if let Some(regrid) = regrid {
+        let start = std::time::Instant::now();
+        let grid;
+        (analysis, grid) = regrid(&buf, analysis)?;
+        let secs = start.elapsed().as_secs_f32();
+        match grid {
+            Some(g) => println!(
+                "  Beat This! in {secs:.1}s: bpm {:.2}  first beat {:.3}s ({})  \
+                 mix in {:.2}s  mix out {:.2}s",
+                g.bpm,
+                g.first,
+                if g.bar_known {
+                    "on the bar"
+                } else {
+                    "bar unknown"
+                },
+                analysis.mix_in,
+                analysis.mix_out
+            ),
+            None => println!("  Beat This! in {secs:.1}s: no steady grid, kept"),
+        }
+    }
     Ok(Side {
         path: path.to_path_buf(),
         buf,
@@ -105,18 +154,20 @@ fn describe(path: &Path, a: &TrackAnalysis) -> String {
 
 fn main() -> anyhow::Result<()> {
     let args = parse_args()?;
+    let regrid = args.model.as_deref().map(regrid).transpose()?;
+    let regrid = regrid.as_deref();
     if args.analyze_only {
         for path in &args.files {
-            if let Err(err) = load(path, args.rate) {
+            if let Err(err) = load(path, args.rate, regrid) {
                 eprintln!("{}: {err:#}", path.display());
             }
         }
         return Ok(());
     }
     std::fs::create_dir_all(&args.out).with_context(|| format!("create {}", args.out.display()))?;
-    let mut prev = load(&args.files[0], args.rate)?;
+    let mut prev = load(&args.files[0], args.rate, regrid)?;
     for (n, path) in args.files.iter().enumerate().skip(1) {
-        let next = load(path, args.rate)?;
+        let next = load(path, args.rate, regrid)?;
         let mix = render(prev, next.clone(), &args.opts)?;
         let file = args.out.join(format!("{n:02}.wav"));
         let clipped = write_wav(&file, &mix.samples, mix.sample_rate, mix.channels)?;
