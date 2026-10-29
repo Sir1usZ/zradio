@@ -3,6 +3,7 @@
 
 use crate::beat_this::resample;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 /// Rate the model runs at.
 pub const MODEL_RATE: u32 = 44_100;
@@ -299,15 +300,79 @@ pub fn model_ready() -> bool {
 }
 
 /// Fetches the model, reporting progress as "42%", unless it is already there.
-#[cfg(feature = "stems")]
-pub fn download_model(
-    progress: Option<std::sync::mpsc::Sender<String>>,
-) -> anyhow::Result<PathBuf> {
-    let path = model_path();
-    if !model_ready() {
-        crate::beat_this::fetch_verified(MODEL_URL, MODEL_SHA256, &path, progress)?;
+pub fn download_model(progress: Option<Sender<String>>) -> anyhow::Result<PathBuf> {
+    #[cfg(feature = "stems")]
+    {
+        let path = model_path();
+        if !model_ready() {
+            crate::beat_this::fetch_verified(MODEL_URL, MODEL_SHA256, &path, progress)?;
+        }
+        Ok(path)
     }
-    Ok(path)
+    #[cfg(not(feature = "stems"))]
+    {
+        let _ = progress;
+        anyhow::bail!("this build has no voice separation")
+    }
+}
+
+/// Whether this build can separate voices.
+pub const AVAILABLE: bool = cfg!(feature = "stems");
+
+/// One thread running the jobs sent to it in turn; it ends when the worker is dropped.
+/// Each job is for the mix armed when it was sent, so of those waiting only the newest is
+/// run.
+pub struct Worker<J, R> {
+    jobs: Sender<J>,
+    done: Receiver<anyhow::Result<R>>,
+}
+
+impl<J: Send + 'static, R: Send + 'static> Worker<J, R> {
+    pub fn spawn(mut run: impl FnMut(J) -> anyhow::Result<R> + Send + 'static) -> Self {
+        let (jobs, rx) = mpsc::channel::<J>();
+        let (tx, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(mut job) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() {
+                    job = newer;
+                }
+                // A model that panics on one mix must not take the worker down with it.
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(job)));
+                let ran = ran.unwrap_or_else(|_| Err(anyhow::anyhow!("separation crashed")));
+                if tx.send(ran).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { jobs, done }
+    }
+
+    pub fn send(&self, job: J) -> bool {
+        self.jobs.send(job).is_ok()
+    }
+
+    pub fn try_recv(&self) -> Option<anyhow::Result<R>> {
+        self.done.try_recv().ok()
+    }
+}
+
+pub type Separate = dyn FnMut(crate::engine::VocalJob) -> anyhow::Result<Option<crate::engine::VocalOverlay>>
+    + Send;
+
+/// What the app separates the voices of a mix with, when this build can.
+pub fn separator() -> Option<Box<Separate>> {
+    #[cfg(feature = "stems")]
+    {
+        Some(Box::new(|job: crate::engine::VocalJob| {
+            // Loaded for each mix, so the memory it runs in is given back between them.
+            let model = Model::load(&model_path())?;
+            job.run(|x, rate| model.vocals(x, 2, rate))
+        }))
+    }
+    #[cfg(not(feature = "stems"))]
+    {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -586,6 +651,53 @@ mod tests {
         for (got, want) in rising.iter().zip(want) {
             assert!((got - want).abs() < want * 1e-3, "{rising:?}");
         }
+    }
+
+    fn wait<R: Send + 'static>(worker: &Worker<u32, R>) -> anyhow::Result<R> {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < until {
+            if let Some(r) = worker.try_recv() {
+                return r;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("the worker did not answer");
+    }
+
+    #[test]
+    fn the_worker_runs_only_the_newest_of_the_jobs_waiting() {
+        let (started_tx, started) = mpsc::channel();
+        let (gate, gate_rx) = mpsc::channel::<()>();
+        let worker = Worker::spawn(move |j: u32| {
+            started_tx.send(j).unwrap();
+            gate_rx.recv().unwrap();
+            Ok(j * 10)
+        });
+        assert!(worker.send(1));
+        let first = started.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(first.unwrap(), 1);
+        assert!(worker.send(2) && worker.send(3));
+        gate.send(()).unwrap();
+        assert_eq!(wait(&worker).unwrap(), 10);
+        gate.send(()).unwrap();
+        assert_eq!(wait(&worker).unwrap(), 30);
+        assert_eq!(
+            started.try_iter().collect::<Vec<_>>(),
+            [3],
+            "ran a stale job"
+        );
+    }
+
+    #[test]
+    fn a_job_that_panics_does_not_take_the_worker_down() {
+        let worker = Worker::spawn(|j: u32| {
+            assert!(j != 0, "no voice in job 0");
+            Ok(j)
+        });
+        assert!(worker.send(0));
+        assert!(wait(&worker).is_err());
+        assert!(worker.send(7));
+        assert_eq!(wait(&worker).unwrap(), 7);
     }
 
     #[test]
