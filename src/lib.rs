@@ -22,6 +22,7 @@ pub mod mpris;
 pub mod playlist;
 pub mod prefs;
 pub mod progress;
+pub mod regrid;
 pub mod remix;
 pub mod remote_meta;
 pub mod scope;

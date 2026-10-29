@@ -49,6 +49,7 @@ use crate::mpris::{MediaCmd, Mpris};
 use crate::playlist::{store_path, PlaylistStore};
 use crate::prefs::{Palette, Prefs, ShuffleMode};
 use crate::progress::{self, TransferBar};
+use crate::regrid;
 use crate::remix::{apply_remix, RemixMode};
 use crate::session_store::SessionState;
 use crate::shell::{format_listen_time, Tab};
@@ -164,6 +165,13 @@ struct DecodeFailure {
     error: String,
 }
 
+/// The Beat This! model being fetched.
+struct ModelFetch {
+    progress: Receiver<String>,
+    done: Receiver<Result<PathBuf, String>>,
+    percent: String,
+}
+
 struct PeekJob {
     id: TrackJobId,
     meta: TrackMeta,
@@ -277,6 +285,14 @@ pub struct App {
     browse_kind: BrowseKind,
     meta_queue: VecDeque<usize>,
     meta_inflight: HashSet<TrackJobId>,
+    /// Beat This! rescoring: started on first use, one track at a time.
+    regrid: Option<regrid::Worker<TrackJobId>>,
+    regrid_queue: regrid::Queue<TrackJobId>,
+    /// Rescored analyses the mixer gets once no mix planned on the old ones is pending.
+    regrid_ready: Vec<(TrackJobId, TrackAnalysis)>,
+    /// The track playing when the tracks around it were last queued.
+    regrid_around: Option<TrackJobId>,
+    model_fetch: Option<ModelFetch>,
     /// 远程控制 API 共享状态
     api_state: api::SharedState,
     playlists: PlaylistStore,
@@ -468,6 +484,11 @@ impl App {
             browse_kind: BrowseKind::All,
             meta_queue: VecDeque::new(),
             meta_inflight: HashSet::new(),
+            regrid: None,
+            regrid_queue: regrid::Queue::default(),
+            regrid_ready: Vec::new(),
+            regrid_around: None,
+            model_fetch: None,
             api_state,
             playlists: PlaylistStore::load(),
             lib_row: 0,
@@ -520,6 +541,9 @@ impl App {
         self.pending_seek = None;
         self.meta_queue.clear();
         self.meta_inflight.clear();
+        self.regrid_queue.clear();
+        self.regrid_ready.clear();
+        self.regrid_around = None;
     }
 
     fn persist_playlists(&mut self) -> bool {
@@ -1001,7 +1025,7 @@ impl App {
         self.status = format!("decode {}", track.title);
         let rate = self.player.sample_rate;
         let ch = self.player.channels;
-        let cached = self.analysis.get(&track.path);
+        let cached = regrid::reusable(self.analysis.get(&track.path), self.prefs.beat_this);
         let tx = self.decode_tx.clone();
         let mixer = Arc::clone(&self.player.mixer);
         thread::spawn(move || {
@@ -1071,7 +1095,14 @@ impl App {
                 .unwrap_or(0);
             job.analysis.size = meta.len();
         }
-        self.analysis.insert(path, job.analysis.clone());
+        // The decode may have read the cache before Beat This! rescored the track; the mix
+        // planned on what it read keeps it, and the rescored one follows once it is done.
+        let stored = self.analysis.get(path);
+        let rescored = regrid::rescored_since(stored, &job.analysis, self.prefs.beat_this);
+        match rescored {
+            Some(a) => self.regrid_ready.push((job.id.track.clone(), a)),
+            None => self.analysis.insert(path, job.analysis.clone()),
+        }
         let meta = load_meta(
             path,
             &self
@@ -1449,6 +1480,11 @@ impl App {
                     self.peek_sort_dirty = false;
                 }
                 self.pump_meta_queue();
+                self.drain_model_fetch();
+                self.drain_regrid();
+                self.apply_regrid();
+                self.want_regrid();
+                self.pump_regrid();
                 self.drain_progress();
                 self.drain_import();
                 self.drain_search();
@@ -1730,10 +1766,10 @@ impl App {
                     self.overlay = Overlay::None;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.settings_idx = (self.settings_idx + 1) % 7;
+                    self.settings_idx = (self.settings_idx + 1) % 8;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.settings_idx = (self.settings_idx + 6) % 7;
+                    self.settings_idx = (self.settings_idx + 7) % 8;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => self.toggle_setting(),
                 _ => {}
@@ -1977,7 +2013,8 @@ impl App {
             3 => self.prefs.lyrics_fetch = !self.prefs.lyrics_fetch,
             4 => self.prefs.cover_fetch = !self.prefs.cover_fetch,
             5 => self.prefs.resume = !self.prefs.resume,
-            6 => self.overlay = Overlay::None,
+            6 => return self.toggle_beat_this(),
+            7 => self.overlay = Overlay::None,
             _ => {}
         }
         self.prefs.save();
@@ -2054,6 +2091,197 @@ impl App {
                 self.meta_inflight.len()
             ));
         }
+    }
+
+    /// Queues the track playing and the one predicted next for Beat This!, once a track has
+    /// taken over.
+    fn want_regrid(&mut self) {
+        if !self.prefs.beat_this || self.model_fetch.is_some() {
+            return;
+        }
+        let current = {
+            let mixer = self.player.mixer.lock().expect("mixer");
+            if mixer.transition_pending() {
+                return;
+            }
+            mixer.current_index()
+        };
+        let Some(id) = current.and_then(|i| self.track_job_id(i)) else {
+            return;
+        };
+        if self.regrid_around.as_ref() == Some(&id) {
+            return;
+        }
+        self.regrid_around = Some(id.clone());
+        if !crate::beat_this::model_ready() {
+            self.prefs.beat_this = false;
+            self.prefs.save();
+            self.status = "Beat This! off: its model is gone; turn it on again to fetch it".into();
+            return;
+        }
+        // AutoMix weighs the whole library to predict it, so only once a track.
+        let next = self.player.mixer.lock().expect("mixer").next_index();
+        let next = next
+            .filter(|&i| i != id.index)
+            .and_then(|i| self.track_job_id(i));
+        for (id, front) in [(Some(id), true), (next, false)] {
+            let Some(id) = id else {
+                continue;
+            };
+            let path = id.path.clone();
+            if self.analysis.get(&path).is_some_and(|a| a.beat_this) {
+                continue;
+            }
+            if front {
+                self.regrid_queue.push_front(id, &path);
+            } else {
+                self.regrid_queue.push_back(id, &path);
+            }
+        }
+    }
+
+    fn pump_regrid(&mut self) {
+        if !self.prefs.beat_this {
+            return;
+        }
+        let Some(id) = self.regrid_queue.take() else {
+            return;
+        };
+        let base = self.analysis.get(&id.path);
+        let current = id.matches(self.library_generation, &self.tracks);
+        if !current || base.as_ref().is_some_and(|a| a.beat_this) {
+            self.regrid_queue.finish(&id.path);
+            return;
+        }
+        if self.regrid.is_none() {
+            let (rate, channels) = (self.player.sample_rate, self.player.channels);
+            self.regrid = regrid::scorer(rate, channels).map(regrid::Worker::spawn);
+        }
+        let path = id.path.clone();
+        let sent = self.regrid.as_ref().is_some_and(|w| {
+            w.send(regrid::Job {
+                id,
+                path: path.clone(),
+                base,
+            })
+        });
+        if !sent {
+            self.regrid = None;
+            self.regrid_queue.finish(&path);
+        }
+    }
+
+    fn drain_regrid(&mut self) {
+        let Some(worker) = self.regrid.as_ref() else {
+            return;
+        };
+        let mut done = Vec::new();
+        while let Some(d) = worker.try_recv() {
+            done.push(d);
+        }
+        for d in done {
+            self.regrid_queue.finish(&d.path);
+            match d.analysis {
+                // Turned off meanwhile: the track keeps the onset tracker's grid.
+                Ok(_) if !self.prefs.beat_this => {}
+                Ok(a) => {
+                    self.analysis.insert(&d.path, a.clone());
+                    self.regrid_ready.push((d.id, a));
+                }
+                Err(e) => self.status = format!("fail Beat This! {e}"),
+            }
+        }
+    }
+
+    /// Hands rescored analyses to the mixer, unless a mix planned on the old ones is pending.
+    fn apply_regrid(&mut self) {
+        if !self.prefs.beat_this {
+            self.regrid_ready.clear();
+            return;
+        }
+        if self.regrid_ready.is_empty() || self.inflight.is_some() {
+            return;
+        }
+        let mut mixer = self.player.mixer.lock().expect("mixer");
+        if mixer.transition_pending() {
+            return;
+        }
+        for (id, analysis) in self.regrid_ready.drain(..) {
+            // Only tracks the mixer already knows: a new one would change what AutoMix picks.
+            let known = mixer.analysis_at(id.index).is_some();
+            if known && id.matches(self.library_generation, &self.tracks) {
+                mixer.set_analysis(id.index, analysis);
+            }
+        }
+    }
+
+    fn toggle_beat_this(&mut self) {
+        if self.model_fetch.is_some() {
+            return;
+        }
+        if self.prefs.beat_this {
+            self.prefs.beat_this = false;
+            self.prefs.save();
+            self.regrid_queue = regrid::Queue::default();
+            self.status = "Beat This! off: tracks go back to the onset grid as they play".into();
+        } else if !regrid::AVAILABLE {
+            self.status =
+                "this build has no Beat This! (built without the beat-this feature)".into();
+        } else if crate::beat_this::model_ready() {
+            self.enable_beat_this();
+        } else {
+            let (progress_tx, progress) = mpsc::channel();
+            let (done_tx, done) = mpsc::channel();
+            thread::spawn(move || {
+                let fetched = regrid::fetch_model(Some(progress_tx));
+                let _ = done_tx.send(fetched.map_err(|e| e.to_string()));
+            });
+            self.model_fetch = Some(ModelFetch {
+                progress,
+                done,
+                percent: "0%".into(),
+            });
+            let mb = crate::beat_this::MODEL_BYTES / 1_000_000;
+            self.status = format!("fetching the Beat This! model ({mb} MB) from GitHub");
+        }
+    }
+
+    fn enable_beat_this(&mut self) {
+        self.prefs.beat_this = true;
+        self.prefs.save();
+        // A track cut short when it was turned off is tried again.
+        self.regrid_queue = regrid::Queue::default();
+        self.regrid_around = None;
+        self.status = "Beat This! on: the track playing and the next are rescored".into();
+    }
+
+    fn drain_model_fetch(&mut self) {
+        let Some(fetch) = self.model_fetch.as_mut() else {
+            return;
+        };
+        while let Ok(p) = fetch.progress.try_recv() {
+            fetch.percent = p;
+        }
+        let result = match fetch.done.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("the download thread died".into()),
+        };
+        self.model_fetch = None;
+        match result {
+            Ok(_) => self.enable_beat_this(),
+            Err(e) => self.status = format!("fail Beat This! model: {e}"),
+        }
+    }
+
+    fn beat_this_label(&self) -> String {
+        if !regrid::AVAILABLE {
+            return "未编译".into();
+        }
+        if let Some(fetch) = self.model_fetch.as_ref() {
+            return format!("下载模型 {}", fetch.percent);
+        }
+        on_off(self.prefs.beat_this).into()
     }
 
     fn bump_eq(&mut self, delta: f32) {
@@ -3602,6 +3830,7 @@ impl App {
             format!("拉歌词      {}", on_off(self.prefs.lyrics_fetch)),
             format!("拉封面      {}", on_off(self.prefs.cover_fetch)),
             format!("续播        {}", on_off(self.prefs.resume)),
+            format!("Beat This!  {}", self.beat_this_label()),
             "关闭".into(),
         ];
         let items: Vec<ListItem> = rows
@@ -3612,7 +3841,7 @@ impl App {
                 ListItem::new(format!("{mark}{row}"))
             })
             .collect();
-        let area = centered(frame.area(), 42, 12);
+        let area = centered(frame.area(), 42, 13);
         let pal = self.palette();
         frame.render_widget(Clear, area);
         frame.render_widget(

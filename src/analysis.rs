@@ -190,6 +190,18 @@ impl TrackAnalysis {
     }
 }
 
+/// The modification time, in seconds, and size the cache keys an analysis to.
+pub fn file_stamp(path: &Path) -> std::io::Result<(u64, u64)> {
+    let meta = fs::metadata(path)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok((mtime, meta.len()))
+}
+
 pub fn analyze_file(path: &Path, buf: &AudioBuf, cache: &mut AnalysisStore) -> TrackAnalysis {
     if let Some(hit) = cache.get(path) {
         return hit;
