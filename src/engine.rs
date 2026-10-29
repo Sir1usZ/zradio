@@ -1120,6 +1120,11 @@ impl Mixer {
         self.incoming.is_some() && self.fade_total > 0
     }
 
+    /// Where the mix under way hands one voice to the next, if its voices were separated.
+    pub fn vocal_handoff(&self) -> Option<Handoff> {
+        self.vocals.as_ref().map(|v| v.handoff)
+    }
+
     /// Whether a mix is armed or under way; its plan was made from the analyses as they were.
     pub fn transition_pending(&self) -> bool {
         self.incoming.is_some() || self.armed.is_some()

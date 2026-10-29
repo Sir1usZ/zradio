@@ -12,7 +12,7 @@ use crate::analysis::TrackAnalysis;
 use crate::automix::TransitionPlan;
 use crate::decode::AudioBuf;
 use crate::dsp::MixMode;
-use crate::engine::Mixer;
+use crate::engine::{Mixer, VocalJob, VocalOverlay, STEMS_LEAD_SECS};
 use crate::library::Track;
 
 /// Frames per `fill`; the overlap is placed to within one block.
@@ -59,6 +59,9 @@ pub struct Mixdown {
     /// Where in the outgoing track the overlap starts, in seconds of its source.
     pub mix_at: f32,
     pub plan: Option<TransitionPlan>,
+    /// The frame of `samples` the outgoing voice is gone by and the incoming one starts at,
+    /// placed to within one block, if the voices were separated.
+    pub handoff: Option<usize>,
 }
 
 impl Mixdown {
@@ -78,6 +81,22 @@ impl Mixdown {
 /// Plays `a` into `b` the way the player does: the mixer decides when to ask for `b`, and `b`
 /// arrives the way the decode worker hands it over.
 pub fn render(a: Side, b: Side, opts: &Options) -> anyhow::Result<Mixdown> {
+    render_with(
+        a,
+        b,
+        opts,
+        None::<fn(VocalJob) -> anyhow::Result<Option<VocalOverlay>>>,
+    )
+}
+
+/// [`render`] with the voice handoff on: `separate` splits the voices of the armed mix as the
+/// player's voice worker does, but before the mixer plays on, so they are always in time.
+pub fn render_with(
+    a: Side,
+    b: Side,
+    opts: &Options,
+    mut separate: Option<impl FnMut(VocalJob) -> anyhow::Result<Option<VocalOverlay>>>,
+) -> anyhow::Result<Mixdown> {
     let sr = a.buf.sample_rate;
     let ch = a.buf.channels;
     ensure!(
@@ -97,7 +116,15 @@ pub fn render(a: Side, b: Side, opts: &Options) -> anyhow::Result<Mixdown> {
             );
             at - opts.before_secs
         }
-        None => a.analysis.mix_out.min(a_secs) - LEAD_SECS - opts.before_secs,
+        None => {
+            // The player fetches the next track sooner when it has voices to separate.
+            let stems = if separate.is_some() {
+                STEMS_LEAD_SECS
+            } else {
+                0.0
+            };
+            a.analysis.mix_out.min(a_secs) - LEAD_SECS - stems - opts.before_secs
+        }
     }
     .max(0.0);
     let limit = a.buf.frames() + b.buf.frames() + 60 * sr as usize;
@@ -108,6 +135,7 @@ pub fn render(a: Side, b: Side, opts: &Options) -> anyhow::Result<Mixdown> {
     let mut mixer = Mixer::new(sr, ch);
     mixer.set_tracks(vec![track(&a.path), track(&b.path)]);
     mixer.set_mix(opts.mode);
+    mixer.set_stems(separate.is_some());
     mixer.bump_volume(1.0);
     mixer.set_analysis(0, a.analysis);
     mixer.play_decoded(0, a.buf);
@@ -119,6 +147,7 @@ pub fn render(a: Side, b: Side, opts: &Options) -> anyhow::Result<Mixdown> {
     let mut overlap: Option<Range<usize>> = None;
     let mut start = None;
     let mut mix_at = 0.0;
+    let mut handoff = None;
     let mut handed_at = 0.0;
     let source_secs = |m: &Mixer| m.playback_view(0).position_frames as f32 / sr as f32;
     loop {
@@ -135,12 +164,20 @@ pub fn render(a: Side, b: Side, opts: &Options) -> anyhow::Result<Mixdown> {
                 hand_over(&mut mixer, next.take().unwrap(), transition, skip);
             }
         }
+        if let Some(separate) = separate.as_mut() {
+            if let Some(job) = mixer.take_vocal_job() {
+                if let Some(overlay) = separate(job)? {
+                    mixer.attach_vocals(overlay);
+                }
+            }
+        }
         mixer.fill(&mut block);
         out.extend_from_slice(&block);
         let fading = mixer.fading();
         if fading && start.is_none() {
             start = Some(frame);
             mix_at = source_secs(&mixer);
+            handoff = mixer.vocal_handoff().map(|h| frame + h.at);
         }
         if overlap.is_none() && next.is_none() && !fading && mixer.current_index() == Some(1) {
             // A cut never fades; it hands over where the outgoing deck stood.
@@ -170,6 +207,7 @@ pub fn render(a: Side, b: Side, opts: &Options) -> anyhow::Result<Mixdown> {
         overlap: overlap.start - keep..overlap.end - keep,
         mix_at,
         plan: mixer.last_plan(),
+        handoff: handoff.map(|h| h - keep),
     })
 }
 
@@ -461,6 +499,76 @@ mod tests {
         assert!(
             incoming < -30.0 && outgoing < -30.0,
             "bass leaks through the high band: incoming {incoming:.1} dB, outgoing {outgoing:.1} dB"
+        );
+    }
+
+    /// A 440 Hz tone at `amps.0` into a 660 Hz one at `amps.1`, through `separate`.
+    fn render_tones(
+        amps: (f32, f32),
+        separate: impl FnMut(VocalJob) -> anyhow::Result<Option<VocalOverlay>>,
+    ) -> Mixdown {
+        let a = tone(40.0, 440.0, amps.0, 120.0);
+        let b = tone(40.0, 660.0, amps.1, 120.0);
+        render_with(a, b, &Options::default(), Some(separate)).unwrap()
+    }
+
+    /// The largest difference between two renders over `frames`.
+    fn diff(x: &Mixdown, y: &Mixdown, frames: Range<usize>) -> f32 {
+        let range = frames.start * x.channels..frames.end * x.channels;
+        x.samples[range.clone()]
+            .iter()
+            .zip(&y.samples[range])
+            .fold(0.0, |m, (p, q)| m.max((p - q).abs()))
+    }
+
+    #[test]
+    fn voice_handoff_plays_one_voice_at_a_time() {
+        // Each tone is all voice, so with the voices separated the outgoing tone plays alone
+        // until the handoff and the incoming one alone after it.
+        let mut calls = 0;
+        let mut whole = |job: VocalJob| {
+            calls += 1;
+            job.run(|audio, _| Ok(audio.to_vec()))
+        };
+        let mix = render_tones((0.5, 0.5), &mut whole);
+        assert_eq!(calls, 1, "separated {calls} times");
+        let mut none = |_: VocalJob| -> anyhow::Result<Option<VocalOverlay>> { Ok(None) };
+        let plain = render_tones((0.5, 0.5), &mut none);
+        let only_a = render_tones((0.5, 0.0), &mut none);
+        let only_b = render_tones((0.0, 0.5), &mut none);
+        assert!(plain.handoff.is_none());
+        for other in [&plain, &only_a, &only_b] {
+            assert_eq!(
+                (other.overlap.clone(), other.frames()),
+                (mix.overlap.clone(), mix.frames())
+            );
+        }
+
+        let at = mix.handoff.expect("a handoff");
+        assert!(
+            mix.overlap.contains(&at),
+            "handoff at {at} outside {:?}",
+            mix.overlap
+        );
+        // The ramp either side of the handoff, and the block the overlap is placed to within.
+        let ramp = (0.3 * SR as f32) as usize + 2 * BLOCK;
+        let before = 0..at - ramp;
+        let after = at + ramp + SR as usize / 50..mix.frames();
+        let (early, late) = (
+            diff(&mix, &only_a, before.clone()),
+            diff(&mix, &only_b, after.clone()),
+        );
+        // The flat master EQ is off by about 1e-4 on these tones, and off differently after a
+        // different past, so the incoming tone alone still differs that much from the mix.
+        assert!(
+            early < 1e-6 && late < 1e-3,
+            "{early} off the outgoing tone before the handoff, {late} off the incoming one after"
+        );
+        // Without the handoff both tones play there.
+        let (both_early, both_late) = (diff(&plain, &only_a, before), diff(&plain, &only_b, after));
+        assert!(
+            both_early > 0.01 && both_late > 0.01,
+            "the other tone is {both_early} before and {both_late} after the handoff"
         );
     }
 
