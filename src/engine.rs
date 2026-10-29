@@ -1794,6 +1794,9 @@ mod tests {
             duration,
             loudness: None,
             peak: 0.0,
+            music_start: 0.0,
+            music_end: duration,
+            beat_this: false,
         }
     }
 

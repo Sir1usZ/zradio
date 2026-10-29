@@ -11,7 +11,7 @@ use crate::decode::AudioBuf;
 use crate::dsp::{Biquad, CROSSOVER_HZ};
 use crate::storage::write_json_atomic;
 
-const ANALYSIS_VERSION: u32 = 7;
+const ANALYSIS_VERSION: u32 = 8;
 const ENV_HZ: f32 = 50.0;
 const BPM_MIN: f32 = 70.0;
 const BPM_MAX: f32 = 180.0;
@@ -80,6 +80,14 @@ pub struct TrackAnalysis {
     /// Sample peak as AutoMix plays the track, through its crossover, 1 at full scale.
     #[serde(default)]
     pub peak: f32,
+    /// Where the music is heard from and to, in seconds, past the silence around it.
+    #[serde(default)]
+    pub music_start: f32,
+    #[serde(default)]
+    pub music_end: f32,
+    /// Whether Beat This! has scored the track; its grid, when it found one, is the one above.
+    #[serde(default)]
+    pub beat_this: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -104,26 +112,7 @@ pub fn analyze_buffer(buf: &AudioBuf) -> TrackAnalysis {
     let (start, end) = loudness
         .and_then(|l| music_span(&steps, l))
         .unwrap_or((0.0, duration));
-    let mix_in = if let Some(bpm) = bpm {
-        // The first beat of the grid that the music is heard on, or the step before it, as
-        // the step it starts in begins up to 100 ms early.
-        let beat = 60.0 / bpm;
-        let n = ((start - LOUDNESS_STEP_SECS - first) / beat)
-            .ceil()
-            .max(0.0);
-        (first + n * beat).min(duration)
-    } else {
-        first.max(start)
-    };
-    let mix_out = if let Some(bpm) = bpm {
-        let bar = 240.0 / bpm;
-        let ideal = snap_to_bar(duration - bar * 8.0, first, bpm);
-        // On a short track or a long silent tail, the bar the music is still heard on.
-        let last = first + ((end - first) / bar + 1e-3).floor() * bar;
-        ideal.min(last).max(mix_in + bar).min(duration)
-    } else {
-        (duration * 0.82).min(end).max(0.0).min(duration)
-    };
+    let (mix_in, mix_out) = mix_points(duration, bpm, first, (start, end), false);
     TrackAnalysis {
         version: ANALYSIS_VERSION,
         mtime: 0,
@@ -141,6 +130,63 @@ pub fn analyze_buffer(buf: &AudioBuf) -> TrackAnalysis {
         duration,
         loudness,
         peak: peak(buf),
+        music_start: start,
+        music_end: end,
+        beat_this: false,
+    }
+}
+
+/// Where AutoMix brings a track in and takes it out: the first beat of the grid the music
+/// is heard on, or the first bar when the grid's bar line is known, and the bar eight
+/// before the end, or the last one the music is still heard on.
+fn mix_points(
+    duration: f32,
+    bpm: Option<f32>,
+    first: f32,
+    (start, end): (f32, f32),
+    bar_known: bool,
+) -> (f32, f32) {
+    let Some(bpm) = bpm else {
+        return (
+            first.max(start),
+            (duration * 0.82).min(end).max(0.0).min(duration),
+        );
+    };
+    let (beat, bar) = (60.0 / bpm, 240.0 / bpm);
+    // The step the music starts in begins up to 100 ms before it.
+    let unit = if bar_known { bar } else { beat };
+    let n = ((start - LOUDNESS_STEP_SECS - first) / unit)
+        .ceil()
+        .max(0.0);
+    let mix_in = (first + n * unit).min(duration);
+    let ideal = snap_to_bar(duration - bar * 8.0, first, bpm);
+    // On a short track or a long silent tail, the bar the music is still heard on.
+    let last = first + ((end - first) / bar + 1e-3).floor() * bar;
+    let mix_out = ideal.min(last).max(mix_in + bar).min(duration);
+    (mix_in, mix_out)
+}
+
+impl TrackAnalysis {
+    /// The analysis on Beat This!'s grid, scored as such; unchanged when it found none.
+    pub fn with_grid(&self, grid: Option<crate::beat_this::Grid>) -> Self {
+        let Some(g) = grid else {
+            return TrackAnalysis {
+                beat_this: true,
+                ..self.clone()
+            };
+        };
+        let bpm = g.bpm as f32;
+        let first = (g.first as f32).clamp(0.0, self.duration);
+        let span = (self.music_start, self.music_end);
+        let (mix_in, mix_out) = mix_points(self.duration, Some(bpm), first, span, g.bar_known);
+        TrackAnalysis {
+            bpm: Some(bpm),
+            first_beat: first,
+            mix_in,
+            mix_out,
+            beat_this: true,
+            ..self.clone()
+        }
     }
 }
 
@@ -817,6 +863,75 @@ mod tests {
             (40.4..42.6).contains(&a.mix_out) && on_grid(a.mix_out, beat * 4.0),
             "mixes out at {} s, the music ends at 42.5 s",
             a.mix_out
+        );
+        assert!((2.8..3.1).contains(&a.music_start), "{}", a.music_start);
+        assert!((42.4..42.8).contains(&a.music_end), "{}", a.music_end);
+    }
+
+    /// Four minutes heard from 2.9 s to 236 s, on the onset tracker's grid.
+    fn tracked() -> TrackAnalysis {
+        let mut a = analyze_buffer(&AudioBuf {
+            samples: Vec::new(),
+            sample_rate: 44_100,
+            channels: 2,
+        });
+        a.bpm = Some(123.0);
+        a.first_beat = 0.1;
+        a.duration = 240.0;
+        a.music_start = 2.9;
+        a.music_end = 236.0;
+        (a.mix_in, a.mix_out) = (3.05, 224.0);
+        a
+    }
+
+    #[test]
+    fn a_beat_this_grid_moves_the_mix_points_onto_its_bars() {
+        let grid = crate::beat_this::Grid {
+            bpm: 124.0,
+            first: 0.35,
+            bar_known: true,
+        };
+        let a = tracked().with_grid(Some(grid));
+        assert!(a.beat_this);
+        assert_eq!((a.bpm, a.first_beat), (Some(124.0), 0.35));
+        let bar = 240.0 / 124.0;
+        let on_bar = |t: f32| {
+            let n = (t - 0.35) / bar;
+            (n - n.round()).abs() < 1e-3
+        };
+        // The first bar the music is heard on, and the bar eight before the end.
+        assert!(
+            on_bar(a.mix_in) && (2.8..2.8 + bar).contains(&a.mix_in),
+            "mixes in at {}",
+            a.mix_in
+        );
+        assert!(
+            on_bar(a.mix_out) && (240.0 - 8.5 * bar..240.0 - 7.5 * bar).contains(&a.mix_out),
+            "mixes out at {}",
+            a.mix_out
+        );
+        // Without the bar line, the first beat the music is heard on.
+        let a = tracked().with_grid(Some(crate::beat_this::Grid {
+            bar_known: false,
+            ..grid
+        }));
+        let beat = 60.0 / 124.0;
+        let n = (a.mix_in - 0.35) / beat;
+        assert!(
+            (n - n.round()).abs() < 1e-3 && (2.8..2.8 + beat).contains(&a.mix_in),
+            "mixes in at {}",
+            a.mix_in
+        );
+    }
+
+    #[test]
+    fn a_track_beat_this_found_no_grid_in_keeps_its_own() {
+        let before = tracked();
+        let after = before.with_grid(None);
+        assert!(after.beat_this);
+        assert_eq!(
+            (after.bpm, after.first_beat, after.mix_in, after.mix_out),
+            (before.bpm, before.first_beat, before.mix_in, before.mix_out)
         );
     }
 
