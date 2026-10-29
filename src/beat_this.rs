@@ -18,6 +18,170 @@ const F_MIN: f64 = 30.0;
 const F_MAX: f64 = 11_000.0;
 const LOG_MULTIPLIER: f32 = 1000.0;
 
+/// Frames the model scores at once: 30 s, the excerpt length it was trained on.
+pub const CHUNK_FRAMES: usize = 1500;
+/// Frames at either edge of a chunk the model was not trained to score; neighbouring chunks
+/// overlap by this much and each keeps only its inner frames.
+const BORDER_FRAMES: usize = 6;
+
+/// Beat and downbeat times in seconds, ascending. Every downbeat is also a beat, unless the
+/// model heard no beats at all.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Beats {
+    pub beats: Vec<f64>,
+    pub downbeats: Vec<f64>,
+}
+
+/// Beat and downbeat logits for every frame of `mel`, scored `chunk` frames at a time by
+/// `run`, as Beat This! itself splits a track: zero-padded at both ends, neighbours
+/// overlapping by twice the border, the last chunk ending on the last frame, and each frame
+/// kept from the first chunk that scores it away from its border.
+pub fn score_chunked<F>(mel: &[f32], chunk: usize, mut run: F) -> (Vec<f32>, Vec<f32>)
+where
+    F: FnMut(&[f32]) -> (Vec<f32>, Vec<f32>),
+{
+    let frames = mel.len() / N_MELS;
+    let (border, inner) = (
+        BORDER_FRAMES as isize,
+        chunk as isize - 2 * BORDER_FRAMES as isize,
+    );
+    let len = frames as isize;
+    let mut starts: Vec<isize> = (0..)
+        .map(|i| i * inner - border)
+        .take_while(|&s| s < len - border)
+        .collect();
+    if len > inner {
+        if let Some(last) = starts.last_mut() {
+            *last = len - (chunk as isize - border);
+        }
+    }
+    let (mut beat, mut downbeat) = (vec![-1000.0; frames], vec![-1000.0; frames]);
+    let mut input = Vec::with_capacity(chunk * N_MELS);
+    // Frames before `done` were already scored by an earlier chunk.
+    let mut done = 0;
+    for &start in &starts {
+        let (lo, hi) = (
+            start.max(0) as usize,
+            ((start + chunk as isize).min(len)) as usize,
+        );
+        let right = (start + chunk as isize - len).clamp(0, border) as usize;
+        input.clear();
+        input.resize((-start).max(0) as usize * N_MELS, 0.0);
+        input.extend_from_slice(&mel[lo * N_MELS..hi * N_MELS]);
+        input.resize(input.len() + right * N_MELS, 0.0);
+        let (b, d) = run(&input);
+        let keep = BORDER_FRAMES..b.len().min(d.len()).saturating_sub(BORDER_FRAMES);
+        for i in keep {
+            let f = start + i as isize;
+            if (done..len).contains(&f) {
+                beat[f as usize] = b[i];
+                downbeat[f as usize] = d[i];
+                done = f + 1;
+            }
+        }
+    }
+    (beat, downbeat)
+}
+
+/// Beats and downbeats from frame logits, as Beat This!'s minimal postprocessing finds them:
+/// a frame whose logit is above zero and the highest within 70 ms, adjacent frames merged
+/// into their mean, and each downbeat moved onto the nearest beat.
+pub fn pick(beat: &[f32], downbeat: &[f32]) -> Beats {
+    let peaks = |logits: &[f32]| -> Vec<f64> {
+        let half = 3;
+        let frames = (0..logits.len()).filter(|&i| {
+            let around = &logits[i.saturating_sub(half)..(i + half + 1).min(logits.len())];
+            logits[i] > 0.0 && around.iter().all(|&v| v <= logits[i])
+        });
+        // Adjacent frames, each within a frame of the running mean, are one peak.
+        let mut merged: Vec<(f64, f64)> = Vec::new();
+        for f in frames {
+            let f = f as f64;
+            match merged.last_mut() {
+                Some((mean, n)) if f - *mean <= 1.0 => {
+                    *n += 1.0;
+                    *mean += (f - *mean) / *n;
+                }
+                _ => merged.push((f, 1.0)),
+            }
+        }
+        merged.into_iter().map(|(mean, _)| mean / FPS).collect()
+    };
+    let beats = peaks(beat);
+    let mut downbeats: Vec<f64> = peaks(downbeat)
+        .into_iter()
+        .map(|d| {
+            beats
+                .iter()
+                .copied()
+                .fold(None, |best: Option<f64>, b| match best {
+                    Some(x) if (x - d).abs() <= (b - d).abs() => Some(x),
+                    _ => Some(b),
+                })
+                .unwrap_or(d)
+        })
+        .collect();
+    downbeats.sort_by(f64::total_cmp);
+    downbeats.dedup();
+    Beats { beats, downbeats }
+}
+
+/// The Beat This! network, loaded from its ONNX export.
+#[cfg(feature = "beat-this")]
+pub struct Model {
+    plan: std::sync::Arc<tract_onnx::prelude::TypedRunnableModel>,
+}
+
+#[cfg(feature = "beat-this")]
+impl Model {
+    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        use tract_onnx::prelude::*;
+        let model = tract_onnx::onnx().model_for_path(path)?;
+        let time = model.symbols.sym("T");
+        let plan = model
+            .with_input_fact(
+                0,
+                f32::fact(&[1.to_dim(), time.to_dim(), N_MELS.to_dim()]).into(),
+            )?
+            .into_optimized()?
+            .into_runnable()?;
+        Ok(Self { plan })
+    }
+
+    /// Frame logits for one chunk of spectrogram.
+    fn score(&self, chunk: &[f32]) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+        use tract_onnx::prelude::*;
+        let frames = chunk.len() / N_MELS;
+        let input = Tensor::from_shape(&[1, frames, N_MELS], chunk)?;
+        let out = self.plan.run(tvec!(input.into()))?;
+        let logits = |i: usize| -> anyhow::Result<Vec<f32>> {
+            let t = out
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("model gave no output {i}"))?;
+            Ok(t.to_plain_array_view::<f32>()?.iter().copied().collect())
+        };
+        Ok((logits(0)?, logits(1)?))
+    }
+
+    /// Beats and downbeats of mono audio at `MODEL_RATE`.
+    pub fn beats(&self, mono: &[f32]) -> anyhow::Result<Beats> {
+        let mut failed = None;
+        let (beat, downbeat) = score_chunked(&log_mel(mono), CHUNK_FRAMES, |chunk| {
+            if failed.is_some() {
+                return (Vec::new(), Vec::new());
+            }
+            self.score(chunk).unwrap_or_else(|e| {
+                failed = Some(e);
+                (Vec::new(), Vec::new())
+            })
+        });
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(pick(&beat, &downbeat)),
+        }
+    }
+}
+
 /// Zero crossings the resampling low-pass reaches on either side of its centre.
 const SINC_ZEROS: usize = 32;
 /// Table steps between two zero crossings; taps in between are interpolated.
@@ -273,5 +437,139 @@ mod tests {
         assert!(log_mel(&[]).is_empty());
         assert!(log_mel(&[0.1; N_FFT / 2]).is_empty());
         assert_eq!(log_mel(&[0.0; N_FFT / 2 + 1]).len(), 2 * N_MELS);
+    }
+
+    /// A spectrogram whose frame `f` carries `f + 1` in its first band, so a chunk shows
+    /// where it was cut from and zero where it was padded.
+    fn numbered(frames: usize) -> Vec<f32> {
+        (0..frames * N_MELS)
+            .map(|i| {
+                if i % N_MELS == 0 {
+                    (i / N_MELS + 1) as f32
+                } else {
+                    0.5
+                }
+            })
+            .collect()
+    }
+
+    /// Scores each chunk with the chunk's number times 1000 plus the position in it as the
+    /// beat, and what the chunk holds there as the downbeat.
+    fn tagging_run(sizes: &mut Vec<usize>) -> impl FnMut(&[f32]) -> (Vec<f32>, Vec<f32>) + '_ {
+        move |chunk: &[f32]| {
+            let call = sizes.len() as f32;
+            sizes.push(chunk.len() / N_MELS);
+            chunk
+                .chunks(N_MELS)
+                .enumerate()
+                .map(|(i, f)| (call * 1000.0 + i as f32, f[0]))
+                .unzip()
+        }
+    }
+
+    #[test]
+    fn chunks_overlap_and_keep_each_frame_from_the_first_that_scores_it() {
+        let mut sizes = Vec::new();
+        let (beat, downbeat) = score_chunked(&numbered(50), 30, tagging_run(&mut sizes));
+        // Starts at -6, 12 and 26: the last one pulled back to end on the last frame.
+        assert_eq!(sizes, [30, 30, 30]);
+        let expected: Vec<f32> = (0..50)
+            .map(|f| match f {
+                0..18 => (f + 6) as f32,
+                // The second chunk keeps frames 18 to 35, the overlap with the third included.
+                18..36 => (1000 + f - 12) as f32,
+                _ => (2000 + f - 26) as f32,
+            })
+            .collect();
+        assert_eq!(beat, expected);
+        assert_eq!(downbeat, (1..=50).map(|f| f as f32).collect::<Vec<_>>());
+
+        let mut sizes = Vec::new();
+        let (_, downbeat) = score_chunked(&numbered(100), 30, tagging_run(&mut sizes));
+        assert_eq!(sizes, [30; 6]);
+        assert_eq!(downbeat, (1..=100).map(|f| f as f32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_track_shorter_than_a_chunk_is_scored_once() {
+        let mut sizes = Vec::new();
+        let (beat, downbeat) = score_chunked(&numbered(10), 30, tagging_run(&mut sizes));
+        assert_eq!(sizes, [22]);
+        assert_eq!(beat, (6..16).map(|f| f as f32).collect::<Vec<_>>());
+        assert_eq!(downbeat, (1..=10).map(|f| f as f32).collect::<Vec<_>>());
+
+        let mut sizes = Vec::new();
+        let (beat, _) = score_chunked(&[], 30, tagging_run(&mut sizes));
+        assert!(beat.is_empty() && sizes.is_empty());
+    }
+
+    #[test]
+    fn beats_are_the_confident_local_peaks_and_downbeats_land_on_them() {
+        let mut beat = vec![-5.0f32; 40];
+        beat[5] = 2.0;
+        beat[7] = 1.0; // within 70 ms of a stronger peak
+        beat[12] = -0.5; // a peak, but under even odds
+        beat[20] = 3.0;
+        beat[21] = 3.0; // two frames tied: one beat between them
+        beat[30] = 1.5;
+        beat[39] = 0.8;
+        let mut downbeat = vec![-5.0f32; 40];
+        downbeat[6] = 1.0;
+        downbeat[29] = 2.0;
+        downbeat[33] = 1.0; // nearest beat is the one frame 29 already took
+        let picked = pick(&beat, &downbeat);
+        assert_eq!(picked.beats, [0.1, 0.41, 0.6, 0.78]);
+        assert_eq!(picked.downbeats, [0.1, 0.6]);
+
+        let mut downbeat = vec![-1.0f32; 10];
+        downbeat[4] = 1.0;
+        let picked = pick(&[-1.0; 10], &downbeat);
+        assert!(picked.beats.is_empty());
+        assert_eq!(picked.downbeats, [0.08]);
+    }
+
+    /// 120 BPM kicks from 0.3 s, every fourth one louder and brighter.
+    #[cfg(feature = "beat-this")]
+    fn click_track(rate: u32, secs: f64) -> Vec<f32> {
+        let n = (secs * f64::from(rate)) as usize;
+        let mut x = vec![0.0f32; n];
+        for k in 0.. {
+            let at = 0.3 + 0.5 * k as f64;
+            let start = (at * f64::from(rate)) as usize;
+            if start >= n {
+                break;
+            }
+            let (amp, hz) = if k % 4 == 0 {
+                (0.9, 1_800.0)
+            } else {
+                (0.5, 900.0)
+            };
+            for (i, s) in x[start..].iter_mut().take(rate as usize / 5).enumerate() {
+                let t = i as f64 / f64::from(rate);
+                let kick = (std::f64::consts::TAU * 55.0 * t).sin() * (-t * 25.0).exp();
+                let tick = (std::f64::consts::TAU * hz * t).sin() * (-t * 120.0).exp();
+                *s += (amp * (kick + 0.5 * tick)) as f32;
+            }
+        }
+        x
+    }
+
+    /// Needs the model: ZRADIO_BEAT_THIS_MODEL=path/to/beat_this.onnx cargo test -- --ignored
+    #[cfg(feature = "beat-this")]
+    #[test]
+    #[ignore]
+    fn the_model_finds_the_beats_of_a_click_track() {
+        let Some(path) = std::env::var_os("ZRADIO_BEAT_THIS_MODEL") else {
+            panic!("set ZRADIO_BEAT_THIS_MODEL to the model file");
+        };
+        let model = Model::load(std::path::Path::new(&path)).expect("load");
+        let mono = to_model_rate(&click_track(44_100, 40.0), 1, 44_100);
+        let found = model.beats(&mono).expect("beats");
+        let expected: Vec<f64> = (0..80).map(|k| 0.3 + 0.5 * k as f64).collect();
+        let hit = |t: &f64| found.beats.iter().any(|b| (b - t).abs() <= 0.07);
+        let hits = expected.iter().filter(|t| hit(t)).count();
+        assert!(hits >= 76, "{hits}/80 beats found: {:?}", found.beats);
+        let extra = found.beats.len().saturating_sub(hits);
+        assert!(extra <= 4, "{extra} beats off the grid: {:?}", found.beats);
     }
 }

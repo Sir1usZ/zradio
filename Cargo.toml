@@ -18,6 +18,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 souvlaki = "0.8"
 symphonia = { version = "0.5", features = ["all"] }
+tract-onnx = { version = "0.23", default-features = false, optional = true }
+
+[features]
+default = ["beat-this"]
+# Runs the Beat This! beat and downbeat model when the user turns it on.
+beat-this = ["dep:tract-onnx"]
 
 [lib]
 name = "zradio"
