@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -133,23 +134,79 @@ struct EqRequest {
 
 // ── HTTP 服务器 ────────────────────────────────────────────────────
 
-pub fn start(tx: Sender<ControlCmd>, state: SharedState) {
-    thread::spawn(move || {
-        let Ok(listener) = TcpListener::bind("0.0.0.0:18765") else {
-            eprintln!("[api] 绑定 18765 失败");
+pub const PORT: u16 = 18765;
+
+/// 正在运行的 API 服务。默认只听本机，`set_lan(true)` 后改听局域网。
+pub struct ApiServer {
+    port: u16,
+    lan: Arc<AtomicBool>,
+    thread: thread::Thread,
+}
+
+impl ApiServer {
+    pub fn set_lan(&self, lan: bool) {
+        if self.lan.swap(lan, Ordering::SeqCst) == lan {
             return;
+        }
+        // 叫醒服务线程：绑定失败时它在 park，正常时它卡在 accept。
+        self.thread.unpark();
+        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, self.port));
+        let _ = TcpStream::connect_timeout(&local, Duration::from_millis(200));
+    }
+}
+
+pub fn start(lan: bool, tx: Sender<ControlCmd>, state: SharedState) -> ApiServer {
+    start_on(PORT, lan, tx, state)
+}
+
+fn start_on(port: u16, lan: bool, tx: Sender<ControlCmd>, state: SharedState) -> ApiServer {
+    let lan = Arc::new(AtomicBool::new(lan));
+    let flag = Arc::clone(&lan);
+    let handle = thread::spawn(move || serve(port, &flag, &tx, &state));
+    ApiServer {
+        port,
+        lan,
+        thread: handle.thread().clone(),
+    }
+}
+
+fn listen_addr(lan: bool, port: u16) -> SocketAddr {
+    let ip = if lan {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        Ipv4Addr::LOCALHOST
+    };
+    SocketAddr::from((ip, port))
+}
+
+fn serve(port: u16, lan: &AtomicBool, tx: &Sender<ControlCmd>, state: &SharedState) {
+    loop {
+        let want = lan.load(Ordering::SeqCst);
+        let addr = listen_addr(want, port);
+        let listener = match TcpListener::bind(addr) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("[api] 绑定 {addr} 失败: {e}");
+                while lan.load(Ordering::SeqCst) == want {
+                    thread::park();
+                }
+                continue;
+            }
         };
-        eprintln!("[api] 远程控制监听 0.0.0.0:18765");
+        eprintln!("[api] 远程控制监听 {addr}");
         for stream in listener.incoming().flatten() {
+            if lan.load(Ordering::SeqCst) != want {
+                break;
+            }
             let tx = tx.clone();
-            let state = Arc::clone(&state);
+            let state = Arc::clone(state);
             thread::spawn(move || {
                 if let Err(e) = handle_connection(stream, &tx, &state) {
                     eprintln!("[api] 连接错误: {e}");
                 }
             });
         }
-    });
+    }
 }
 
 fn handle_connection(
@@ -1106,6 +1163,67 @@ mod tests {
                 .contains("access-control-allow-origin"),
             "got {resp:?}"
         );
+    }
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn answers(addr: SocketAddr) -> bool {
+        let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
+            return false;
+        };
+        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+        if s.write_all(b"GET /health HTTP/1.1\r\n\r\n").is_err() {
+            return false;
+        }
+        let mut resp = String::new();
+        let _ = s.read_to_string(&mut resp);
+        resp.contains(r#""ok":true"#)
+    }
+
+    fn eventually(mut check: impl FnMut() -> bool) -> bool {
+        (0..100).any(|_| {
+            check() || {
+                thread::sleep(Duration::from_millis(20));
+                false
+            }
+        })
+    }
+
+    // Linux 上整个 127.0.0.0/8 都是本机：绑 0.0.0.0 时 127.0.0.2 连得上，
+    // 只绑 127.0.0.1 时连不上，借此看出服务有没有对外开放。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn api_listens_on_loopback_until_lan_is_switched_on() {
+        let port = free_port();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let server = start_on(port, false, tx, new_shared_state());
+        let local = SocketAddr::from(([127, 0, 0, 1], port));
+        let other = SocketAddr::from(([127, 0, 0, 2], port));
+        assert!(eventually(|| answers(local)));
+        assert!(
+            !answers(other),
+            "the API must not listen beyond loopback by default"
+        );
+
+        server.set_lan(true);
+        assert!(
+            eventually(|| answers(other)),
+            "switching LAN on must rebind"
+        );
+        assert!(answers(local));
+
+        server.set_lan(false);
+        assert!(
+            eventually(|| !answers(other)),
+            "switching LAN off must rebind"
+        );
+        assert!(answers(local));
     }
 
     #[test]

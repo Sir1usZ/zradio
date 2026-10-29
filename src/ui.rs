@@ -267,6 +267,7 @@ pub struct App {
     meta_inflight: HashSet<TrackJobId>,
     /// 远程控制 API 共享状态
     api_state: api::SharedState,
+    api_server: api::ApiServer,
     playlists: PlaylistStore,
     lib_row: usize,
     lib_state: ListState,
@@ -375,10 +376,10 @@ impl App {
         let (control_tx, control_rx) = mpsc::channel();
         let mut login_poller = LoginPoller::new();
         login_poller.request();
-        // 新版 JSON API 替代旧 TCP 控制，监听 0.0.0.0:18765
-        let api_state = api::new_shared_state();
-        api::start(control_tx, Arc::clone(&api_state));
         let mut prefs = Prefs::load();
+        // 新版 JSON API 替代旧 TCP 控制：默认只听 127.0.0.1:18765，设置里可开局域网
+        let api_state = api::new_shared_state();
+        let api_server = api::start(prefs.api_lan, control_tx, Arc::clone(&api_state));
         if prefs.library.trim().is_empty() {
             prefs.set_library(&root);
         }
@@ -457,6 +458,7 @@ impl App {
             meta_queue: VecDeque::new(),
             meta_inflight: HashSet::new(),
             api_state,
+            api_server,
             playlists: PlaylistStore::load(),
             lib_row: 0,
             lib_state: ListState::default(),
@@ -1715,10 +1717,10 @@ impl App {
                     self.overlay = Overlay::None;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.settings_idx = (self.settings_idx + 1) % 7;
+                    self.settings_idx = (self.settings_idx + 1) % 8;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.settings_idx = (self.settings_idx + 6) % 7;
+                    self.settings_idx = (self.settings_idx + 7) % 8;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => self.toggle_setting(),
                 _ => {}
@@ -1962,7 +1964,18 @@ impl App {
             3 => self.prefs.lyrics_fetch = !self.prefs.lyrics_fetch,
             4 => self.prefs.cover_fetch = !self.prefs.cover_fetch,
             5 => self.prefs.resume = !self.prefs.resume,
-            6 => self.overlay = Overlay::None,
+            6 => {
+                self.prefs.api_lan = !self.prefs.api_lan;
+                self.prefs.save();
+                self.api_server.set_lan(self.prefs.api_lan);
+                self.status = if self.prefs.api_lan {
+                    format!("API 对局域网开放 :{}", api::PORT)
+                } else {
+                    format!("API 只听本机 127.0.0.1:{}", api::PORT)
+                };
+                return;
+            }
+            7 => self.overlay = Overlay::None,
             _ => {}
         }
         self.prefs.save();
@@ -3587,6 +3600,7 @@ impl App {
             format!("拉歌词      {}", on_off(self.prefs.lyrics_fetch)),
             format!("拉封面      {}", on_off(self.prefs.cover_fetch)),
             format!("续播        {}", on_off(self.prefs.resume)),
+            format!("局域网遥控  {}", on_off(self.prefs.api_lan)),
             "关闭".into(),
         ];
         let items: Vec<ListItem> = rows

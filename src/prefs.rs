@@ -161,6 +161,9 @@ pub struct Prefs {
     pub sort_mode: SortMode,
     #[serde(default)]
     pub shuffle_mode: ShuffleMode,
+    /// API 是否对局域网开放；关着时只有本机能连。
+    #[serde(default)]
+    pub api_lan: bool,
 }
 
 impl Default for Prefs {
@@ -176,6 +179,7 @@ impl Default for Prefs {
             eq_db: [0.0; 5],
             sort_mode: SortMode::Path,
             shuffle_mode: ShuffleMode::Off,
+            api_lan: false,
         }
     }
 }
@@ -359,6 +363,15 @@ mod tests {
             t = t.next();
         }
         assert_eq!(t.next(), ThemeName::System);
+    }
+
+    #[test]
+    fn prefs_saved_before_the_lan_switch_still_load_with_lan_off() {
+        let mut old = serde_json::to_value(Prefs::default()).unwrap();
+        old.as_object_mut().unwrap().remove("api_lan");
+        let prefs: Prefs = serde_json::from_value(old).unwrap();
+        assert!(!prefs.api_lan);
+        assert!(!Prefs::default().api_lan);
     }
 
     #[test]
