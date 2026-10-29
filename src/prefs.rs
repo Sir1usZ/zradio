@@ -164,6 +164,10 @@ pub struct Prefs {
     /// Rescore tracks with Beat This! for AutoMix; on only once its model has been fetched.
     #[serde(default)]
     pub beat_this: bool,
+    /// Separate the singers' voices in AutoMix overlaps, so only one is heard at a time; on
+    /// only once the htdemucs model has been fetched.
+    #[serde(default)]
+    pub stems: bool,
 }
 
 impl Default for Prefs {
@@ -180,6 +184,7 @@ impl Default for Prefs {
             sort_mode: SortMode::Path,
             shuffle_mode: ShuffleMode::Off,
             beat_this: false,
+            stems: false,
         }
     }
 }
@@ -375,6 +380,18 @@ mod tests {
         saved.as_object_mut().unwrap().remove("beat_this");
         let loaded: Prefs = serde_json::from_value(saved).expect("an older prefs file loads");
         assert!(!loaded.resume && !loaded.beat_this);
+    }
+
+    #[test]
+    fn prefs_saved_before_stems_still_load() {
+        let mut saved = serde_json::to_value(Prefs {
+            beat_this: true,
+            ..Prefs::default()
+        })
+        .unwrap();
+        saved.as_object_mut().unwrap().remove("stems");
+        let loaded: Prefs = serde_json::from_value(saved).expect("an older prefs file loads");
+        assert!(loaded.beat_this && !loaded.stems);
     }
 
     #[test]

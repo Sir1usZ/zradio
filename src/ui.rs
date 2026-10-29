@@ -1,7 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, stdout};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -33,7 +33,7 @@ use crate::drawer::{
     drawer_open_height, drawer_rect, drawer_rows, list_title, wrap_idx, DrawerAnim, DRAWER_SLOTS,
 };
 use crate::dsp::MixMode;
-use crate::engine::{load_track, Mixer, Player, PreparedBend, Snapshot};
+use crate::engine::{load_track, Mixer, Player, PreparedBend, Snapshot, VocalJob, VocalOverlay};
 use crate::eq::Equalizer;
 use crate::fetch::{self, find_media_url};
 use crate::greeting::{
@@ -54,6 +54,7 @@ use crate::remix::{apply_remix, RemixMode};
 use crate::session_store::SessionState;
 use crate::shell::{format_listen_time, Tab};
 use crate::splayer;
+use crate::stems;
 use crate::taste::TasteStore;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -165,11 +166,53 @@ struct DecodeFailure {
     error: String,
 }
 
-/// The Beat This! model being fetched.
+/// A model being fetched.
 struct ModelFetch {
     progress: Receiver<String>,
     done: Receiver<Result<PathBuf, String>>,
     percent: String,
+}
+
+impl ModelFetch {
+    /// Runs `fetch` on its own thread, which reports progress as "42%".
+    fn spawn(
+        fetch: impl FnOnce(Option<Sender<String>>) -> anyhow::Result<PathBuf> + Send + 'static,
+    ) -> Self {
+        let (progress_tx, progress) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        thread::spawn(move || {
+            let fetched = fetch(Some(progress_tx));
+            let _ = done_tx.send(fetched.map_err(|e| e.to_string()));
+        });
+        Self {
+            progress,
+            done,
+            percent: "0%".into(),
+        }
+    }
+
+    /// The fetch's result once it is done; until then None, keeping `percent` current.
+    fn poll(&mut self) -> Option<Result<PathBuf, String>> {
+        while let Ok(p) = self.progress.try_recv() {
+            self.percent = p;
+        }
+        match self.done.try_recv() {
+            Ok(r) => Some(r),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err("the download thread died".into())),
+        }
+    }
+}
+
+/// A model setting's row: whether the build has it, how far its fetch is, or on/off.
+fn model_label(built: bool, fetch: Option<&ModelFetch>, on: bool) -> String {
+    if !built {
+        return "未编译".into();
+    }
+    match fetch {
+        Some(fetch) => format!("下载模型 {}", fetch.percent),
+        None => on_off(on).into(),
+    }
 }
 
 struct PeekJob {
@@ -293,6 +336,8 @@ pub struct App {
     /// The track playing when the tracks around it were last queued.
     regrid_around: Option<TrackJobId>,
     model_fetch: Option<ModelFetch>,
+    stems_fetch: Option<ModelFetch>,
+    vocal_worker: Option<stems::Worker<VocalJob, Option<VocalOverlay>>>,
     /// 远程控制 API 共享状态
     api_state: api::SharedState,
     playlists: PlaylistStore,
@@ -489,6 +534,8 @@ impl App {
             regrid_ready: Vec::new(),
             regrid_around: None,
             model_fetch: None,
+            stems_fetch: None,
+            vocal_worker: None,
             api_state,
             playlists: PlaylistStore::load(),
             lib_row: 0,
@@ -1481,6 +1528,9 @@ impl App {
                 }
                 self.pump_meta_queue();
                 self.drain_model_fetch();
+                self.drain_stems_fetch();
+                self.pump_vocals();
+                self.drain_vocals();
                 self.drain_regrid();
                 self.apply_regrid();
                 self.want_regrid();
@@ -1766,10 +1816,10 @@ impl App {
                     self.overlay = Overlay::None;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.settings_idx = (self.settings_idx + 1) % 8;
+                    self.settings_idx = (self.settings_idx + 1) % SETTINGS_ROWS;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.settings_idx = (self.settings_idx + 7) % 8;
+                    self.settings_idx = (self.settings_idx + SETTINGS_ROWS - 1) % SETTINGS_ROWS;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => self.toggle_setting(),
                 _ => {}
@@ -2014,7 +2064,8 @@ impl App {
             4 => self.prefs.cover_fetch = !self.prefs.cover_fetch,
             5 => self.prefs.resume = !self.prefs.resume,
             6 => return self.toggle_beat_this(),
-            7 => self.overlay = Overlay::None,
+            7 => return self.toggle_stems(),
+            8 => self.overlay = Overlay::None,
             _ => {}
         }
         self.prefs.save();
@@ -2230,17 +2281,7 @@ impl App {
         } else if crate::beat_this::model_ready() {
             self.enable_beat_this();
         } else {
-            let (progress_tx, progress) = mpsc::channel();
-            let (done_tx, done) = mpsc::channel();
-            thread::spawn(move || {
-                let fetched = regrid::fetch_model(Some(progress_tx));
-                let _ = done_tx.send(fetched.map_err(|e| e.to_string()));
-            });
-            self.model_fetch = Some(ModelFetch {
-                progress,
-                done,
-                percent: "0%".into(),
-            });
+            self.model_fetch = Some(ModelFetch::spawn(regrid::fetch_model));
             let mb = crate::beat_this::MODEL_BYTES / 1_000_000;
             self.status = format!("fetching the Beat This! model ({mb} MB) from GitHub");
         }
@@ -2256,16 +2297,8 @@ impl App {
     }
 
     fn drain_model_fetch(&mut self) {
-        let Some(fetch) = self.model_fetch.as_mut() else {
+        let Some(result) = self.model_fetch.as_mut().and_then(ModelFetch::poll) else {
             return;
-        };
-        while let Ok(p) = fetch.progress.try_recv() {
-            fetch.percent = p;
-        }
-        let result = match fetch.done.try_recv() {
-            Ok(r) => r,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => Err("the download thread died".into()),
         };
         self.model_fetch = None;
         match result {
@@ -2275,13 +2308,106 @@ impl App {
     }
 
     fn beat_this_label(&self) -> String {
-        if !regrid::AVAILABLE {
-            return "未编译".into();
+        model_label(
+            regrid::AVAILABLE,
+            self.model_fetch.as_ref(),
+            self.prefs.beat_this,
+        )
+    }
+
+    fn toggle_stems(&mut self) {
+        if self.stems_fetch.is_some() {
+            return;
         }
-        if let Some(fetch) = self.model_fetch.as_ref() {
-            return format!("下载模型 {}", fetch.percent);
+        if self.prefs.stems {
+            self.prefs.stems = false;
+            self.prefs.save();
+            // A mix being separated finishes on the old thread and is let go.
+            self.vocal_worker = None;
+            self.status = "voice handoff off: AutoMix overlaps keep both voices".into();
+        } else if !stems::AVAILABLE {
+            self.status = "this build has no voice separation (built without stems)".into();
+        } else if stems::model_ready() {
+            self.enable_stems();
+        } else {
+            self.stems_fetch = Some(ModelFetch::spawn(stems::download_model));
+            let mb = stems::MODEL_BYTES / 1_000_000;
+            self.status = format!("fetching the htdemucs model ({mb} MB) from Hugging Face");
         }
-        on_off(self.prefs.beat_this).into()
+    }
+
+    fn enable_stems(&mut self) {
+        self.prefs.stems = true;
+        self.prefs.save();
+        self.status =
+            "voice handoff on: each AutoMix takes ~30 s and ~1 GB to separate, ahead of time"
+                .into();
+    }
+
+    fn drain_stems_fetch(&mut self) {
+        let Some(result) = self.stems_fetch.as_mut().and_then(ModelFetch::poll) else {
+            return;
+        };
+        self.stems_fetch = None;
+        match result {
+            Ok(_) => self.enable_stems(),
+            Err(e) => self.status = format!("fail htdemucs model: {e}"),
+        }
+    }
+
+    fn stems_label(&self) -> String {
+        model_label(
+            stems::AVAILABLE,
+            self.stems_fetch.as_ref(),
+            self.prefs.stems,
+        )
+    }
+
+    /// Tells the mixer whether to separate voices, and hands an armed mix's to the worker.
+    fn pump_vocals(&mut self) {
+        let on = self.prefs.stems && stems::AVAILABLE;
+        let job = {
+            let mut mixer = self.player.mixer.lock().expect("mixer");
+            mixer.set_stems(on);
+            mixer.take_vocal_job()
+        };
+        let Some(job) = job else {
+            return;
+        };
+        if !stems::model_ready() {
+            self.prefs.stems = false;
+            self.prefs.save();
+            self.status =
+                "voice handoff off: its model is gone; turn it on again to fetch it".into();
+            return;
+        }
+        if self.vocal_worker.is_none() {
+            self.vocal_worker = stems::separator().map(stems::Worker::spawn);
+        }
+        if !self.vocal_worker.as_ref().is_some_and(|w| w.send(job)) {
+            self.vocal_worker = None;
+        }
+    }
+
+    fn drain_vocals(&mut self) {
+        let Some(done) = self.vocal_worker.as_ref().and_then(stems::Worker::try_recv) else {
+            return;
+        };
+        match done {
+            Ok(Some(overlay)) => {
+                let attached = self
+                    .player
+                    .mixer
+                    .lock()
+                    .expect("mixer")
+                    .attach_vocals(overlay);
+                if !attached {
+                    self.status = "voices separated too late for this mix".into();
+                }
+            }
+            Ok(None) => {}
+            Err(e) => self.status = format!("fail voice separation: {e}"),
+        }
     }
 
     fn bump_eq(&mut self, delta: f32) {
@@ -3823,7 +3949,7 @@ impl App {
     }
 
     fn draw_settings(&self, frame: &mut ratatui::Frame<'_>) {
-        let rows = [
+        let rows: [String; SETTINGS_ROWS] = [
             format!("主题        {}", self.prefs.theme.label()),
             format!("透明背景    {}", on_off(self.prefs.transparent)),
             format!("可视化      {}", self.prefs.visualize.label()),
@@ -3831,6 +3957,7 @@ impl App {
             format!("拉封面      {}", on_off(self.prefs.cover_fetch)),
             format!("续播        {}", on_off(self.prefs.resume)),
             format!("Beat This!  {}", self.beat_this_label()),
+            format!("人声交接    {}", self.stems_label()),
             "关闭".into(),
         ];
         let items: Vec<ListItem> = rows
@@ -4241,6 +4368,9 @@ fn context_target_for_tab(
     }
 }
 
+/// Rows in the settings panel, the last of which closes it.
+const SETTINGS_ROWS: usize = 9;
+
 fn on_off(v: bool) -> &'static str {
     if v {
         "on"
@@ -4358,6 +4488,59 @@ mod tests {
             guard.disarm();
         }
         assert_eq!(cleanup_count.get(), 1);
+    }
+
+    fn finish(fetch: &mut ModelFetch) -> Result<PathBuf, String> {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(done) = fetch.poll() {
+                return done;
+            }
+            assert!(Instant::now() < until, "the fetch never finished");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_model_fetch_reports_progress_then_its_result() {
+        let (go, wait) = mpsc::channel::<()>();
+        let mut fetch = ModelFetch::spawn(move |progress| {
+            progress.expect("asked for progress").send("42%".into())?;
+            wait.recv()?;
+            Ok(PathBuf::from("/models/m.onnx"))
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while fetch.percent != "42%" {
+            assert!(fetch.poll().is_none(), "done before it was let go");
+            assert!(Instant::now() < until, "no progress");
+            thread::sleep(Duration::from_millis(2));
+        }
+        go.send(()).unwrap();
+        assert_eq!(finish(&mut fetch), Ok(PathBuf::from("/models/m.onnx")));
+    }
+
+    #[test]
+    fn a_model_fetch_that_fails_or_dies_says_so() {
+        let mut failed = ModelFetch::spawn(|_| Err(anyhow::anyhow!("offline")));
+        assert_eq!(finish(&mut failed), Err("offline".into()));
+        let mut died = ModelFetch::spawn(|_| panic!("the fetch thread panics"));
+        assert_eq!(finish(&mut died), Err("the download thread died".into()));
+    }
+
+    #[test]
+    fn model_rows_say_if_the_build_has_them_and_how_far_the_fetch_is() {
+        assert_eq!(model_label(false, None, true), "未编译");
+        assert_eq!(model_label(true, None, true), "on");
+        assert_eq!(model_label(true, None, false), "off");
+        let (_progress, progress) = mpsc::channel();
+        let (_done, done) = mpsc::channel();
+        let fetch = ModelFetch {
+            progress,
+            done,
+            percent: "42%".into(),
+        };
+        assert_eq!(model_label(true, Some(&fetch), false), "下载模型 42%");
+        assert_eq!(model_label(false, Some(&fetch), false), "未编译");
     }
 
     #[test]
