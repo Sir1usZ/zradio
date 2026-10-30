@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -56,7 +57,10 @@ impl RebuildGate {
     }
 
     fn allow(&mut self, now: Instant, gap: Duration) -> bool {
-        if self.last.is_some_and(|last| now.saturating_duration_since(last) < gap) {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < gap)
+        {
             return false;
         }
         self.last = Some(now);
@@ -242,6 +246,7 @@ pub struct Mixer {
     shuffle: bool,
     shuffle_mode: ShuffleMode,
     recent: Vec<usize>,
+    shuffle_state: u64,
     loop_mode: LoopMode,
     taste_boosts: Vec<f32>,
     eq: Equalizer,
@@ -276,6 +281,7 @@ impl Mixer {
             shuffle: false,
             shuffle_mode: ShuffleMode::Off,
             recent: Vec::new(),
+            shuffle_state: shuffle_entropy(),
             loop_mode: LoopMode::Off,
             taste_boosts: Vec::new(),
             eq: Equalizer::new(sample_rate, [0.0; 5]),
@@ -290,6 +296,15 @@ impl Mixer {
 
     pub fn bump_eq(&mut self, band: usize, delta: f32) {
         self.eq.bump(self.sample_rate, band, delta);
+        self.status = format!(
+            "eq {} {:+.0}",
+            Equalizer::labels()[band.min(4)],
+            self.eq.db()[band.min(4)]
+        );
+    }
+
+    pub fn set_eq_band(&mut self, band: usize, db: f32) {
+        self.eq.set_band(self.sample_rate, band, db);
         self.status = format!(
             "eq {} {:+.0}",
             Equalizer::labels()[band.min(4)],
@@ -315,10 +330,43 @@ impl Mixer {
     }
 
     pub fn set_tracks(&mut self, tracks: Vec<Track>) {
-        self.analyses = vec![None; tracks.len()];
-        self.taste_boosts = vec![0.0; tracks.len()];
+        let new_index: HashMap<&Path, usize> = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.path.as_path(), i))
+            .collect();
+        let remap = |old: usize| {
+            self.tracks
+                .get(old)
+                .and_then(|t| new_index.get(t.path.as_path()).copied())
+        };
+        let current_idx = self.current_idx.and_then(remap);
+        let incoming_idx = self.incoming_idx.and_then(remap);
+        let armed_idx = self.armed.as_ref().map(|a| remap(a.index));
+        let recent: Vec<usize> = self.recent.iter().filter_map(|&i| remap(i)).collect();
+        let mut analyses = vec![None; tracks.len()];
+        let mut taste_boosts = vec![0.0; tracks.len()];
+        for (old, track) in self.tracks.iter().enumerate() {
+            if let Some(&new) = new_index.get(track.path.as_path()) {
+                analyses[new] = self.analyses.get(old).cloned().flatten();
+                taste_boosts[new] = self.taste_boosts.get(old).copied().unwrap_or(0.0);
+            }
+        }
+        self.current_idx = current_idx;
+        self.incoming_idx = incoming_idx;
+        match armed_idx {
+            Some(Some(index)) => {
+                if let Some(armed) = self.armed.as_mut() {
+                    armed.index = index;
+                }
+            }
+            Some(None) => self.armed = None,
+            None => {}
+        }
+        self.recent = recent;
+        self.analyses = analyses;
+        self.taste_boosts = taste_boosts;
         self.tracks = tracks;
-        self.recent.clear();
         if self.tracks.is_empty() {
             self.status = "empty library".into();
         } else {
@@ -419,6 +467,7 @@ impl Mixer {
         if self.tracks.is_empty() {
             return;
         }
+        self.shuffle_state = splitmix64(self.shuffle_state ^ index as u64);
         self.recent.retain(|&i| i != index);
         self.recent.push(index);
         let cap = self.tracks.len().saturating_sub(1).min(12);
@@ -492,16 +541,34 @@ impl Mixer {
         self.status = self.play_status(index);
     }
 
-    pub fn start_transition(&mut self, index: usize, buf: AudioBuf, skip: bool) {
-        let plan = plan_for(
+    pub fn transition_rate(&self, index: usize, skip: bool) -> f32 {
+        self.plan_transition(index, skip).rate
+    }
+
+    fn plan_transition(&self, index: usize, skip: bool) -> TransitionPlan {
+        plan_for(
             self.current_idx,
             index,
             &self.analyses,
             self.mix,
             skip && self.mix != MixMode::AutoMix,
-        );
+        )
+    }
+
+    pub fn start_transition(&mut self, index: usize, buf: AudioBuf, skip: bool) {
+        self.start_matched_transition(index, buf, skip, 1.0);
+    }
+
+    pub fn start_matched_transition(
+        &mut self,
+        index: usize,
+        buf: AudioBuf,
+        skip: bool,
+        matched: f32,
+    ) {
+        let plan = self.plan_transition(index, skip);
         let fade_secs = plan.fade_secs;
-        let buf = beatmatch(buf, plan.rate);
+        let buf = beatmatch(buf, plan.rate / matched.max(0.01));
         if !self.mix.uses_fade() || self.current.as_ref().is_none_or(|d| d.remaining() < 2) {
             self.play_decoded(index, buf);
             return;
@@ -702,8 +769,7 @@ impl Mixer {
     }
 
     fn shuffle_seed(&self) -> usize {
-        let cur = self.current_idx.unwrap_or(0);
-        cur.wrapping_mul(1_000_003) ^ self.tracks.len() ^ 0x9E37
+        (self.shuffle_state >> 11) as usize
     }
 
     fn random_next(&self, pool: &[usize]) -> usize {
@@ -764,10 +830,14 @@ impl Mixer {
         Some(self.step_in_pool(&pool, -1))
     }
 
-    pub fn take_finished(&mut self) -> bool {
-        let done = self.done;
-        self.done = false;
-        done
+    pub fn take_auto_advance(&mut self) -> Option<usize> {
+        if !std::mem::take(&mut self.done) {
+            return None;
+        }
+        if self.loop_mode == LoopMode::One || self.tracks.len() < 2 {
+            return None;
+        }
+        self.next_index()
     }
 
     pub fn snapshot(&self, selected: usize) -> Snapshot {
@@ -1045,7 +1115,22 @@ impl Mixer {
     }
 }
 
-fn beatmatch(buf: AudioBuf, rate: f32) -> AudioBuf {
+fn shuffle_entropy() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    splitmix64(nanos ^ (u64::from(std::process::id()) << 32))
+}
+
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+pub fn beatmatch(buf: AudioBuf, rate: f32) -> AudioBuf {
     if (rate - 1.0).abs() < 0.004 || buf.samples.is_empty() {
         return buf;
     }
@@ -1089,7 +1174,13 @@ impl Player {
         let config: StreamConfig = supported.into();
         let mixer = Arc::new(Mutex::new(Mixer::new(sample_rate, channels)));
         let health = Arc::new(StreamHealth::new());
-        let stream = open_stream(&device, &config, sample_format, Arc::clone(&mixer), Arc::clone(&health))?;
+        let stream = open_stream(
+            &device,
+            &config,
+            sample_format,
+            Arc::clone(&mixer),
+            Arc::clone(&health),
+        )?;
         stream.play()?;
         Ok(Self {
             mixer,
@@ -1246,6 +1337,81 @@ mod tests {
     }
 
     #[test]
+    fn cut_end_hands_next_track_to_ui_once() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.mix = MixMode::Cut;
+        mixer.play_decoded(0, const_deck(64, 0.5));
+        assert_eq!(mixer.take_auto_advance(), None);
+        let mut out = vec![0.0; 256];
+        mixer.fill(&mut out);
+        assert!(!mixer.should_prefetch());
+        assert_eq!(mixer.take_auto_advance(), Some(1));
+        assert_eq!(mixer.take_auto_advance(), None);
+    }
+
+    #[test]
+    fn fade_mode_still_advances_when_prefetch_never_landed() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.mix = MixMode::Crossfade;
+        mixer.play_decoded(0, const_deck(64, 0.5));
+        let mut out = vec![0.0; 256];
+        mixer.fill(&mut out);
+        assert_eq!(mixer.take_auto_advance(), Some(1));
+    }
+
+    #[test]
+    fn auto_advance_respects_loop_one_and_single_track() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.mix = MixMode::Cut;
+        mixer.loop_mode = LoopMode::One;
+        mixer.play_decoded(0, const_deck(64, 0.5));
+        let mut out = vec![0.0; 256];
+        mixer.fill(&mut out);
+        assert_eq!(mixer.take_auto_advance(), None);
+
+        let mut single = Mixer::new(48_000, 2);
+        single.set_tracks(two_tracks()[..1].to_vec());
+        single.mix = MixMode::Cut;
+        single.play_decoded(0, const_deck(64, 0.5));
+        single.fill(&mut out);
+        assert_eq!(single.take_auto_advance(), None);
+    }
+
+    #[test]
+    fn rescan_keeps_playing_and_fading_tracks_by_path() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(four_tracks());
+        mixer.mix = MixMode::Crossfade;
+        mixer.set_analysis(1, analysis_at(1.0, 9.0, 10.0));
+        mixer.play_decoded(1, const_deck(48_000, 0.5));
+        mixer.start_transition(2, const_deck(48_000, 0.2), true);
+        assert!(mixer.fading());
+
+        let mut reordered = four_tracks();
+        reordered.reverse();
+        mixer.set_tracks(reordered);
+
+        assert_eq!(mixer.current_idx, Some(2));
+        assert_eq!(mixer.incoming_idx, Some(1));
+        assert_eq!(mixer.recent, vec![2]);
+        assert!(mixer.analysis_at(2).is_some());
+        assert!(mixer.analysis_at(1).is_none());
+    }
+
+    #[test]
+    fn rescan_forgets_a_playing_track_that_vanished() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(four_tracks());
+        mixer.play_decoded(3, const_deck(100, 0.5));
+        mixer.set_tracks(four_tracks()[..2].to_vec());
+        assert_eq!(mixer.current_idx, None);
+        assert!(mixer.recent.is_empty());
+    }
+
+    #[test]
     fn crossfade_mixes_then_lands_on_next() {
         let mut mixer = Mixer::new(48_000, 2);
         mixer.set_tracks(two_tracks());
@@ -1308,6 +1474,32 @@ mod tests {
             start_at >= pos,
             "must not rewind current track, start={start_at} pos={pos}"
         );
+    }
+
+    #[test]
+    fn prematched_transition_is_not_resampled_again() {
+        let armed_frames = |prematched: bool| {
+            let mut mixer = Mixer::new(48_000, 2);
+            mixer.set_tracks(two_tracks());
+            mixer.mix = MixMode::AutoMix;
+            mixer.play_decoded(0, const_deck(48_000 * 20, 0.8));
+            mixer.set_analysis(0, analysis_at(0.0, 16.0, 20.0));
+            let mut next = analysis_at(4.0, 18.0, 20.0);
+            next.bpm = Some(126.0);
+            mixer.set_analysis(1, next);
+            let rate = mixer.transition_rate(1, false);
+            assert!((rate - 1.0).abs() > 0.004);
+            if prematched {
+                let buf = beatmatch(const_deck(48_000 * 20, 0.2), rate);
+                mixer.start_matched_transition(1, buf, false, rate);
+            } else {
+                mixer.start_transition(1, const_deck(48_000 * 20, 0.2), false);
+            }
+            mixer.armed.as_ref().expect("armed").deck.frames()
+        };
+        let raw = armed_frames(false);
+        assert_ne!(raw, 48_000 * 20);
+        assert_eq!(armed_frames(true), raw);
     }
 
     #[test]
@@ -1493,6 +1685,29 @@ mod tests {
         mixer.set_playhead(9_000);
         assert_eq!(mixer.next_index(), Some(first));
         assert_eq!(mixer.snapshot(0).next_hint, hint);
+    }
+
+    #[test]
+    fn random_shuffle_reaches_the_whole_library() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(
+            (0..16)
+                .map(|i| Track {
+                    path: PathBuf::from(format!("{i}.wav")),
+                    title: i.to_string(),
+                })
+                .collect(),
+        );
+        mixer.set_shuffle_mode(crate::prefs::ShuffleMode::Random);
+        mixer.shuffle_state = 7;
+        mixer.play_decoded(0, const_deck(100, 0.5));
+        let mut seen = std::collections::HashSet::from([0]);
+        for _ in 0..200 {
+            let next = mixer.next_index().unwrap();
+            mixer.play_decoded(next, const_deck(100, 0.5));
+            seen.insert(next);
+        }
+        assert_eq!(seen.len(), 16, "visited {seen:?}");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-const BANDS: usize = 5;
+pub const BANDS: usize = 5;
 const FREQS: [f32; BANDS] = [60.0, 250.0, 1000.0, 4000.0, 12000.0];
 
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +88,14 @@ impl Equalizer {
         self.set_db(sample_rate, self.db);
     }
 
+    pub fn set_band(&mut self, sample_rate: u32, band: usize, db: f32) {
+        if band >= BANDS {
+            return;
+        }
+        self.db[band] = db.clamp(-12.0, 12.0);
+        self.set_db(sample_rate, self.db);
+    }
+
     pub fn reset(&mut self, sample_rate: u32) {
         self.set_db(sample_rate, [0.0; BANDS]);
     }
@@ -121,6 +129,18 @@ mod tests {
         let out = eq.process_stereo([0.2, -0.1]);
         assert!((out[0] - 0.2).abs() < 0.02);
         assert!((out[1] + 0.1).abs() < 0.02);
+    }
+
+    #[test]
+    fn set_band_is_absolute_and_clamped() {
+        let mut eq = Equalizer::new(48_000, [0.0; 5]);
+        eq.set_band(48_000, 2, 4.5);
+        eq.set_band(48_000, 2, 4.5);
+        assert!((eq.db()[2] - 4.5).abs() < 1e-4);
+        eq.set_band(48_000, 0, 40.0);
+        assert_eq!(eq.db()[0], 12.0);
+        eq.set_band(48_000, 9, 3.0);
+        assert_eq!(eq.db(), [12.0, 0.0, 4.5, 0.0, 0.0]);
     }
 
     #[test]

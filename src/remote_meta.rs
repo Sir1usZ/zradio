@@ -693,7 +693,7 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
 
 fn curl_bytes(url: &str) -> Option<Vec<u8>> {
     let out = Command::new("curl")
-        .args(["-sS", "--max-time", "8", "-A", "zradio/0.1", "-L", url])
+        .args(["-sSf", "--max-time", "8", "-A", "zradio/0.1", "-L", url])
         .output()
         .ok()?;
     if !out.status.success() || out.stdout.is_empty() {
@@ -830,18 +830,12 @@ mod tests {
 
     #[test]
     fn cjk_queries_ask_cn_sources_before_itunes() {
-        assert_eq!(
-            tag_source_order("晴天", "周杰伦"),
-            TagSourceOrder::CnFirst
-        );
+        assert_eq!(tag_source_order("晴天", "周杰伦"), TagSourceOrder::CnFirst);
         assert_eq!(
             tag_source_order("Levels", "Avicii"),
             TagSourceOrder::ItunesFirst
         );
-        assert_eq!(
-            tag_source_order("海阔天空", ""),
-            TagSourceOrder::CnFirst
-        );
+        assert_eq!(tag_source_order("海阔天空", ""), TagSourceOrder::CnFirst);
     }
 
     #[test]

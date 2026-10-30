@@ -488,7 +488,7 @@ curl -X POST http://localhost:18765/control \
 
 ```bash
 curl -X POST http://localhost:18765/import \
-  -d '{"url":"https://music.163.com/song?id=123456"}'
+  -d '{"url":"https://www.youtube.com/watch?v=tRsQsTMvPNg"}'
 ```
 
 ### `/library/scan` — 重新扫描资料库

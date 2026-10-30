@@ -332,6 +332,8 @@ fn pump_curl_progress(stderr: impl Read, progress: Option<Sender<String>>) {
     }
 }
 
+const DOWNLOAD_STALL_SECS: u64 = 120;
+
 fn emit_curl_progress(buf: &[u8], progress: Option<&Sender<String>>) {
     let line = String::from_utf8_lossy(buf);
     if let Some(pct) = parse_curl_progress(&line) {
@@ -342,10 +344,19 @@ fn emit_curl_progress(buf: &[u8], progress: Option<&Sender<String>>) {
 }
 
 fn curl_download_args(url: &str, out: &str) -> Vec<String> {
+    curl_download_args_with_stall(url, out, DOWNLOAD_STALL_SECS)
+}
+
+fn curl_download_args_with_stall(url: &str, out: &str, stall_secs: u64) -> Vec<String> {
     vec![
-        "-sS".into(),
         "-L".into(),
         "--fail".into(),
+        "--connect-timeout".into(),
+        "15".into(),
+        "--speed-limit".into(),
+        "1".into(),
+        "--speed-time".into(),
+        stall_secs.to_string(),
         "--progress-bar".into(),
         "-A".into(),
         "Mozilla/5.0".into(),
@@ -584,21 +595,99 @@ mod tests {
     }
 
     #[test]
-    fn curl_download_is_silent_with_progress_bar() {
+    fn curl_download_uses_progress_bar_without_silencing_it() {
         let args = curl_download_args("http://example.com/a.mp3", "/tmp/a.mp3");
-        let joined = args.join(" ");
+        assert!(args.iter().any(|a| a == "--progress-bar"));
         assert!(
-            joined.contains("-sS") || joined.contains("-s"),
-            "must not dump meter to TTY"
+            !args
+                .iter()
+                .any(|a| a == "-s" || a == "-sS" || a == "--silent"),
+            "--silent hides the progress bar the pump reads: {args:?}"
         );
-        assert!(joined.contains("--progress-bar") || joined.contains("-#"));
-        assert!(joined.contains("--fail"));
-        assert!(joined.contains("-o"));
-        assert!(
-            !joined.split_whitespace().any(|a| a == "-#")
-                || joined.contains("--progress-bar")
-                || joined.contains("-sS")
+        assert!(args.iter().any(|a| a == "--fail"));
+        assert!(args.iter().any(|a| a == "-o"));
+    }
+
+    #[test]
+    fn download_progress_reaches_the_pump() {
+        use std::io::Write;
+        if Command::new("curl").arg("--version").output().is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = vec![0u8; 4 << 20];
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let _ = s.read(&mut req);
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            let _ = s.write_all(head.as_bytes());
+            for chunk in body.chunks(256 << 10) {
+                let _ = s.write_all(chunk);
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        });
+        let out = std::env::temp_dir().join(format!("zradio-curl-pump-{}", std::process::id()));
+        let args = curl_download_args(&format!("http://{addr}/a.mp3"), out.to_str().unwrap());
+        let mut child = Command::new("curl")
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        pump_curl_progress(child.stderr.take().unwrap(), Some(tx));
+        assert!(child.wait().unwrap().success());
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&out);
+        let seen: Vec<String> = rx.try_iter().collect();
+        assert!(seen.iter().any(|m| m == "100%"), "progress seen: {seen:?}");
+    }
+
+    #[test]
+    fn stalled_download_gives_up_instead_of_hanging() {
+        use std::io::Write;
+        if Command::new("curl").arg("--version").output().is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nabc");
+            while matches!(s.read(&mut buf), Ok(n) if n > 0) {}
+        });
+        let out = std::env::temp_dir().join(format!("zradio-curl-stall-{}", std::process::id()));
+        let args = curl_download_args_with_stall(
+            &format!("http://{addr}/a.mp3"),
+            out.to_str().unwrap(),
+            1,
         );
+        let mut child = Command::new("curl")
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if started.elapsed() > Duration::from_secs(15) {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&out);
+        let status = status.expect("curl still waiting on a dead transfer after 15s");
+        assert!(!status.success());
     }
 
     #[test]

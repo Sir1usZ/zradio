@@ -4,11 +4,40 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::control::ControlCmd;
 use crate::engine::Snapshot;
+
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+
+const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
+
+fn request_body_size_allowed(content_length: usize) -> bool {
+    content_length <= MAX_REQUEST_BODY_BYTES
+}
+
+fn read_head_line<R: BufRead>(
+    reader: &mut R,
+    budget: &mut usize,
+) -> std::io::Result<Option<String>> {
+    let mut line = Vec::new();
+    let n = reader
+        .by_ref()
+        .take(*budget as u64 + 1)
+        .read_until(b'\n', &mut line)?;
+    if n > *budget {
+        return Ok(None);
+    }
+    *budget -= n;
+    Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+}
+
+fn request_read_timeout() -> Duration {
+    Duration::from_secs(5)
+}
 
 // ── 共享状态：App 每个 tick 更新，API 线程读取 ────────────────────
 
@@ -129,10 +158,13 @@ fn handle_connection(
     state: &SharedState,
 ) -> std::io::Result<()> {
     let reader = stream.try_clone()?;
+    reader.set_read_timeout(Some(request_read_timeout()))?;
     let mut buf_reader = BufReader::new(reader);
 
-    let mut request_line = String::new();
-    buf_reader.read_line(&mut request_line)?;
+    let mut budget = MAX_REQUEST_HEAD_BYTES;
+    let Some(request_line) = read_head_line(&mut buf_reader, &mut budget)? else {
+        return send_json(&mut stream, 431, &err("request head too large"));
+    };
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         return send_json(&mut stream, 400, &err("bad request"));
@@ -143,8 +175,9 @@ fn handle_connection(
 
     let mut content_length: usize = 0;
     loop {
-        let mut line = String::new();
-        buf_reader.read_line(&mut line)?;
+        let Some(line) = read_head_line(&mut buf_reader, &mut budget)? else {
+            return send_json(&mut stream, 431, &err("request head too large"));
+        };
         let trimmed = line.trim().to_lowercase();
         if trimmed.is_empty() {
             break;
@@ -152,6 +185,10 @@ fn handle_connection(
         if let Some(val) = trimmed.strip_prefix("content-length:") {
             content_length = val.trim().parse().unwrap_or(0);
         }
+    }
+
+    if !request_body_size_allowed(content_length) {
+        return send_json(&mut stream, 413, &err("request body too large"));
     }
 
     let body = if content_length > 0 {
@@ -643,6 +680,9 @@ fn handle_control(body: &str, tx: &Sender<ControlCmd>, state: &SharedState) -> s
         // ── EQ ──
         "eq" => {
             let band = req.index.unwrap_or(0);
+            if band >= crate::eq::BANDS {
+                return err("band must be 0-4");
+            }
             let db = req.value.unwrap_or(0.0);
             ControlCmd::SetEq(band, db)
         }
@@ -685,6 +725,9 @@ fn handle_import(body: &str, tx: &Sender<ControlCmd>) -> serde_json::Value {
         Ok(r) => r,
         Err(e) => return err(format!("bad json: {e}")),
     };
+    if !crate::fetch::looks_like_media_url(&req.url) {
+        return err("need a youtube or bilibili url");
+    }
     if let Err(response) = enqueue_control(tx, ControlCmd::Import(req.url.clone())) {
         return response;
     }
@@ -710,6 +753,9 @@ fn handle_eq(body: &str, tx: &Sender<ControlCmd>) -> serde_json::Value {
         Ok(r) => r,
         Err(e) => return err(format!("bad json: {e}")),
     };
+    if req.band >= crate::eq::BANDS {
+        return err("band must be 0-4");
+    }
     if let Err(response) = enqueue_control(tx, ControlCmd::SetEq(req.band, req.db)) {
         return response;
     }
@@ -842,13 +888,19 @@ fn enqueue_control(tx: &Sender<ControlCmd>, cmd: ControlCmd) -> Result<(), serde
     tx.send(cmd).map_err(|_| err("control unavailable"))
 }
 
-fn send_bytes(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> std::io::Result<()> {
-    let status_text = match status {
+fn http_status_text(status: u16) -> &'static str {
+    match status {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
         _ => "Error",
-    };
+    }
+}
+
+fn send_bytes(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> std::io::Result<()> {
+    let status_text = http_status_text(status);
     let header = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: {mime}\r\n\
@@ -866,12 +918,7 @@ fn send_bytes(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> s
 
 fn send_json(stream: &mut TcpStream, status: u16, body: &serde_json::Value) -> std::io::Result<()> {
     let json = serde_json::to_vec(body).unwrap_or_default();
-    let status_text = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        _ => "Error",
-    };
+    let status_text = http_status_text(status);
     let header = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: application/json; charset=utf-8\r\n\
@@ -906,6 +953,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_body_limit_allows_64_kib_and_rejects_more() {
+        assert!(request_body_size_allowed(65_536));
+        assert!(!request_body_size_allowed(65_537));
+        assert_eq!(http_status_text(413), "Payload Too Large");
+    }
+
+    #[test]
+    fn request_head_reads_stop_at_the_byte_budget() {
+        let mut budget = MAX_REQUEST_HEAD_BYTES;
+        let mut endless = BufReader::new(std::io::repeat(b'a'));
+        assert!(read_head_line(&mut endless, &mut budget).unwrap().is_none());
+
+        let mut budget = MAX_REQUEST_HEAD_BYTES;
+        let mut flood = std::io::Cursor::new(b"X-Pad: 1\r\n".repeat(4000));
+        let mut lines = 0;
+        while read_head_line(&mut flood, &mut budget).unwrap().is_some() {
+            lines += 1;
+        }
+        assert!(lines < 4000, "header count must be bounded, read {lines}");
+
+        let mut budget = MAX_REQUEST_HEAD_BYTES;
+        let mut req = std::io::Cursor::new(b"GET /status HTTP/1.1\r\n\r\n".to_vec());
+        let line = read_head_line(&mut req, &mut budget).unwrap().unwrap();
+        assert_eq!(line, "GET /status HTTP/1.1\r\n");
+        assert_eq!(budget, MAX_REQUEST_HEAD_BYTES - line.len());
+        assert_eq!(http_status_text(431), "Request Header Fields Too Large");
+    }
+
+    #[test]
+    fn oversized_header_line_gets_431_instead_of_buffering() {
+        let mut req = b"GET /status HTTP/1.1\r\nX-Pad: ".to_vec();
+        req.resize(MAX_REQUEST_HEAD_BYTES + 1, b'a');
+        let resp = serve_once(&req);
+        assert!(resp.starts_with("HTTP/1.1 431 "), "got {resp:?}");
+
+        let body = r#"{"url":"https://youtu.be/tRsQsTMvPNg"}"#;
+        let req = format!(
+            "POST /import HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let resp = serve_once(req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 200 "), "got {resp:?}");
+        assert!(resp.contains(r#""ok":true"#), "got {resp:?}");
+    }
+
+    fn serve_once(req: &[u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = handle_connection(stream, &tx, &new_shared_state());
+            drop(rx);
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        client.write_all(req).unwrap();
+        let mut resp = String::new();
+        let _ = client.read_to_string(&mut resp);
+        server.join().unwrap();
+        resp
+    }
+
+    #[test]
+    fn request_reads_have_a_five_second_inactivity_timeout() {
+        assert_eq!(request_read_timeout(), std::time::Duration::from_secs(5));
+    }
+
+    #[test]
     fn ok_response_structure() {
         let resp = ok(serde_json::json!({"hello": "world"}));
         assert_eq!(resp["ok"], true);
@@ -920,13 +1038,38 @@ mod tests {
     }
 
     #[test]
+    fn eq_rejects_unknown_bands_before_queueing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state = new_shared_state();
+        assert_eq!(handle_eq(r#"{"band":5,"db":3.0}"#, &tx)["ok"], false);
+        let resp = handle_control(r#"{"action":"eq","index":7,"value":3.0}"#, &tx, &state);
+        assert_eq!(resp["ok"], false);
+        assert!(rx.try_recv().is_err());
+
+        assert_eq!(handle_eq(r#"{"band":4,"db":3.0}"#, &tx)["ok"], true);
+        assert!(matches!(rx.try_recv(), Ok(ControlCmd::SetEq(4, db)) if db == 3.0));
+    }
+
+    #[test]
+    fn import_rejects_non_media_urls_before_queueing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let resp = handle_import(r#"{"url":"https://evil.example/youtube.com/x"}"#, &tx);
+        assert_eq!(resp["ok"], false);
+        assert!(rx.try_recv().is_err());
+
+        let resp = handle_import(r#"{"url":"https://youtu.be/tRsQsTMvPNg"}"#, &tx);
+        assert_eq!(resp["ok"], true);
+        assert!(matches!(rx.try_recv(), Ok(ControlCmd::Import(_))));
+    }
+
+    #[test]
     fn disconnected_control_handlers_report_unavailable() {
         let (tx, rx) = std::sync::mpsc::channel();
         drop(rx);
         let state = new_shared_state();
         let responses = [
             handle_control(r#"{"action":"play"}"#, &tx, &state),
-            handle_import(r#"{"url":"https://example.com/song"}"#, &tx),
+            handle_import(r#"{"url":"https://youtu.be/tRsQsTMvPNg"}"#, &tx),
             handle_library_scan(&tx),
             handle_meta_scan(&tx),
             handle_eq(r#"{"band":2,"db":4.5}"#, &tx),
@@ -1096,10 +1239,11 @@ mod tests {
         info.has_cover = true;
         let state = Arc::new(Mutex::new(ApiSnapshot {
             library: vec![sample_track(0, "A"), info],
-            cover_paths: vec![None, Some(path)],
+            cover_paths: vec![None, Some(path.clone())],
             ..Default::default()
         }));
         let resp = handle_track("/track/1", &state);
+        let _ = std::fs::remove_file(&path);
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["data"]["info"]["title"], "B");
         assert_eq!(resp["data"]["cover"]["mime"], "image/jpeg");
@@ -1122,10 +1266,11 @@ mod tests {
         info.has_cover = true;
         let state = Arc::new(Mutex::new(ApiSnapshot {
             library: vec![info],
-            cover_paths: vec![Some(path)],
+            cover_paths: vec![Some(path.clone())],
             ..Default::default()
         }));
         let resp = handle_library_full(&state);
+        let _ = std::fs::remove_file(&path);
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("secret"));
         assert!(!json.contains("image/jpeg"));
@@ -1138,10 +1283,12 @@ mod tests {
         let path = temp_cover(jpeg, "jpg");
         let state = Arc::new(Mutex::new(ApiSnapshot {
             library: vec![sample_track(2, "C")],
-            cover_paths: vec![None, None, Some(path)],
+            cover_paths: vec![None, None, Some(path.clone())],
             ..Default::default()
         }));
-        let (mime, bytes) = cover_bytes_for("/cover/2", &state).expect("cover");
+        let found = cover_bytes_for("/cover/2", &state);
+        let _ = std::fs::remove_file(&path);
+        let (mime, bytes) = found.expect("cover");
         assert_eq!(mime, "image/jpeg");
         assert_eq!(bytes, jpeg);
         assert!(cover_bytes_for("/cover/0", &state).is_none());

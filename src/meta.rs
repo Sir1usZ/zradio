@@ -155,9 +155,9 @@ pub fn load_meta(path: &Path, fallback_title: &str) -> TrackMeta {
     if meta.cover_path.is_none() {
         if let Some(cover) = sidecar_cover(path) {
             if let Ok(bytes) = fs::read(&cover) {
-                if let Some((cover_path, art)) = store_cover(&cover, &bytes, None) {
-                    meta.cover_path = Some(cover_path);
-                    meta.cover = art;
+                if sniff_image(&bytes).is_some() {
+                    meta.cover = crate::cover::CoverArt::from_bytes(&bytes);
+                    meta.cover_path = Some(cover);
                 }
             }
         }
@@ -363,6 +363,7 @@ fn sidecar_cover(path: &Path) -> Option<PathBuf> {
 }
 
 pub fn cache_cover(src: &Path, data: &[u8]) -> Option<(PathBuf, Option<crate::cover::CoverArt>)> {
+    sniff_image(data)?;
     store_cover(src, data, None)
 }
 
@@ -392,14 +393,20 @@ fn cover_extension(data: &[u8], mime: Option<&str>) -> &'static str {
         Some("image/jpeg" | "image/jpg") => return "jpg",
         _ => {}
     }
+    sniff_image(data).unwrap_or("jpg")
+}
+
+fn sniff_image(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"\x89PNG\r\n\x1a\n") {
-        "png"
+        Some("png")
     } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
-        "gif"
+        Some("gif")
     } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
-        "webp"
+        Some("webp")
+    } else if data.starts_with(b"\xff\xd8\xff") {
+        Some("jpg")
     } else {
-        "jpg"
+        None
     }
 }
 
@@ -419,7 +426,7 @@ fn cover_cache_name(src: &Path, ext: &str) -> String {
         })
         .collect();
     let mut hash = 0xcbf29ce484222325u64;
-    for byte in src.to_string_lossy().as_bytes() {
+    for byte in src.as_os_str().as_encoded_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -451,6 +458,22 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with("song-"));
         assert!(first.ends_with(".jpg"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cover_cache_names_preserve_non_utf8_path_identity() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = PathBuf::from(OsString::from_vec(b"/music/\x80/song.mp3".to_vec()));
+        let second = PathBuf::from(OsString::from_vec(b"/music/\x81/song.mp3".to_vec()));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+
+        assert_ne!(
+            cover_cache_name(&first, "jpg"),
+            cover_cache_name(&second, "jpg")
+        );
     }
 
     #[test]
@@ -646,12 +669,15 @@ mod tests {
             },
         );
         assert!(changed);
-        assert!(!sort_key_changed(&slot, &TrackMeta {
-            artist: "Avicii".into(),
-            album: "True".into(),
-            title: "Levels".into(),
-            ..TrackMeta::default()
-        }));
+        assert!(!sort_key_changed(
+            &slot,
+            &TrackMeta {
+                artist: "Avicii".into(),
+                album: "True".into(),
+                title: "Levels".into(),
+                ..TrackMeta::default()
+            }
+        ));
         let mut empty_album = Some(TrackMeta {
             artist: "Avicii".into(),
             title: "Levels".into(),
@@ -667,11 +693,14 @@ mod tests {
             },
         );
         assert!(changed);
-        assert!(sort_key_changed(&empty_album, &TrackMeta {
-            artist: "Avicii".into(),
-            title: "Levels".into(),
-            ..TrackMeta::default()
-        }));
+        assert!(sort_key_changed(
+            &empty_album,
+            &TrackMeta {
+                artist: "Avicii".into(),
+                title: "Levels".into(),
+                ..TrackMeta::default()
+            }
+        ));
     }
 
     #[test]
@@ -717,6 +746,60 @@ mod tests {
         assert_eq!(merged.title, "Remote title");
         assert_eq!(merged.artist, "Remote artist");
         assert_eq!(merged.album, "Local album");
+    }
+
+    #[test]
+    fn sidecar_cover_is_used_in_place_without_copies() {
+        let dir = std::env::temp_dir().join(format!("zradio-sidecar-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("cover")).unwrap();
+        let song = dir.join("song.wav");
+        write_silent_wav(&song);
+        let cover = dir.join("cover").join("cover.png");
+        let mut png = Vec::new();
+        image::RgbImage::from_pixel(2, 2, image::Rgb([200, 40, 40]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        fs::write(&cover, &png).unwrap();
+
+        let meta = load_meta(&song, "song");
+
+        assert_eq!(meta.cover_path.as_deref(), Some(cover.as_path()));
+        assert!(meta.cover.is_some());
+        assert!(!dir.join("cover").join("cover").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_image_sidecar_does_not_block_cover_fetch() {
+        let dir = std::env::temp_dir().join(format!("zradio-badside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("cover")).unwrap();
+        let song = dir.join("song.wav");
+        write_silent_wav(&song);
+        fs::write(
+            dir.join("cover").join("song.jpg"),
+            b"<html>403 Forbidden</html>",
+        )
+        .unwrap();
+
+        let meta = load_meta(&song, "song");
+
+        assert!(meta.cover_path.is_none());
+        assert!(meta.cover.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetched_error_page_is_not_cached_as_cover() {
+        let dir = std::env::temp_dir().join(format!("zradio-badcover-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let song = dir.join("song.wav");
+
+        assert!(cache_cover(&song, b"<html><body>404 Not Found</body></html>").is_none());
+        assert!(!dir.join("cover").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

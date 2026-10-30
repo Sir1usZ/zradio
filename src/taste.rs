@@ -122,12 +122,20 @@ impl TasteStore {
     }
 
     pub fn boosts_for(&self, tracks: &[Track], artists: &[String]) -> Vec<f32> {
+        let mut by_artist: HashMap<&str, f32> = HashMap::new();
+        for e in self.cache.tracks.values() {
+            let artist = e.artist.trim();
+            if !artist.is_empty() {
+                *by_artist.entry(artist).or_default() += score_of(e);
+            }
+        }
         tracks
             .iter()
             .enumerate()
             .map(|(i, track)| {
-                let artist = artists.get(i).map(String::as_str).unwrap_or("");
-                self.boost_for(&track.path, artist)
+                let artist = artists.get(i).map(|a| a.trim()).unwrap_or("");
+                let artist_score = by_artist.get(artist).copied().unwrap_or(0.0);
+                boost(self.track_score(&track.path), artist_score)
             })
             .collect()
     }
@@ -289,6 +297,50 @@ mod tests {
         let p = Path::new("/m/mid.mp3");
         taste.record_leave(p, "Mid", "X", 0.55, true, 100.0);
         assert_eq!(taste.track_score(p), 0.0);
+    }
+
+    #[test]
+    fn batch_boosts_match_single_lookups() {
+        let mut taste = TasteStore::memory();
+        for i in 0..40 {
+            let p = PathBuf::from(format!("/m/{i}.mp3"));
+            let artist = format!("Artist {}", i % 7);
+            taste.record_leave(&p, "T", &artist, 1.0, i % 5 == 0, 100.0);
+        }
+        taste.record_leave(
+            Path::new("/m/skip.mp3"),
+            "S",
+            " Artist 3 ",
+            0.1,
+            true,
+            100.0,
+        );
+        let tracks: Vec<Track> = (0..60)
+            .map(|i| Track {
+                path: PathBuf::from(format!("/m/{i}.mp3")),
+                title: "T".into(),
+            })
+            .collect();
+        let artists: Vec<String> = (0..58)
+            .map(|i| match i % 9 {
+                0 => String::new(),
+                1 => format!(" Artist {} ", i % 7),
+                _ => format!("Artist {}", i % 7),
+            })
+            .collect();
+
+        let batch = taste.boosts_for(&tracks, &artists);
+
+        assert_eq!(batch.len(), tracks.len());
+        for (i, track) in tracks.iter().enumerate() {
+            let artist = artists.get(i).map(String::as_str).unwrap_or("");
+            let single = taste.boost_for(&track.path, artist);
+            assert!(
+                (batch[i] - single).abs() < 1e-6,
+                "track {i}: {} vs {single}",
+                batch[i]
+            );
+        }
     }
 
     #[test]

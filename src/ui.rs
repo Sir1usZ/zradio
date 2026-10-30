@@ -35,7 +35,7 @@ use crate::drawer::{
 use crate::dsp::MixMode;
 use crate::engine::{load_track, Player, Snapshot};
 use crate::eq::Equalizer;
-use crate::fetch::{self, looks_like_media_url};
+use crate::fetch::{self, find_media_url};
 use crate::greeting::{
     greeting_line, greeting_origin, greeting_overlay, local_hour, music_split, overlay_escape,
     system_name, GreetingAnim, GREET_SCALE,
@@ -95,6 +95,48 @@ fn receive_batch<T>(rx: &Receiver<T>, limit: usize) -> Vec<T> {
         }
     }
     items
+}
+
+fn advance_animations(drawer: &mut DrawerAnim, greeting: &mut GreetingAnim, elapsed: Duration) {
+    let dt_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    drawer.tick(dt_ms);
+    greeting.tick(dt_ms);
+}
+
+struct CleanupGuard<F: FnOnce()> {
+    cleanup: Option<F>,
+}
+
+impl<F: FnOnce()> CleanupGuard<F> {
+    fn new(cleanup: F) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for CleanupGuard<F> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+fn restore_terminal() -> io::Result<()> {
+    let raw_result = disable_raw_mode();
+    let screen_result = execute!(
+        io::stdout(),
+        crossterm::event::DisableBracketedPaste,
+        DisableFocusChange,
+        LeaveAlternateScreen
+    );
+    raw_result?;
+    screen_result
 }
 
 struct DecodeJob {
@@ -614,14 +656,7 @@ impl App {
                 .collect()
         } else {
             match self.playlists.current_list() {
-                Some(list) => list
-                    .paths
-                    .iter()
-                    .map(|p| match self.tracks.iter().position(|t| &t.path == p) {
-                        Some(i) => RangeRow::Present(i),
-                        None => RangeRow::Missing(p.clone()),
-                    })
-                    .collect(),
+                Some(list) => playlist_rows(&list.paths, &self.tracks),
                 None => Vec::new(),
             }
         };
@@ -640,21 +675,10 @@ impl App {
         }
         match self.browse_kind {
             BrowseKind::All => self.sorted_idx.iter().copied().map(LibRow::Track).collect(),
-            BrowseKind::Tagged => {
-                let tagged = browse::tagged_indices(&self.metas);
-                self.sorted_idx
-                    .iter()
-                    .copied()
-                    .filter(|i| tagged.contains(i))
-                    .map(LibRow::Track)
-                    .collect()
-            }
-            BrowseKind::Untagged => {
-                let untagged = browse::untagged_indices(&self.metas);
-                self.sorted_idx
-                    .iter()
-                    .copied()
-                    .filter(|i| untagged.contains(i))
+            BrowseKind::Tagged | BrowseKind::Untagged => {
+                let tagged = self.browse_kind == BrowseKind::Tagged;
+                browse::filter_tagged(&self.sorted_idx, &self.metas, tagged)
+                    .into_iter()
                     .map(LibRow::Track)
                     .collect()
             }
@@ -1029,10 +1053,6 @@ impl App {
             job.analysis.size = meta.len();
         }
         self.analysis.insert(path, job.analysis.clone());
-        let remix = self.player.mixer.lock().expect("mixer").remix();
-        let buf = apply_remix(&job.buf, remix);
-        let mut mixer = self.player.mixer.lock().expect("mixer");
-        mixer.set_analysis(index, job.analysis);
         let meta = load_meta(
             path,
             &self
@@ -1041,7 +1061,18 @@ impl App {
                 .map(|t| t.title.clone())
                 .unwrap_or_default(),
         );
+        let mut mixer = self.player.mixer.lock().expect("mixer");
+        mixer.set_analysis(index, job.analysis);
         mixer.set_track_title(index, meta.title.clone());
+        let remix = mixer.remix();
+        let fade = job.transition && mixer.mix().uses_fade();
+        let rate = if fade {
+            mixer.transition_rate(index, job.skip)
+        } else {
+            1.0
+        };
+        drop(mixer);
+        let buf = crate::engine::beatmatch(apply_remix(job.buf, remix), rate);
         if let Some(track) = self.tracks.get_mut(index) {
             track.title = meta.title.clone();
         }
@@ -1049,15 +1080,13 @@ impl App {
             self.metas.resize(index + 1, None);
         }
         self.metas[index] = Some(meta.clone());
-        let queue_remote = self.wants_remote(&meta);
-        drop(mixer);
-        if queue_remote {
+        if self.wants_remote(&meta) {
             self.queue_meta(index);
         }
         self.mark_meta_changed();
         let mut mixer = self.player.mixer.lock().expect("mixer");
-        if job.transition && mixer.mix().uses_fade() {
-            mixer.start_transition(index, buf, job.skip);
+        if fade {
+            mixer.start_matched_transition(index, buf, job.skip, rate);
         } else {
             mixer.play_decoded(index, buf);
         }
@@ -1124,6 +1153,7 @@ impl App {
 
     fn drain_remote_meta(&mut self) {
         let mut changed = false;
+        let mut titles = Vec::new();
         while let Ok(job) = self.remote_rx.try_recv() {
             if !job.id.matches(self.library_generation, &self.tracks)
                 || !self.meta_inflight.remove(&job.id)
@@ -1156,7 +1186,8 @@ impl App {
                 if let Some(title) = job.title.filter(|s| !s.trim().is_empty()) {
                     slot.title = title.clone();
                     if let Some(track) = self.tracks.get_mut(index) {
-                        track.title = title;
+                        track.title = title.clone();
+                        titles.push((index, title));
                     }
                     changed = true;
                 }
@@ -1183,6 +1214,7 @@ impl App {
                 self.peek_sort_dirty = true;
             }
         }
+        self.push_mixer_titles(titles);
         if changed {
             self.api_dirty = true;
         }
@@ -1218,6 +1250,7 @@ impl App {
     fn drain_peek(&mut self) {
         const PEEK_PER_TICK: usize = 24;
         let mut changed = 0;
+        let mut titles = Vec::new();
         for job in receive_batch(&self.peek_rx, PEEK_PER_TICK) {
             if !job.id.matches(self.library_generation, &self.tracks) {
                 continue;
@@ -1234,7 +1267,8 @@ impl App {
                     .filter(|t| !t.is_empty())
                 {
                     if let Some(track) = self.tracks.get_mut(index) {
-                        track.title = title;
+                        track.title = title.clone();
+                        titles.push((index, title));
                     }
                 }
                 changed += 1;
@@ -1251,8 +1285,20 @@ impl App {
                 }
             }
         }
+        self.push_mixer_titles(titles);
         if changed > 0 {
             self.api_dirty = true;
+        }
+    }
+
+    fn push_mixer_titles(&self, titles: Vec<(usize, String)>) {
+        if titles.is_empty() {
+            return;
+        }
+        if let Ok(mut mixer) = self.player.mixer.lock() {
+            for (index, title) in titles {
+                mixer.set_track_title(index, title);
+            }
         }
     }
 
@@ -1295,35 +1341,39 @@ impl App {
         if self.inflight.is_some() {
             return;
         }
-        let (need, index, mix) = {
-            let mixer = self.player.mixer.lock().expect("mixer");
-            (mixer.should_prefetch(), mixer.next_index(), mixer.mix())
+        let (advance, prefetch) = {
+            let mut mixer = self.player.mixer.lock().expect("mixer");
+            let advance = mixer.take_auto_advance();
+            let prefetch =
+                if advance.is_none() && mixer.mix().uses_fade() && mixer.should_prefetch() {
+                    mixer.next_index()
+                } else {
+                    None
+                };
+            (advance, prefetch)
         };
-        if !need {
+        if let Some(index) = advance {
+            self.note_leave(false);
+            self.sync_list_cursor(index);
+            self.spawn_decode(index, false, false);
             return;
         }
-        let Some(index) = index else {
+        let Some(index) = prefetch else {
             return;
         };
         if self.prefetch_attempt == Some(index) {
             return;
         }
         self.prefetch_attempt = Some(index);
-        if !mix.uses_fade() {
-            let finished = self.player.mixer.lock().expect("mixer").take_finished();
-            if finished {
-                self.note_leave(false);
-                self.sync_list_cursor(index);
-                self.spawn_decode(index, false, false);
-            }
-            return;
-        }
         self.note_leave(false);
         self.spawn_decode(index, true, false);
     }
 
     pub fn run(mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
+        let mut cleanup = CleanupGuard::new(|| {
+            let _ = restore_terminal();
+        });
         let mut stdout = stdout();
         if self.prefs.transparent {
             execute!(
@@ -1372,7 +1422,9 @@ impl App {
                     _ => {}
                 }
             }
-            if last.elapsed() >= tick {
+            let elapsed = last.elapsed();
+            if elapsed >= tick {
+                last = Instant::now();
                 self.tick = self.tick.wrapping_add(1);
                 self.drain_decode();
                 self.drain_peek();
@@ -1386,8 +1438,7 @@ impl App {
                 self.drain_import();
                 self.drain_search();
                 self.drain_control();
-                self.drawer.tick(tick.as_millis() as u64);
-                self.greeting.tick(tick.as_millis() as u64);
+                advance_animations(&mut self.drawer, &mut self.greeting, elapsed);
                 if let Some(login) = self.login_poller.drain() {
                     self.login = login;
                 }
@@ -1417,18 +1468,12 @@ impl App {
                         }
                     }
                 }
-                last = Instant::now();
             }
         };
         self.save_session();
         self.taste.flush();
-        disable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            crossterm::event::DisableBracketedPaste,
-            DisableFocusChange,
-            LeaveAlternateScreen
-        )?;
+        restore_terminal()?;
+        cleanup.disarm();
         result
     }
 
@@ -2041,8 +2086,8 @@ impl App {
             buf.push_str(text);
             return;
         }
-        if looks_like_media_url(text) {
-            self.command = Some(text.to_string());
+        if let Some(url) = find_media_url(text) {
+            self.command = Some(url.to_string());
             self.status = "enter to import pasted url".into();
         }
     }
@@ -2052,8 +2097,8 @@ impl App {
         if raw.is_empty() {
             return;
         }
-        if looks_like_media_url(raw) {
-            self.start_import(raw);
+        if let Some(url) = find_media_url(raw) {
+            self.start_import(url);
             return;
         }
         if let Some(rest) = raw.strip_prefix("search ") {
@@ -2082,23 +2127,9 @@ impl App {
     fn open_folder(&mut self, root: PathBuf) {
         match scan_library(&root) {
             Ok(tracks) => {
-                self.invalidate_library_jobs();
                 self.prefs.set_library(&root);
                 self.prefs.save();
-                self.tracks = tracks;
-                self.metas = vec![None; self.tracks.len()];
-                if let Ok(mut mixer) = self.player.mixer.lock() {
-                    mixer.set_tracks(self.tracks.clone());
-                    mixer.set_shuffle_mode(self.prefs.shuffle_mode);
-                }
-                self.sync_playable();
-                self.spawn_peek();
-                self.mark_meta_changed();
-                self.list_state.select(if self.tracks.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                });
+                self.replace_tracks(tracks);
                 self.status = format!("open {} · {} tracks", root.display(), self.tracks.len());
             }
             Err(err) => self.status = format!("open fail {err}"),
@@ -2109,25 +2140,51 @@ impl App {
         let root = self.prefs.library_path();
         match scan_library(&root) {
             Ok(tracks) => {
-                self.invalidate_library_jobs();
-                self.tracks = tracks;
-                self.metas = vec![None; self.tracks.len()];
-                if let Ok(mut mixer) = self.player.mixer.lock() {
-                    mixer.set_tracks(self.tracks.clone());
-                    mixer.set_shuffle_mode(self.prefs.shuffle_mode);
-                }
-                self.sync_playable();
-                self.spawn_peek();
-                self.mark_meta_changed();
-                self.list_state.select(if self.tracks.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                });
+                self.replace_tracks(tracks);
                 self.status = format!("rescan {} · {} tracks", root.display(), self.tracks.len());
             }
             Err(err) => self.status = format!("rescan fail {err}"),
         }
+    }
+
+    fn replace_tracks(&mut self, tracks: Vec<Track>) {
+        self.invalidate_library_jobs();
+        let moved = remap_track_indices(&self.tracks, &tracks);
+        let mut metas = vec![None; tracks.len()];
+        let playing = self
+            .player
+            .mixer
+            .lock()
+            .ok()
+            .and_then(|m| m.playback_view(0).current);
+        if let Some(old) = playing {
+            if let Some(new) = moved.get(old).copied().flatten() {
+                metas[new] = self.metas.get_mut(old).and_then(Option::take);
+            }
+        }
+        self.local_hits = self
+            .local_hits
+            .iter()
+            .filter_map(|&i| moved.get(i).copied().flatten())
+            .collect();
+        if self.local_hits.is_empty() {
+            self.local_filter.clear();
+        }
+        self.local_idx = 0;
+        self.tracks = tracks;
+        self.metas = metas;
+        if let Ok(mut mixer) = self.player.mixer.lock() {
+            mixer.set_tracks(self.tracks.clone());
+            mixer.set_shuffle_mode(self.prefs.shuffle_mode);
+        }
+        self.sync_playable();
+        self.spawn_peek();
+        self.mark_meta_changed();
+        self.list_state.select(if self.tracks.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
     }
 
     fn search_local(&mut self, query: &str) {
@@ -2629,10 +2686,11 @@ impl App {
                 // ── EQ ──
                 ControlCmd::SetEq(band, db) => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
-                        mixer.bump_eq(band, db);
+                        mixer.set_eq_band(band, db);
                         self.prefs.eq_db = mixer.eq_db();
                         self.status = mixer.snapshot(self.selected()).status;
                     }
+                    self.prefs.save();
                 }
                 ControlCmd::ResetEq => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
@@ -2640,6 +2698,7 @@ impl App {
                         self.prefs.eq_db = mixer.eq_db();
                         self.status = mixer.snapshot(self.selected()).status;
                     }
+                    self.prefs.save();
                 }
 
                 // ── 排序 ──
@@ -3853,6 +3912,32 @@ fn esc_outcome(search_open: bool, local_open: bool) -> EscOutcome {
     }
 }
 
+fn remap_track_indices(old: &[Track], new: &[Track]) -> Vec<Option<usize>> {
+    let by_path: std::collections::HashMap<&std::path::Path, usize> = new
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.path.as_path(), i))
+        .collect();
+    old.iter()
+        .map(|t| by_path.get(t.path.as_path()).copied())
+        .collect()
+}
+
+fn playlist_rows(paths: &[PathBuf], tracks: &[Track]) -> Vec<RangeRow> {
+    let mut by_path: std::collections::HashMap<&std::path::Path, usize> =
+        std::collections::HashMap::with_capacity(tracks.len());
+    for (i, t) in tracks.iter().enumerate() {
+        by_path.entry(t.path.as_path()).or_insert(i);
+    }
+    paths
+        .iter()
+        .map(|p| match by_path.get(p.as_path()) {
+            Some(&i) => RangeRow::Present(i),
+            None => RangeRow::Missing(p.clone()),
+        })
+        .collect()
+}
+
 fn visible_row(visible: &[usize], track_index: usize) -> Option<usize> {
     visible.iter().position(|&i| i == track_index)
 }
@@ -4016,11 +4101,77 @@ fn visualize_rows(
 mod tests {
     use super::*;
 
+    #[test]
+    fn cleanup_guard_runs_on_early_return_and_can_be_disarmed() {
+        let cleanup_count = std::cell::Cell::new(0);
+        {
+            let _guard = CleanupGuard::new(|| cleanup_count.set(cleanup_count.get() + 1));
+        }
+        assert_eq!(cleanup_count.get(), 1);
+
+        {
+            let mut guard = CleanupGuard::new(|| cleanup_count.set(cleanup_count.get() + 1));
+            guard.disarm();
+        }
+        assert_eq!(cleanup_count.get(), 1);
+    }
+
+    #[test]
+    fn animations_advance_by_the_full_elapsed_duration() {
+        let mut drawer = DrawerAnim::closed();
+        drawer.open();
+        let mut greeting = GreetingAnim::new();
+
+        advance_animations(&mut drawer, &mut greeting, Duration::from_secs(8));
+
+        assert_eq!(drawer.phase(), crate::drawer::DrawerPhase::Open);
+        assert!(!greeting.is_visible());
+    }
+
     fn job_track(path: &str) -> Track {
         Track {
             path: PathBuf::from(path),
             title: path.into(),
         }
+    }
+
+    #[test]
+    fn playlist_rows_resolve_paths_to_first_library_index() {
+        let tracks = vec![
+            job_track("/m/a.mp3"),
+            job_track("/m/b.mp3"),
+            job_track("/m/a.mp3"),
+        ];
+        let paths = vec![
+            PathBuf::from("/m/b.mp3"),
+            PathBuf::from("/gone.mp3"),
+            PathBuf::from("/m/a.mp3"),
+            PathBuf::from("/m/b.mp3"),
+        ];
+        let rows = playlist_rows(&paths, &tracks);
+        assert!(matches!(rows[0], RangeRow::Present(1)));
+        assert!(matches!(&rows[1], RangeRow::Missing(p) if p == std::path::Path::new("/gone.mp3")));
+        assert!(matches!(rows[2], RangeRow::Present(0)));
+        assert!(matches!(rows[3], RangeRow::Present(1)));
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn rescan_moves_indices_with_their_files() {
+        let old = vec![
+            job_track("/m/a.mp3"),
+            job_track("/m/b.mp3"),
+            job_track("/m/c.mp3"),
+        ];
+        let new = vec![
+            job_track("/m/c.mp3"),
+            job_track("/m/new.mp3"),
+            job_track("/m/a.mp3"),
+        ];
+        assert_eq!(
+            remap_track_indices(&old, &new),
+            vec![Some(2), None, Some(0)]
+        );
     }
 
     #[test]
@@ -4130,7 +4281,10 @@ mod tests {
 
     #[test]
     fn tick_work_skips_spectrum_when_visualizer_is_off() {
-        assert!(!needs_spectrum_refresh(crate::prefs::VisualizeMode::Off, false));
+        assert!(!needs_spectrum_refresh(
+            crate::prefs::VisualizeMode::Off,
+            false
+        ));
         assert!(needs_spectrum_refresh(
             crate::prefs::VisualizeMode::Bars,
             false
