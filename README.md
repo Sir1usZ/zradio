@@ -29,6 +29,8 @@ cargo build --release
 
 Optional argument: a library directory.
 
+`cargo build --release --no-default-features` leaves out [Beat This!](#beat-this) and the [voice handoff](#voice-handoff); the binary drops from about 40 MB to 10 MB.
+
 ## Keys
 
 | Key | Action |
@@ -60,9 +62,43 @@ Optional argument: a library directory.
 
 Playlists live in `~/.local/share/zradio/playlists.json`. Slot `1` is the whole library; slots `2`–`9` are user lists. The music tab shows the current list only; `p` slides a 9-slot picker up from the bottom. The current list is the play range for `n` / shuffle / loop. Missing files stay in the JSON, render gray, and are skipped.
 
-Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume.
+Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume, [Beat This!](#beat-this), [voice handoff](#voice-handoff) (人声交接).
 
 Missing tags / covers / lyrics fill from iTunes + lrclib, then Netease, QQ, and Kugou. Existing fields are kept. Lyrics land in a sidecar `lrc/` file; audio files are not rewritten. SPlayer is only for `?` search/download.
+
+## AutoMix
+
+`m` cycles `CUT` / `FADE` / `AUTO`. In `AUTO` each track is analysed once, cached in `~/.cache/zradio/analysis.json`, for tempo and beat phase, key (Camelot), BS.1770 loudness, peak, and where the music starts and ends.
+
+- Next track: with shuffle off and loop not `all`, the best scoring track in the play range by key, tempo and energy, plus taste. Tempos lock within 8%, or an octave apart (80 BPM beats with 160).
+- Level: every track plays at -14 LUFS, or lower if its peak through the crossover would pass -1 dBFS.
+- Transition: when the tempos lock, the outgoing tail glides to the incoming tempo. The incoming track starts on the outgoing beat phase and is never resampled. The style follows the pair: `bass-swap` (a 160 Hz Linkwitz-Riley crossover hands the low end over mid-overlap), `filter` when the keys clash or the energy jumps, a 4 s `quick` when both do, a 4 s `echo-out` when the tempos do not lock.
+
+Render transitions offline through the same mixer:
+
+```sh
+cargo run --release --example automix_render -- -o /tmp/mix a.flac b.flac c.flac
+```
+
+Each neighbouring pair becomes `NN.wav`: 12 s before the overlap, the overlap, then 6 s after. The log line gives the style, bend, fade, score, peak, and clipped samples. `--analyze` prints the analysis only. `--skip SECS` mixes as a skip at that point. `--mode fade|cut`, `--before`, `--after` and `--rate` are also accepted. `--beat-this path/to/beat_this.onnx` mixes on the model's grid. `--stems path/to/htdemucs.onnx` hands the voices over as the [voice handoff](#voice-handoff) does, and logs how long each separation took and where the voices change hands.
+
+### Beat This!
+
+Off by default. Turning it on in settings fetches the [Beat This!](https://github.com/CPJKU/beat_this) beat and downbeat model (Foscarin, Schlüter and Widmer, ISMIR 2024; MIT): 83 MB, the ONNX export in [beat_this_cpp](https://github.com/mosynthkey/beat_this_cpp) (MIT), pinned to a commit and checked against its sha256, into `~/.local/share/zradio/models/`. Nothing but the request for that file leaves the machine.
+
+While it is on, the track playing and the one predicted next are scored on one background thread, 15 to 25 s of CPU and up to 340 MB of memory a track. The model's grid replaces the onset tracker's tempo and beat phase and adds the bar line, so the incoming track mixes in on the first bar its music is heard on. A rescored track reaches the mixer only between mixes, never under one already planned. A track the model hears no steady grid in keeps its own. Turned off, tracks go back to the onset grid as they play.
+
+On 40 library tracks, the model held a steady grid in 35. On 27 of those it heard the onset tracker's tempo, and put the bar line elsewhere on 9 of the 27; on 7 it heard twice or half the tempo, on 1 three halves.
+
+### Voice handoff
+
+Off by default. Turning it on in settings (人声交接) fetches the htdemucs source separation model (Rouard, Massa and Défossez, ICASSP 2023; [Meta Demucs](https://github.com/facebookresearch/demucs), MIT): 130 MB, the ONNX export by [StemSplitio](https://huggingface.co/StemSplitio/htdemucs-onnx) (MIT) with its STFT rebuilt from ONNX `DFT` by [itamiArika](https://huggingface.co/itamiArika/htdemucs-int8-memory) (MIT), the fp16 build run in fp32 without quantization, pinned to a revision and checked against its sha256, into `~/.local/share/zradio/models/`. Nothing but the request for that file leaves the machine.
+
+While it is on, each `AUTO` mix has the voices of both tracks separated over the overlap on one background thread, about 20 to 35 s of CPU and up to 1 GB of memory a mix. Where both voices would be heard at once for a second or more, within 12 dB of each other, the outgoing voice fades out over 0.3 s up to a beat of the incoming track and the incoming voice fades in from it; the instruments mix as before. Of the beats that take the least voice away, the handoff takes the one nearest the middle of the overlap. A mix whose voices never clash plays as it would without the setting.
+
+To leave time for the separation, the next track is fetched 45 s sooner. A mix the separation is not ready for keeps both voices: one a skip starts at once, or one replanned by a seek just before it. So do the mixes armed and under way when the setting is turned off.
+
+On 6 transitions between 7 library tracks, the voices clashed in 1, a 4 s `echo-out`, and changed hands 2 s in; the other 5 rendered to the same samples as without it.
 
 ## Visualize
 

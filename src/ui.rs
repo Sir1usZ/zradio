@@ -1,8 +1,8 @@
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, stdout};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -33,7 +33,7 @@ use crate::drawer::{
     drawer_open_height, drawer_rect, drawer_rows, list_title, wrap_idx, DrawerAnim, DRAWER_SLOTS,
 };
 use crate::dsp::MixMode;
-use crate::engine::{load_track, Player, Snapshot};
+use crate::engine::{load_track, Mixer, Player, PreparedBend, Snapshot, VocalJob, VocalOverlay};
 use crate::eq::Equalizer;
 use crate::fetch::{self, find_media_url};
 use crate::greeting::{
@@ -49,10 +49,12 @@ use crate::mpris::{MediaCmd, Mpris};
 use crate::playlist::{store_path, PlaylistStore};
 use crate::prefs::{Palette, Prefs, ShuffleMode};
 use crate::progress::{self, TransferBar};
+use crate::regrid;
 use crate::remix::{apply_remix, RemixMode};
 use crate::session_store::SessionState;
 use crate::shell::{format_listen_time, Tab};
 use crate::splayer;
+use crate::stems;
 use crate::taste::TasteStore;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -84,6 +86,17 @@ fn decode_request_is_current(
     tracks: &[Track],
 ) -> bool {
     inflight == Some(completed) && completed.track.matches(generation, tracks)
+}
+
+/// Renders the outgoing tail on the decode worker; the mixer is locked only to snapshot it.
+fn prepare_bend(
+    mixer: &Mutex<Mixer>,
+    index: usize,
+    next: &TrackAnalysis,
+    skip: bool,
+) -> Option<PreparedBend> {
+    let job = mixer.lock().ok()?.bend_job(index, next, skip)?;
+    Some(job.render())
 }
 
 fn receive_batch<T>(rx: &Receiver<T>, limit: usize) -> Vec<T> {
@@ -145,11 +158,61 @@ struct DecodeJob {
     skip: bool,
     buf: AudioBuf,
     analysis: TrackAnalysis,
+    bend: Option<PreparedBend>,
 }
 
 struct DecodeFailure {
     id: DecodeRequestId,
     error: String,
+}
+
+/// A model being fetched.
+struct ModelFetch {
+    progress: Receiver<String>,
+    done: Receiver<Result<PathBuf, String>>,
+    percent: String,
+}
+
+impl ModelFetch {
+    /// Runs `fetch` on its own thread, which reports progress as "42%".
+    fn spawn(
+        fetch: impl FnOnce(Option<Sender<String>>) -> anyhow::Result<PathBuf> + Send + 'static,
+    ) -> Self {
+        let (progress_tx, progress) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        thread::spawn(move || {
+            let fetched = fetch(Some(progress_tx));
+            let _ = done_tx.send(fetched.map_err(|e| e.to_string()));
+        });
+        Self {
+            progress,
+            done,
+            percent: "0%".into(),
+        }
+    }
+
+    /// The fetch's result once it is done; until then None, keeping `percent` current.
+    fn poll(&mut self) -> Option<Result<PathBuf, String>> {
+        while let Ok(p) = self.progress.try_recv() {
+            self.percent = p;
+        }
+        match self.done.try_recv() {
+            Ok(r) => Some(r),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err("the download thread died".into())),
+        }
+    }
+}
+
+/// A model setting's row: whether the build has it, how far its fetch is, or on/off.
+fn model_label(built: bool, fetch: Option<&ModelFetch>, on: bool) -> String {
+    if !built {
+        return "未编译".into();
+    }
+    match fetch {
+        Some(fetch) => format!("下载模型 {}", fetch.percent),
+        None => on_off(on).into(),
+    }
 }
 
 struct PeekJob {
@@ -265,6 +328,16 @@ pub struct App {
     browse_kind: BrowseKind,
     meta_queue: VecDeque<usize>,
     meta_inflight: HashSet<TrackJobId>,
+    /// Beat This! rescoring: started on first use, one track at a time.
+    regrid: Option<regrid::Worker<TrackJobId>>,
+    regrid_queue: regrid::Queue<TrackJobId>,
+    /// Rescored analyses the mixer gets once no mix planned on the old ones is pending.
+    regrid_ready: Vec<(TrackJobId, TrackAnalysis)>,
+    /// The track playing when the tracks around it were last queued.
+    regrid_around: Option<TrackJobId>,
+    model_fetch: Option<ModelFetch>,
+    stems_fetch: Option<ModelFetch>,
+    vocal_worker: Option<stems::Worker<VocalJob, Option<VocalOverlay>>>,
     /// 远程控制 API 共享状态
     api_state: api::SharedState,
     api_server: api::ApiServer,
@@ -457,6 +530,13 @@ impl App {
             browse_kind: BrowseKind::All,
             meta_queue: VecDeque::new(),
             meta_inflight: HashSet::new(),
+            regrid: None,
+            regrid_queue: regrid::Queue::default(),
+            regrid_ready: Vec::new(),
+            regrid_around: None,
+            model_fetch: None,
+            stems_fetch: None,
+            vocal_worker: None,
             api_state,
             api_server,
             playlists: PlaylistStore::load(),
@@ -510,6 +590,9 @@ impl App {
         self.pending_seek = None;
         self.meta_queue.clear();
         self.meta_inflight.clear();
+        self.regrid_queue.clear();
+        self.regrid_ready.clear();
+        self.regrid_around = None;
     }
 
     fn persist_playlists(&mut self) -> bool {
@@ -991,17 +1074,24 @@ impl App {
         self.status = format!("decode {}", track.title);
         let rate = self.player.sample_rate;
         let ch = self.player.channels;
-        let cached = self.analysis.get(&track.path);
+        let cached = regrid::reusable(self.analysis.get(&track.path), self.prefs.beat_this);
         let tx = self.decode_tx.clone();
+        let mixer = Arc::clone(&self.player.mixer);
         thread::spawn(move || {
             let result = load_track(&track.path, rate, ch).map(|buf| {
                 let analysis = cached.unwrap_or_else(|| analyze_buffer(&buf));
+                let bend = if transition {
+                    prepare_bend(&mixer, index, &analysis, skip)
+                } else {
+                    None
+                };
                 DecodeJob {
                     id: id.clone(),
                     transition,
                     skip,
                     buf,
                     analysis,
+                    bend,
                 }
             });
             let _ = tx.send(result.map_err(|err| DecodeFailure {
@@ -1054,7 +1144,14 @@ impl App {
                 .unwrap_or(0);
             job.analysis.size = meta.len();
         }
-        self.analysis.insert(path, job.analysis.clone());
+        // The decode may have read the cache before Beat This! rescored the track; the mix
+        // planned on what it read keeps it, and the rescored one follows once it is done.
+        let stored = self.analysis.get(path);
+        let rescored = regrid::rescored_since(stored, &job.analysis, self.prefs.beat_this);
+        match rescored {
+            Some(a) => self.regrid_ready.push((job.id.track.clone(), a)),
+            None => self.analysis.insert(path, job.analysis.clone()),
+        }
         let meta = load_meta(
             path,
             &self
@@ -1068,13 +1165,9 @@ impl App {
         mixer.set_track_title(index, meta.title.clone());
         let remix = mixer.remix();
         let fade = job.transition && mixer.mix().uses_fade();
-        let rate = if fade {
-            mixer.transition_rate(index, job.skip)
-        } else {
-            1.0
-        };
         drop(mixer);
-        let buf = crate::engine::beatmatch(apply_remix(job.buf, remix), rate);
+        let buf = apply_remix(job.buf, remix);
+        let tempo = remix.rate();
         if let Some(track) = self.tracks.get_mut(index) {
             track.title = meta.title.clone();
         }
@@ -1088,9 +1181,9 @@ impl App {
         self.mark_meta_changed();
         let mut mixer = self.player.mixer.lock().expect("mixer");
         if fade {
-            mixer.start_matched_transition(index, buf, job.skip, rate);
+            mixer.start_prepared_transition(index, buf, tempo, job.skip, job.bend);
         } else {
-            mixer.play_decoded(index, buf);
+            mixer.play_remixed(index, buf, tempo);
         }
         if let Some(secs) = self.pending_seek.take() {
             let snap = mixer.snapshot(index);
@@ -1436,6 +1529,14 @@ impl App {
                     self.peek_sort_dirty = false;
                 }
                 self.pump_meta_queue();
+                self.drain_model_fetch();
+                self.drain_stems_fetch();
+                self.pump_vocals();
+                self.drain_vocals();
+                self.drain_regrid();
+                self.apply_regrid();
+                self.want_regrid();
+                self.pump_regrid();
                 self.drain_progress();
                 self.drain_import();
                 self.drain_search();
@@ -1717,10 +1818,10 @@ impl App {
                     self.overlay = Overlay::None;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.settings_idx = (self.settings_idx + 1) % 8;
+                    self.settings_idx = (self.settings_idx + 1) % SETTINGS_ROWS;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.settings_idx = (self.settings_idx + 7) % 8;
+                    self.settings_idx = (self.settings_idx + SETTINGS_ROWS - 1) % SETTINGS_ROWS;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => self.toggle_setting(),
                 _ => {}
@@ -1964,7 +2065,9 @@ impl App {
             3 => self.prefs.lyrics_fetch = !self.prefs.lyrics_fetch,
             4 => self.prefs.cover_fetch = !self.prefs.cover_fetch,
             5 => self.prefs.resume = !self.prefs.resume,
-            6 => {
+            6 => return self.toggle_beat_this(),
+            7 => return self.toggle_stems(),
+            8 => {
                 self.prefs.api_lan = !self.prefs.api_lan;
                 self.prefs.save();
                 self.api_server.set_lan(self.prefs.api_lan);
@@ -1979,7 +2082,7 @@ impl App {
                 };
                 return;
             }
-            7 => self.overlay = Overlay::None,
+            9 => self.overlay = Overlay::None,
             _ => {}
         }
         self.prefs.save();
@@ -2055,6 +2158,272 @@ impl App {
                 self.meta_queue.len(),
                 self.meta_inflight.len()
             ));
+        }
+    }
+
+    /// Queues the track playing and the one predicted next for Beat This!, once a track has
+    /// taken over.
+    fn want_regrid(&mut self) {
+        if !self.prefs.beat_this || self.model_fetch.is_some() {
+            return;
+        }
+        let current = {
+            let mixer = self.player.mixer.lock().expect("mixer");
+            if mixer.transition_pending() {
+                return;
+            }
+            mixer.current_index()
+        };
+        let Some(id) = current.and_then(|i| self.track_job_id(i)) else {
+            return;
+        };
+        if self.regrid_around.as_ref() == Some(&id) {
+            return;
+        }
+        self.regrid_around = Some(id.clone());
+        if !crate::beat_this::model_ready() {
+            self.prefs.beat_this = false;
+            self.prefs.save();
+            self.status = "Beat This! off: its model is gone; turn it on again to fetch it".into();
+            return;
+        }
+        // AutoMix weighs the whole library to predict it, so only once a track.
+        let next = self.player.mixer.lock().expect("mixer").next_index();
+        let next = next
+            .filter(|&i| i != id.index)
+            .and_then(|i| self.track_job_id(i));
+        for (id, front) in [(Some(id), true), (next, false)] {
+            let Some(id) = id else {
+                continue;
+            };
+            let path = id.path.clone();
+            if self.analysis.get(&path).is_some_and(|a| a.beat_this) {
+                continue;
+            }
+            if front {
+                self.regrid_queue.push_front(id, &path);
+            } else {
+                self.regrid_queue.push_back(id, &path);
+            }
+        }
+    }
+
+    fn pump_regrid(&mut self) {
+        if !self.prefs.beat_this {
+            return;
+        }
+        let Some(id) = self.regrid_queue.take() else {
+            return;
+        };
+        let base = self.analysis.get(&id.path);
+        let current = id.matches(self.library_generation, &self.tracks);
+        if !current || base.as_ref().is_some_and(|a| a.beat_this) {
+            self.regrid_queue.finish(&id.path);
+            return;
+        }
+        if self.regrid.is_none() {
+            let (rate, channels) = (self.player.sample_rate, self.player.channels);
+            self.regrid = regrid::scorer(rate, channels).map(regrid::Worker::spawn);
+        }
+        let path = id.path.clone();
+        let sent = self.regrid.as_ref().is_some_and(|w| {
+            w.send(regrid::Job {
+                id,
+                path: path.clone(),
+                base,
+            })
+        });
+        if !sent {
+            self.regrid = None;
+            self.regrid_queue.finish(&path);
+        }
+    }
+
+    fn drain_regrid(&mut self) {
+        let Some(worker) = self.regrid.as_ref() else {
+            return;
+        };
+        let mut done = Vec::new();
+        while let Some(d) = worker.try_recv() {
+            done.push(d);
+        }
+        for d in done {
+            self.regrid_queue.finish(&d.path);
+            match d.analysis {
+                // Turned off meanwhile: the track keeps the onset tracker's grid.
+                Ok(_) if !self.prefs.beat_this => {}
+                Ok(a) => {
+                    self.analysis.insert(&d.path, a.clone());
+                    self.regrid_ready.push((d.id, a));
+                }
+                Err(e) => self.status = format!("fail Beat This! {e}"),
+            }
+        }
+    }
+
+    /// Hands rescored analyses to the mixer, unless a mix planned on the old ones is pending.
+    fn apply_regrid(&mut self) {
+        if !self.prefs.beat_this {
+            self.regrid_ready.clear();
+            return;
+        }
+        if self.regrid_ready.is_empty() || self.inflight.is_some() {
+            return;
+        }
+        let mut mixer = self.player.mixer.lock().expect("mixer");
+        if mixer.transition_pending() {
+            return;
+        }
+        for (id, analysis) in self.regrid_ready.drain(..) {
+            // Only tracks the mixer already knows: a new one would change what AutoMix picks.
+            let known = mixer.analysis_at(id.index).is_some();
+            if known && id.matches(self.library_generation, &self.tracks) {
+                mixer.set_analysis(id.index, analysis);
+            }
+        }
+    }
+
+    fn toggle_beat_this(&mut self) {
+        if self.model_fetch.is_some() {
+            return;
+        }
+        if self.prefs.beat_this {
+            self.prefs.beat_this = false;
+            self.prefs.save();
+            self.regrid_queue = regrid::Queue::default();
+            self.status = "Beat This! off: tracks go back to the onset grid as they play".into();
+        } else if !regrid::AVAILABLE {
+            self.status =
+                "this build has no Beat This! (built without the beat-this feature)".into();
+        } else if crate::beat_this::model_ready() {
+            self.enable_beat_this();
+        } else {
+            self.model_fetch = Some(ModelFetch::spawn(regrid::fetch_model));
+            let mb = crate::beat_this::MODEL_BYTES / 1_000_000;
+            self.status = format!("fetching the Beat This! model ({mb} MB) from GitHub");
+        }
+    }
+
+    fn enable_beat_this(&mut self) {
+        self.prefs.beat_this = true;
+        self.prefs.save();
+        // A track cut short when it was turned off is tried again.
+        self.regrid_queue = regrid::Queue::default();
+        self.regrid_around = None;
+        self.status = "Beat This! on: the track playing and the next are rescored".into();
+    }
+
+    fn drain_model_fetch(&mut self) {
+        let Some(result) = self.model_fetch.as_mut().and_then(ModelFetch::poll) else {
+            return;
+        };
+        self.model_fetch = None;
+        match result {
+            Ok(_) => self.enable_beat_this(),
+            Err(e) => self.status = format!("fail Beat This! model: {e}"),
+        }
+    }
+
+    fn beat_this_label(&self) -> String {
+        model_label(
+            regrid::AVAILABLE,
+            self.model_fetch.as_ref(),
+            self.prefs.beat_this,
+        )
+    }
+
+    fn toggle_stems(&mut self) {
+        if self.stems_fetch.is_some() {
+            return;
+        }
+        if self.prefs.stems {
+            self.prefs.stems = false;
+            self.prefs.save();
+            // A mix being separated finishes on the old thread and is let go.
+            self.vocal_worker = None;
+            self.status = "voice handoff off: AutoMix overlaps keep both voices".into();
+        } else if !stems::AVAILABLE {
+            self.status = "this build has no voice separation (built without stems)".into();
+        } else if stems::model_ready() {
+            self.enable_stems();
+        } else {
+            self.stems_fetch = Some(ModelFetch::spawn(stems::download_model));
+            let mb = stems::MODEL_BYTES / 1_000_000;
+            self.status = format!("fetching the htdemucs model ({mb} MB) from Hugging Face");
+        }
+    }
+
+    fn enable_stems(&mut self) {
+        self.prefs.stems = true;
+        self.prefs.save();
+        self.status =
+            "voice handoff on: each AutoMix takes ~30 s and ~1 GB to separate, ahead of time"
+                .into();
+    }
+
+    fn drain_stems_fetch(&mut self) {
+        let Some(result) = self.stems_fetch.as_mut().and_then(ModelFetch::poll) else {
+            return;
+        };
+        self.stems_fetch = None;
+        match result {
+            Ok(_) => self.enable_stems(),
+            Err(e) => self.status = format!("fail htdemucs model: {e}"),
+        }
+    }
+
+    fn stems_label(&self) -> String {
+        model_label(
+            stems::AVAILABLE,
+            self.stems_fetch.as_ref(),
+            self.prefs.stems,
+        )
+    }
+
+    /// Tells the mixer whether to separate voices, and hands an armed mix's to the worker.
+    fn pump_vocals(&mut self) {
+        let on = self.prefs.stems && stems::AVAILABLE;
+        let job = {
+            let mut mixer = self.player.mixer.lock().expect("mixer");
+            mixer.set_stems(on);
+            mixer.take_vocal_job()
+        };
+        let Some(job) = job else {
+            return;
+        };
+        if !stems::model_ready() {
+            self.prefs.stems = false;
+            self.prefs.save();
+            self.status =
+                "voice handoff off: its model is gone; turn it on again to fetch it".into();
+            return;
+        }
+        if self.vocal_worker.is_none() {
+            self.vocal_worker = stems::separator().map(stems::Worker::spawn);
+        }
+        if !self.vocal_worker.as_ref().is_some_and(|w| w.send(job)) {
+            self.vocal_worker = None;
+        }
+    }
+
+    fn drain_vocals(&mut self) {
+        let Some(done) = self.vocal_worker.as_ref().and_then(stems::Worker::try_recv) else {
+            return;
+        };
+        match done {
+            Ok(Some(overlay)) => {
+                let attached = self
+                    .player
+                    .mixer
+                    .lock()
+                    .expect("mixer")
+                    .attach_vocals(overlay);
+                if !attached {
+                    self.status = "voices separated too late for this mix".into();
+                }
+            }
+            Ok(None) => {}
+            Err(e) => self.status = format!("fail voice separation: {e}"),
         }
     }
 
@@ -3597,13 +3966,15 @@ impl App {
     }
 
     fn draw_settings(&self, frame: &mut ratatui::Frame<'_>) {
-        let rows = [
+        let rows: [String; SETTINGS_ROWS] = [
             format!("主题        {}", self.prefs.theme.label()),
             format!("透明背景    {}", on_off(self.prefs.transparent)),
             format!("可视化      {}", self.prefs.visualize.label()),
             format!("拉歌词      {}", on_off(self.prefs.lyrics_fetch)),
             format!("拉封面      {}", on_off(self.prefs.cover_fetch)),
             format!("续播        {}", on_off(self.prefs.resume)),
+            format!("Beat This!  {}", self.beat_this_label()),
+            format!("人声交接    {}", self.stems_label()),
             format!("局域网遥控  {}", on_off(self.prefs.api_lan)),
             "关闭".into(),
         ];
@@ -3615,7 +3986,7 @@ impl App {
                 ListItem::new(format!("{mark}{row}"))
             })
             .collect();
-        let area = centered(frame.area(), 42, 12);
+        let area = centered(frame.area(), 42, 13);
         let pal = self.palette();
         frame.render_widget(Clear, area);
         frame.render_widget(
@@ -4015,6 +4386,9 @@ fn context_target_for_tab(
     }
 }
 
+/// Rows in the settings panel, the last of which closes it.
+const SETTINGS_ROWS: usize = 10;
+
 fn on_off(v: bool) -> &'static str {
     if v {
         "on"
@@ -4132,6 +4506,59 @@ mod tests {
             guard.disarm();
         }
         assert_eq!(cleanup_count.get(), 1);
+    }
+
+    fn finish(fetch: &mut ModelFetch) -> Result<PathBuf, String> {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(done) = fetch.poll() {
+                return done;
+            }
+            assert!(Instant::now() < until, "the fetch never finished");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_model_fetch_reports_progress_then_its_result() {
+        let (go, wait) = mpsc::channel::<()>();
+        let mut fetch = ModelFetch::spawn(move |progress| {
+            progress.expect("asked for progress").send("42%".into())?;
+            wait.recv()?;
+            Ok(PathBuf::from("/models/m.onnx"))
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while fetch.percent != "42%" {
+            assert!(fetch.poll().is_none(), "done before it was let go");
+            assert!(Instant::now() < until, "no progress");
+            thread::sleep(Duration::from_millis(2));
+        }
+        go.send(()).unwrap();
+        assert_eq!(finish(&mut fetch), Ok(PathBuf::from("/models/m.onnx")));
+    }
+
+    #[test]
+    fn a_model_fetch_that_fails_or_dies_says_so() {
+        let mut failed = ModelFetch::spawn(|_| Err(anyhow::anyhow!("offline")));
+        assert_eq!(finish(&mut failed), Err("offline".into()));
+        let mut died = ModelFetch::spawn(|_| panic!("the fetch thread panics"));
+        assert_eq!(finish(&mut died), Err("the download thread died".into()));
+    }
+
+    #[test]
+    fn model_rows_say_if_the_build_has_them_and_how_far_the_fetch_is() {
+        assert_eq!(model_label(false, None, true), "未编译");
+        assert_eq!(model_label(true, None, true), "on");
+        assert_eq!(model_label(true, None, false), "off");
+        let (_progress, progress) = mpsc::channel();
+        let (_done, done) = mpsc::channel();
+        let fetch = ModelFetch {
+            progress,
+            done,
+            percent: "42%".into(),
+        };
+        assert_eq!(model_label(true, Some(&fetch), false), "下载模型 42%");
+        assert_eq!(model_label(false, Some(&fetch), false), "未编译");
     }
 
     #[test]
