@@ -29,6 +29,7 @@ pub mod shell;
 pub mod spectrum;
 pub mod splayer;
 pub(crate) mod storage;
+pub mod stretch;
 pub mod taste;
 pub mod ui;
 
