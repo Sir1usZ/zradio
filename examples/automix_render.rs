@@ -7,6 +7,9 @@
 //!
 //! `--beat-this beat_this.onnx` moves every track onto the grid Beat This! hears in it first,
 //! as the player does with Beat This! on.
+//!
+//! `--stems htdemucs.onnx` separates the voices of each overlap and hands one to the next,
+//! as the player does with the voice handoff on.
 
 use std::path::{Path, PathBuf};
 
@@ -14,15 +17,19 @@ use anyhow::{bail, Context};
 use zradio::analysis::{analyze_buffer, TrackAnalysis};
 use zradio::beat_this::Grid;
 use zradio::decode::{decode_file, AudioBuf};
-use zradio::mixdown::{render, write_wav, Options, Side};
+use zradio::engine::{VocalJob, VocalOverlay};
+use zradio::mixdown::{render_with, write_wav, Options, Side};
 use zradio::MixMode;
 
 const USAGE: &str = "usage: automix_render [--mode auto|fade|cut] [--skip SECS] \
 [--before SECS] [--after SECS] [--rate HZ] [-o DIR] [--analyze] [--beat-this MODEL] \
-FILE FILE [FILE ...]";
+[--stems MODEL] FILE FILE [FILE ...]";
 
 /// Refits a track's analysis on Beat This!'s grid, giving the grid too.
 type Regrid = dyn Fn(&AudioBuf, TrackAnalysis) -> anyhow::Result<(TrackAnalysis, Option<Grid>)>;
+
+/// Separates the voices of an armed mix.
+type Separate = dyn FnMut(VocalJob) -> anyhow::Result<Option<VocalOverlay>>;
 
 struct Args {
     opts: Options,
@@ -30,6 +37,7 @@ struct Args {
     out: PathBuf,
     analyze_only: bool,
     model: Option<PathBuf>,
+    stems: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
 
@@ -40,6 +48,7 @@ fn parse_args() -> anyhow::Result<Args> {
         out: PathBuf::from("automix-out"),
         analyze_only: false,
         model: None,
+        stems: None,
         files: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
@@ -61,6 +70,7 @@ fn parse_args() -> anyhow::Result<Args> {
             "-o" | "--out" => args.out = PathBuf::from(value()?),
             "--analyze" => args.analyze_only = true,
             "--beat-this" => args.model = Some(PathBuf::from(value()?)),
+            "--stems" => args.stems = Some(PathBuf::from(value()?)),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -90,6 +100,26 @@ fn regrid(model: &Path) -> anyhow::Result<Box<Regrid>> {
 #[cfg(not(feature = "beat-this"))]
 fn regrid(_: &Path) -> anyhow::Result<Box<Regrid>> {
     bail!("--beat-this needs the beat-this feature")
+}
+
+#[cfg(feature = "stems")]
+fn separator(model: &Path) -> anyhow::Result<Box<Separate>> {
+    use zradio::stems::Model;
+    let model = Model::load(model).with_context(|| format!("load {}", model.display()))?;
+    Ok(Box::new(move |job: VocalJob| {
+        let start = std::time::Instant::now();
+        let overlay = job.run(|audio, rate| model.vocals(audio, 2, rate))?;
+        println!(
+            "  voices separated in {:.1}s",
+            start.elapsed().as_secs_f32()
+        );
+        Ok(overlay)
+    }))
+}
+
+#[cfg(not(feature = "stems"))]
+fn separator(_: &Path) -> anyhow::Result<Box<Separate>> {
+    bail!("--stems needs the stems feature")
 }
 
 fn load(path: &Path, rate: u32, regrid: Option<&Regrid>) -> anyhow::Result<Side> {
@@ -156,6 +186,7 @@ fn main() -> anyhow::Result<()> {
     let args = parse_args()?;
     let regrid = args.model.as_deref().map(regrid).transpose()?;
     let regrid = regrid.as_deref();
+    let mut separate = args.stems.as_deref().map(separator).transpose()?;
     if args.analyze_only {
         for path in &args.files {
             if let Err(err) = load(path, args.rate, regrid) {
@@ -168,7 +199,7 @@ fn main() -> anyhow::Result<()> {
     let mut prev = load(&args.files[0], args.rate, regrid)?;
     for (n, path) in args.files.iter().enumerate().skip(1) {
         let next = load(path, args.rate, regrid)?;
-        let mix = render(prev, next.clone(), &args.opts)?;
+        let mix = render_with(prev, next.clone(), &args.opts, separate.as_deref_mut())?;
         let file = args.out.join(format!("{n:02}.wav"));
         let clipped = write_wav(&file, &mix.samples, mix.sample_rate, mix.channels)?;
         let span = |f: usize| mix.secs(f);
@@ -193,6 +224,15 @@ fn main() -> anyhow::Result<()> {
             mix.mix_at,
             mix.peak()
         );
+        match mix.handoff {
+            Some(at) => println!(
+                "    voices hand over at {:.2}s of the file, {:.2}s into the overlap",
+                span(at),
+                span(at - mix.overlap.start)
+            ),
+            None if separate.is_some() => println!("    no voices clash, both kept"),
+            None => {}
+        }
         prev = next;
     }
     Ok(())

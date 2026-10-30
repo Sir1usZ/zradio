@@ -31,6 +31,7 @@ pub mod session_store;
 pub mod shell;
 pub mod spectrum;
 pub mod splayer;
+pub mod stems;
 pub(crate) mod storage;
 pub mod stretch;
 pub mod taste;

@@ -315,19 +315,29 @@ pub const MODEL_SHA256: &str = "c5c1466e08abdb03fdeb50668a06f244b787d564c2124904
 
 /// Where the model is kept: under `XDG_DATA_HOME`, or `~/.local/share`.
 pub fn model_path() -> std::path::PathBuf {
-    model_path_in(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+    models_dir_file("beat_this.onnx")
+}
+
+/// `file` in the folder ZRadio keeps its models in.
+pub(crate) fn models_dir_file(file: &str) -> std::path::PathBuf {
+    model_path_in(
+        std::env::var_os("XDG_DATA_HOME"),
+        std::env::var_os("HOME"),
+        file,
+    )
 }
 
 fn model_path_in(
     data_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
+    file: &str,
 ) -> std::path::PathBuf {
     let base = data_home
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| home.map(|h| std::path::PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join("zradio").join("models").join("beat_this.onnx")
+    base.join("zradio").join("models").join(file)
 }
 
 /// Whether the model has been fetched; its hash was checked when it was.
@@ -350,7 +360,7 @@ pub fn download_model(
 /// Fetches `url` to `dest` through a file beside it, which only takes its place once its
 /// hash is `sha256`.
 #[cfg(feature = "beat-this")]
-fn fetch_verified(
+pub(crate) fn fetch_verified(
     url: &str,
     sha256: &str,
     dest: &std::path::Path,
@@ -439,7 +449,7 @@ pub fn to_model_rate(samples: &[f32], channels: usize, rate: u32) -> Vec<f32> {
 
 /// Blackman-windowed sinc, each output's taps scaled to sum to one so a constant passes as
 /// it is. Without the low-pass, a 44.1 kHz master's hi-hats would fold into the top bands.
-fn resample(x: &[f32], from: u32, to: u32) -> Vec<f32> {
+pub(crate) fn resample(x: &[f32], from: u32, to: u32) -> Vec<f32> {
     let cutoff = PASS_BAND * f64::from(from.min(to)) / 2.0;
     // Input samples from one zero crossing of the sinc to the next.
     let zero_step = f64::from(from) / (2.0 * cutoff);
@@ -950,7 +960,13 @@ mod tests {
 
     #[test]
     fn the_model_is_kept_in_the_user_data_dir() {
-        let path = |data: Option<&str>| model_path_in(data.map(Into::into), Some("/home/u".into()));
+        let path = |data: Option<&str>| {
+            model_path_in(
+                data.map(Into::into),
+                Some("/home/u".into()),
+                "beat_this.onnx",
+            )
+        };
         let tail = "zradio/models/beat_this.onnx";
         assert_eq!(
             path(Some("/data")),
