@@ -1036,6 +1036,13 @@ impl Mixer {
     /// Whether AutoMix separates the voices of its mixes, which needs the next track sooner.
     pub fn set_stems(&mut self, on: bool) {
         self.stems = on;
+        if !on {
+            // Turned off, a mix armed or under way plays both voices from here on.
+            self.vocals = None;
+            if let Some(armed) = self.armed.as_mut() {
+                armed.vocals = None;
+            }
+        }
     }
 
     /// The armed mix's voices to separate, once per mix.
@@ -1081,10 +1088,10 @@ impl Mixer {
     }
 
     /// Hands the armed mix the voices separated for it; false, and they are dropped, if
-    /// that mix is no longer the one armed.
+    /// that mix is no longer the one armed or the handoff was turned off since.
     pub fn attach_vocals(&mut self, overlay: VocalOverlay) -> bool {
         match self.armed.as_mut() {
-            Some(armed) if overlay.fits(armed.id, armed.fade) => {
+            Some(armed) if self.stems && overlay.fits(armed.id, armed.fade) => {
                 armed.vocals = Some(overlay);
                 true
             }
@@ -2485,6 +2492,7 @@ mod tests {
         let voice_b = || sine(48_000 * 20, 1_500.0, 0.3);
         let silent = || const_deck(48_000 * 20, 0.0);
         let mut mixed = armed_voices(voice_a(), voice_b());
+        mixed.set_stems(true);
         let armed = mixed.armed.as_ref().unwrap();
         let (fade, start_at, arm) = (armed.fade, armed.start_at, armed.id);
         let handoff = Handoff {
@@ -2522,6 +2530,7 @@ mod tests {
     #[test]
     fn voices_go_only_to_the_mix_they_were_separated_for() {
         let mut mixer = armed_voices(sine(48_000 * 20, 1_000.0, 0.3), tone(48_000 * 20));
+        mixer.set_stems(true);
         let armed = mixer.armed.as_ref().unwrap();
         let (fade, arm) = (armed.fade, armed.id);
         let overlay = |arm, frames: usize| VocalOverlay {
@@ -2544,6 +2553,7 @@ mod tests {
 
         // A mix that does not start where it was armed to starts without them.
         let mut late = armed_voices(sine(48_000 * 20, 1_000.0, 0.3), tone(48_000 * 20));
+        late.set_stems(true);
         let (arm, start_at) = {
             let armed = late.armed.as_ref().unwrap();
             (armed.id, armed.start_at)
@@ -2555,11 +2565,50 @@ mod tests {
 
         // Seeking drops the armed mix, and its voices with it; the next one gets a new id.
         let mut seeked = armed_voices(sine(48_000 * 20, 1_000.0, 0.3), tone(48_000 * 20));
+        seeked.set_stems(true);
         let arm = seeked.armed.as_ref().unwrap().id;
         assert!(seeked.attach_vocals(overlay(arm, fade)));
         seeked.seek_by(0.0);
         assert!(seeked.armed.is_none() && seeked.vocals.is_none());
         assert!(!seeked.attach_vocals(overlay(arm, fade)));
+    }
+
+    #[test]
+    fn turning_the_handoff_off_keeps_both_voices_from_then_on() {
+        let overlay = |mixer: &Mixer| {
+            let armed = mixer.armed.as_ref().unwrap();
+            VocalOverlay {
+                arm: armed.id,
+                out: vec![0.1; 2 * armed.fade],
+                inn: vec![0.1; 2 * armed.fade],
+                handoff: Handoff {
+                    at: armed.fade / 2,
+                    ramp: 100,
+                },
+            }
+        };
+        // Off while the mix is armed.
+        let mut armed = armed_voices(sine(48_000 * 20, 1_000.0, 0.3), tone(48_000 * 20));
+        armed.set_stems(true);
+        assert!(armed.attach_vocals(overlay(&armed)));
+        armed.set_stems(false);
+        armed.next_stereo();
+        assert!(armed.fading() && armed.vocal_handoff().is_none());
+
+        // Off under the mix.
+        let mut mixing = armed_voices(sine(48_000 * 20, 1_000.0, 0.3), tone(48_000 * 20));
+        mixing.set_stems(true);
+        assert!(mixing.attach_vocals(overlay(&mixing)));
+        mixing.next_stereo();
+        assert!(mixing.vocal_handoff().is_some());
+        mixing.set_stems(false);
+        assert!(mixing.fading() && mixing.vocal_handoff().is_none());
+
+        // Voices separated before it was turned off arrive too late.
+        let mut late = armed_voices(sine(48_000 * 20, 1_000.0, 0.3), tone(48_000 * 20));
+        let separated = overlay(&late);
+        late.set_stems(false);
+        assert!(!late.attach_vocals(separated));
     }
 
     // Neither repeats on a whole second, so voices taken from the wrong frames differ.
