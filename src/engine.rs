@@ -10,13 +10,13 @@ use cpal::{Sample, SampleFormat, Stream, StreamConfig};
 
 use crate::analysis::TrackAnalysis;
 use crate::automix::{
-    at_tempo, cue, fade_secs_for, place, plan_for, plan_pair, Cue, MixStyle, TailBend,
+    at_tempo, cue, fade_secs_for, level_gain, place, plan_for, plan_pair, Cue, MixStyle, TailBend,
     TransitionPlan, PREFETCH_LEAD_SECS, RAMP_MAX_SECS,
 };
 use crate::decode::{decode_file, AudioBuf};
 use crate::dsp::{
-    fade_frames, lp_alpha, mix_bass_swap, mix_echo_out, mix_filter_blend, mix_stereo_frame,
-    MixMode, OnePole,
+    fade_frames, mix_bass_swap, mix_echo_out, mix_filter_blend, mix_stereo_frame, Bands, Crossover,
+    MixMode, CROSSOVER_HZ,
 };
 use crate::eq::Equalizer;
 use crate::library::Track;
@@ -27,6 +27,10 @@ use crate::spectrum::Spectrum;
 use crate::stretch::{render_tail, TimeMap};
 
 const FADE_SECS: f32 = 6.0;
+/// How long switching into or out of AutoMix blends the two ways of playing.
+const MODE_BLEND_SECS: f32 = 0.1;
+/// AutoMix moves a deck's level at most this many seconds per unit of gain.
+const LEVEL_GLIDE_SECS: f32 = 0.1;
 const STREAM_REBUILD_GAP: Duration = Duration::from_millis(500);
 
 struct StreamHealth {
@@ -183,6 +187,14 @@ struct Deck {
     tail: Option<BentTail>,
     /// Playback speed relative to the analysed audio; a remix resamples the buffer.
     tempo: f32,
+    /// Level AutoMix plays the deck at.
+    gain: f32,
+    /// Level AutoMix played the last frame at, gliding to `gain` so it never jumps.
+    level: f32,
+    /// Most `level` moves in a frame.
+    glide: f32,
+    /// AutoMix plays the deck through this, so a mix can take its bass away.
+    split: Crossover,
 }
 
 /// From `start` on the deck plays `samples`, its source rendered through `map`.
@@ -195,12 +207,22 @@ struct BentTail {
 impl Deck {
     fn from_buf(buf: AudioBuf) -> Self {
         Self {
+            split: Crossover::new(buf.sample_rate, CROSSOVER_HZ),
             samples: Arc::new(buf.samples),
             pos: 0,
             channels: buf.channels.max(1),
             tail: None,
             tempo: 1.0,
+            gain: 1.0,
+            level: 1.0,
+            glide: 1.0 / (LEVEL_GLIDE_SECS * buf.sample_rate.max(1) as f32),
         }
+    }
+
+    /// Sets the level of a deck not heard yet, so it starts there instead of gliding.
+    fn start_at(&mut self, gain: f32) {
+        self.gain = gain;
+        self.level = gain;
     }
 
     fn source_frames(&self) -> usize {
@@ -265,6 +287,39 @@ impl Deck {
             [samples[i], samples.get(i + 1).copied().unwrap_or(0.0)]
         }
     }
+
+    /// The frame at `pos` split for AutoMix, at the deck's level; call once a frame.
+    fn split_frame(&mut self) -> Bands {
+        self.level = approach(self.level, self.gain, self.glide);
+        let [l, r] = self.frame(self.pos);
+        self.split.split([l * self.level, r * self.level])
+    }
+
+    /// The frame at `pos`, `wet` of the way from as recorded to as AutoMix plays it;
+    /// call once a frame.
+    fn play_frame(&mut self, wet: f32) -> [f32; 2] {
+        if wet <= 0.0 {
+            return self.frame(self.pos);
+        }
+        let auto = self.split_frame().sum();
+        blend(self.frame(self.pos), auto, wet)
+    }
+}
+
+fn approach(from: f32, to: f32, step: f32) -> f32 {
+    if to > from {
+        (from + step).min(to)
+    } else {
+        (from - step).max(to)
+    }
+}
+
+fn blend(raw: [f32; 2], auto: [f32; 2], wet: f32) -> [f32; 2] {
+    if wet >= 1.0 {
+        return auto;
+    }
+    let dry = 1.0 - wet;
+    [raw[0] * dry + auto[0] * wet, raw[1] * dry + auto[1] * wet]
 }
 
 /// Everything the worker needs to render a bend off the mixer lock.
@@ -314,8 +369,6 @@ pub struct Mixer {
     analyses: Vec<Option<TrackAnalysis>>,
     last_plan: Option<TransitionPlan>,
     armed: Option<ArmedMix>,
-    current_lp: OnePole,
-    incoming_lp: OnePole,
     volume: f32,
     sample_rate: u32,
     channels: usize,
@@ -331,6 +384,9 @@ pub struct Mixer {
     eq: Equalizer,
     playable: Option<Vec<usize>>,
     pcm: PcmRing,
+    /// How much of the output is AutoMix's: 1 in AutoMix, 0 otherwise, gliding between
+    /// the two for `MODE_BLEND_SECS` after a switch so the level and bass phase don't jump.
+    automix_wet: f32,
 }
 
 impl Mixer {
@@ -349,8 +405,6 @@ impl Mixer {
             analyses: Vec::new(),
             last_plan: None,
             armed: None,
-            current_lp: OnePole::default(),
-            incoming_lp: OnePole::default(),
             volume: 0.9,
             sample_rate,
             channels: channels.max(1),
@@ -366,6 +420,7 @@ impl Mixer {
             eq: Equalizer::new(sample_rate, [0.0; 5]),
             playable: None,
             pcm: PcmRing::new(),
+            automix_wet: 0.0,
         }
     }
 
@@ -458,6 +513,24 @@ impl Mixer {
             self.analyses.resize(index + 1, None);
         }
         self.analyses[index] = Some(analysis);
+        let gain = self.level_of(index);
+        let decks = [
+            (self.current_idx, self.current.as_mut()),
+            (self.incoming_idx, self.incoming.as_mut()),
+            (
+                self.armed.as_ref().map(|a| a.index),
+                self.armed.as_mut().map(|a| &mut a.deck),
+            ),
+        ];
+        for (at, deck) in decks {
+            if let (Some(deck), true) = (deck, at == Some(index)) {
+                deck.gain = gain;
+            }
+        }
+    }
+
+    fn level_of(&self, index: usize) -> f32 {
+        level_gain(self.analysis_at(index))
     }
 
     pub fn analysis_at(&self, index: usize) -> Option<&TrackAnalysis> {
@@ -517,7 +590,32 @@ impl Mixer {
 
     pub fn cycle_mix(&mut self) {
         self.mix = self.mix.next();
+        if self.mix == MixMode::AutoMix && self.automix_wet <= 0.0 {
+            // Left over from the last time AutoMix played these decks, the crossover would
+            // ring out old bass. While a blend out is still running it is playing them.
+            for deck in [&mut self.current, &mut self.incoming]
+                .into_iter()
+                .flatten()
+            {
+                deck.split.reset();
+            }
+        }
         self.status = format!("mix {}", self.mix.label());
+    }
+
+    pub fn set_mix(&mut self, mode: MixMode) {
+        while self.mix != mode {
+            self.cycle_mix();
+        }
+    }
+
+    pub fn current_index(&self) -> Option<usize> {
+        self.current_idx
+    }
+
+    /// The plan of the transition that is running or last ran.
+    pub fn last_plan(&self) -> Option<TransitionPlan> {
+        self.last_plan
     }
 
     pub fn shuffle(&self) -> bool {
@@ -615,6 +713,9 @@ impl Mixer {
 
     fn play_deck(&mut self, index: usize, mut deck: Deck) {
         deck.pos = 0;
+        deck.start_at(self.level_of(index));
+        // A new track starts from silence, so there is nothing to blend from.
+        self.automix_wet = self.automix_target();
         self.remember_played(index);
         self.current_idx = Some(index);
         self.incoming_idx = None;
@@ -623,8 +724,6 @@ impl Mixer {
         self.fade_pos = 0;
         self.last_plan = None;
         self.armed = None;
-        self.current_lp = OnePole::default();
-        self.incoming_lp = OnePole::default();
         self.current = Some(deck);
         self.paused = false;
         self.done = false;
@@ -707,6 +806,7 @@ impl Mixer {
         self.drop_armed();
         let mut incoming = Deck::from_buf(buf);
         incoming.tempo = tempo;
+        incoming.start_at(self.level_of(index));
         if !self.mix.uses_fade() || self.current.as_ref().is_none_or(|d| d.remaining() < 2) {
             self.play_deck(index, incoming);
             return;
@@ -810,8 +910,6 @@ impl Mixer {
         self.incoming = Some(incoming);
         self.fade_total = fade;
         self.fade_pos = 0;
-        self.current_lp = OnePole::default();
-        self.incoming_lp = OnePole::default();
         self.paused = false;
         self.done = false;
         self.armed = None;
@@ -1176,10 +1274,24 @@ impl Mixer {
         }
     }
 
+    fn automix_target(&self) -> f32 {
+        if self.mix == MixMode::AutoMix {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    fn step_automix_wet(&mut self) {
+        let step = 1.0 / (MODE_BLEND_SECS * self.sample_rate.max(1) as f32);
+        self.automix_wet = approach(self.automix_wet, self.automix_target(), step);
+    }
+
     fn next_stereo(&mut self) -> [f32; 2] {
         if self.paused {
             return [0.0, 0.0];
         }
+        self.step_automix_wet();
         if self.incoming.is_some() && self.fade_total > 0 {
             return self.mix_frame();
         }
@@ -1204,7 +1316,7 @@ impl Mixer {
                 return [0.0, 0.0];
             }
         }
-        let frame = deck.frame(deck.pos);
+        let frame = deck.play_frame(self.automix_wet);
         deck.pos += 1;
         if deck.pos >= deck.frames() {
             if self.loop_mode == LoopMode::One {
@@ -1216,22 +1328,57 @@ impl Mixer {
         frame
     }
 
+    /// Both decks at `t` through the transition, as AutoMix mixes them.
+    fn automix_frame(&mut self, t: f32) -> [f32; 2] {
+        let a = self
+            .current
+            .as_mut()
+            .map(Deck::split_frame)
+            .unwrap_or_default();
+        let b = self
+            .incoming
+            .as_mut()
+            .map(Deck::split_frame)
+            .unwrap_or_default();
+        match self
+            .last_plan
+            .map(|p| p.style)
+            .unwrap_or(MixStyle::BassSwap)
+        {
+            MixStyle::BassSwap => mix_bass_swap(a, b, t),
+            MixStyle::Filter => mix_filter_blend(a, b, t),
+            MixStyle::Echo | MixStyle::Quick => mix_echo_out(a.sum(), b.sum(), t),
+        }
+    }
+
+    /// Both decks at `t` through the transition, as Cut and Crossfade mix them.
+    fn crossfade_frame(&self, t: f32) -> [f32; 2] {
+        let a = self
+            .current
+            .as_ref()
+            .map(|d| d.frame(d.pos))
+            .unwrap_or_default();
+        let b = self
+            .incoming
+            .as_ref()
+            .map(|d| d.frame(d.pos))
+            .unwrap_or_default();
+        mix_stereo_frame(a, b, t)
+    }
+
     fn mix_frame(&mut self) -> [f32; 2] {
         let t = if self.fade_total == 0 {
             1.0
         } else {
             self.fade_pos as f32 / self.fade_total as f32
         };
-        let a = self
-            .current
-            .as_ref()
-            .map(|d| d.frame(d.pos))
-            .unwrap_or([0.0, 0.0]);
-        let b = self
-            .incoming
-            .as_ref()
-            .map(|d| d.frame(d.pos))
-            .unwrap_or([0.0, 0.0]);
+        let wet = self.automix_wet;
+        let out = if wet <= 0.0 {
+            self.crossfade_frame(t)
+        } else {
+            let auto = self.automix_frame(t);
+            blend(self.crossfade_frame(t), auto, wet)
+        };
         if let Some(deck) = self.current.as_mut() {
             if deck.pos < deck.frames() {
                 deck.pos += 1;
@@ -1246,24 +1393,7 @@ impl Mixer {
         if self.fade_pos >= self.fade_total {
             self.finish_fade();
         }
-        if self.mix == MixMode::AutoMix {
-            let alpha = lp_alpha(self.sample_rate, 160.0);
-            match self
-                .last_plan
-                .map(|p| p.style)
-                .unwrap_or(MixStyle::BassSwap)
-            {
-                MixStyle::BassSwap => {
-                    mix_bass_swap(a, b, &mut self.current_lp, &mut self.incoming_lp, t, alpha)
-                }
-                MixStyle::Filter => {
-                    mix_filter_blend(a, b, &mut self.current_lp, &mut self.incoming_lp, t, alpha)
-                }
-                MixStyle::Echo | MixStyle::Quick => mix_echo_out(a, b, t),
-            }
-        } else {
-            mix_stereo_frame(a, b, t)
-        }
+        out
     }
 
     fn finish_fade(&mut self) {
@@ -1662,7 +1792,244 @@ mod tests {
             mix_out,
             first_beat: mix_in,
             duration,
+            loudness: None,
+            peak: 0.0,
         }
+    }
+
+    #[test]
+    fn automix_levels_the_deck_even_when_its_analysis_lands_late() {
+        // -6 LUFS with a full-scale peak comes down 8 dB to the -14 LUFS target.
+        let loud = crate::analysis::TrackAnalysis {
+            loudness: Some(-6.0),
+            peak: 1.0,
+            ..analysis_at(0.0, 16.0, 20.0)
+        };
+        let want = 0.5 * 10f32.powf(-8.0 / 20.0);
+        for (mode, gain) in [(MixMode::AutoMix, want), (MixMode::Crossfade, 0.5)] {
+            let mut mixer = Mixer::new(48_000, 2);
+            mixer.set_tracks(two_tracks());
+            mixer.mix = mode;
+            mixer.play_decoded(0, const_deck(48_000, 0.5));
+            mixer.set_analysis(0, loud.clone());
+            // AutoMix's crossover turns the phase of the step the deck starts on.
+            let got = (0..4_800).map(|_| mixer.next_stereo()[0]).last().unwrap();
+            assert!(
+                (got - gain).abs() < 1e-5,
+                "{mode:?} played {got}, not {gain}"
+            );
+        }
+    }
+
+    /// 60 Hz at 0.5: sits under the crossover, so the allpass turns its phase.
+    fn bass_tone(frames: usize) -> AudioBuf {
+        AudioBuf {
+            samples: (0..frames)
+                .flat_map(|f| {
+                    let v = 0.5 * (std::f32::consts::TAU * 60.0 * f as f32 / 48_000.0).sin();
+                    [v, v]
+                })
+                .collect(),
+            sample_rate: 48_000,
+            channels: 2,
+        }
+    }
+
+    /// The most one frame can move the 60 Hz tone, with room for the blend itself.
+    const BASS_STEP: f32 = 0.5 * std::f32::consts::TAU * 60.0 / 48_000.0 * 1.2;
+
+    fn left(mixer: &mut Mixer, frames: usize) -> Vec<f32> {
+        (0..frames).map(|_| mixer.next_stereo()[0]).collect()
+    }
+
+    fn largest_step(out: &[f32]) -> f32 {
+        out.windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max)
+    }
+
+    fn rms(out: &[f32]) -> f32 {
+        (out.iter().map(|v| v * v).sum::<f32>() / out.len() as f32).sqrt()
+    }
+
+    fn loud_analysis() -> crate::analysis::TrackAnalysis {
+        // -6 LUFS with a full-scale peak: AutoMix plays it 8 dB down.
+        crate::analysis::TrackAnalysis {
+            loudness: Some(-6.0),
+            peak: 1.0,
+            ..analysis_at(0.0, 16.0, 20.0)
+        }
+    }
+
+    #[test]
+    fn switching_into_and_out_of_automix_glides_instead_of_jumping() {
+        let gain = 10f32.powf(-8.0 / 20.0);
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.set_analysis(0, loud_analysis());
+        mixer.play_decoded(0, bass_tone(48_000 * 10));
+        // Switch on a peak of the tone, where a jump would be largest.
+        let before = left(&mut mixer, 24_200);
+        mixer.cycle_mix();
+        assert_eq!(mixer.mix(), MixMode::AutoMix);
+        let into = left(&mut mixer, 24_000);
+        let mut joined = before[before.len() - 100..].to_vec();
+        joined.extend(&into);
+        let step = largest_step(&joined);
+        assert!(step <= BASS_STEP, "switching into AutoMix stepped {step}");
+        let (was, now) = (rms(&before[..24_000]), rms(&into[12_000..]));
+        assert!(
+            (now / was - gain).abs() < 0.01,
+            "AutoMix settled at {} of the level, not {gain}",
+            now / was
+        );
+
+        mixer.cycle_mix();
+        assert_eq!(mixer.mix(), MixMode::Cut);
+        let out = left(&mut mixer, 24_000);
+        let mut joined = into[into.len() - 100..].to_vec();
+        joined.extend(&out);
+        let step = largest_step(&joined);
+        assert!(step <= BASS_STEP, "switching out of AutoMix stepped {step}");
+        assert!((rms(&out[12_000..]) / was - 1.0).abs() < 0.01);
+
+        // Pressing `m` fast: back into AutoMix halfway through blending into it, then out
+        // and in again before the blend finishes.
+        mixer.set_mix(MixMode::AutoMix);
+        let mut fast = out[out.len() - 100..].to_vec();
+        fast.extend(left(&mut mixer, 2_400));
+        mixer.set_mix(MixMode::Cut);
+        fast.extend(left(&mut mixer, 1_200));
+        mixer.set_mix(MixMode::AutoMix);
+        fast.extend(left(&mut mixer, 9_600));
+        let step = largest_step(&fast);
+        assert!(step <= BASS_STEP, "switching back mid-blend stepped {step}");
+    }
+
+    #[test]
+    fn late_analysis_glides_the_level_instead_of_jumping() {
+        let gain = 10f32.powf(-8.0 / 20.0);
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.set_mix(MixMode::AutoMix);
+        mixer.play_decoded(0, bass_tone(48_000 * 10));
+        // Land on a peak of the tone, where a jump would be largest.
+        let before = left(&mut mixer, 24_200);
+        mixer.set_analysis(0, loud_analysis());
+        let after = left(&mut mixer, 24_000);
+        let mut joined = before[before.len() - 100..].to_vec();
+        joined.extend(&after);
+        let step = largest_step(&joined);
+        assert!(step <= BASS_STEP, "the analysis landing stepped {step}");
+        let (was, now) = (rms(&before[12_200..]), rms(&after[12_000..]));
+        assert!((now / was - gain).abs() < 0.01, "settled at {}", now / was);
+    }
+
+    #[test]
+    fn a_deck_whose_analysis_is_known_starts_at_its_level() {
+        let gain = 10f32.powf(-8.0 / 20.0);
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.set_mix(MixMode::AutoMix);
+        mixer.set_analysis(0, loud_analysis());
+        mixer.play_decoded(0, bass_tone(48_000));
+        // The first 100 ms, six periods of the tone.
+        let level = rms(&left(&mut mixer, 4_800)) / (0.5 / 2f32.sqrt());
+        assert!(
+            (level - gain).abs() < 0.02,
+            "started at {level}, not {gain}"
+        );
+    }
+
+    #[test]
+    fn switching_mode_mid_transition_glides_instead_of_jumping() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.set_mix(MixMode::AutoMix);
+        mixer.set_analysis(0, loud_analysis());
+        mixer.play_decoded(0, bass_tone(48_000 * 10));
+        let plan = mixer.plan_transition(1, true);
+        let silent = Deck::from_buf(const_deck(48_000 * 10, 0.0));
+        mixer.begin_mix(1, silent, 48_000 * 4, plan);
+        let before = left(&mut mixer, 48_200);
+        mixer.set_mix(MixMode::Cut);
+        assert!(mixer.fading());
+        let after = left(&mut mixer, 12_000);
+        let mut joined = before[before.len() - 100..].to_vec();
+        joined.extend(&after);
+        let step = largest_step(&joined);
+        assert!(step <= BASS_STEP, "switching mid-transition stepped {step}");
+    }
+
+    #[test]
+    fn automix_never_plays_a_deck_past_the_ceiling() {
+        // A clipped 808: 20 ms of 50 Hz square every half second. Quiet enough to be raised,
+        // and its flat tops grow by 4 dB once the crossover turns the bass's phase.
+        let samples = (0..48_000 * 6)
+            .flat_map(|f| {
+                let into = f as f32 / 48_000.0 % 0.5;
+                let v = if into < 0.02 {
+                    0.5 * (std::f32::consts::TAU * 50.0 * into).sin().signum()
+                } else {
+                    0.0
+                };
+                [v, v]
+            })
+            .collect();
+        let buf = AudioBuf {
+            samples,
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let analysis = crate::analysis::analyze_buffer(&buf);
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.mix = MixMode::AutoMix;
+        mixer.set_analysis(0, analysis);
+        mixer.play_decoded(0, buf);
+        let peak = (0..48_000 * 6)
+            .map(|_| mixer.next_stereo()[0].abs())
+            .fold(0.0, f32::max);
+        let db = 20.0 * peak.log10();
+        assert!(db < -0.99, "AutoMix played it at {db:.2} dBFS");
+    }
+
+    #[test]
+    fn automix_comes_back_without_old_bass() {
+        // A fifth of a second of 50 Hz, then silence.
+        let samples = (0..48_000)
+            .flat_map(|f| {
+                let v = if f < 9_600 {
+                    0.5 * (std::f32::consts::TAU * 50.0 * f as f32 / 48_000.0).sin()
+                } else {
+                    0.0
+                };
+                [v, v]
+            })
+            .collect();
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.mix = MixMode::AutoMix;
+        mixer.play_decoded(
+            0,
+            AudioBuf {
+                samples,
+                sample_rate: 48_000,
+                channels: 2,
+            },
+        );
+        let play = |mixer: &mut Mixer, frames: usize| {
+            (0..frames)
+                .map(|_| mixer.next_stereo()[0].abs())
+                .fold(0.0, f32::max)
+        };
+        play(&mut mixer, 4_800);
+        // Out of AutoMix in the middle of the bass, back once the deck has gone quiet.
+        mixer.set_mix(MixMode::Crossfade);
+        play(&mut mixer, 9_600);
+        mixer.set_mix(MixMode::AutoMix);
+        let ring = play(&mut mixer, 2_400);
+        assert!(ring < 1e-3, "AutoMix came back ringing at {ring}");
     }
 
     #[test]

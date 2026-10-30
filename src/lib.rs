@@ -16,6 +16,7 @@ pub mod fetch;
 pub mod greeting;
 pub mod library;
 pub mod meta;
+pub mod mixdown;
 pub mod mpris;
 pub mod playlist;
 pub mod prefs;

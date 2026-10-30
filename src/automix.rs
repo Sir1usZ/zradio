@@ -73,6 +73,22 @@ pub fn select_style(
     }
 }
 
+/// Loudness AutoMix plays every track at, so neither side of a mix jumps out.
+const TARGET_LUFS: f32 = -14.0;
+/// Highest sample peak AutoMix plays a track at, in dBFS.
+const PEAK_CEILING_DB: f32 = -1.0;
+
+/// Gain that brings a track to `TARGET_LUFS`, or as close as its peak allows under
+/// `PEAK_CEILING_DB`: the crossover can lift a master's peaks past full scale, so even a
+/// quiet one may have to come down. Tracks never measured play as they are.
+pub fn level_gain(a: Option<&TrackAnalysis>) -> f32 {
+    let Some((lufs, peak)) = a.and_then(|a| a.loudness.map(|l| (l, a.peak))) else {
+        return 1.0;
+    };
+    let headroom = PEAK_CEILING_DB - 20.0 * peak.max(1e-6).log10();
+    10f32.powf((TARGET_LUFS - lufs).min(headroom) / 20.0)
+}
+
 pub fn beat_seconds(bpm: f32) -> f32 {
     if bpm <= 1.0 {
         0.5
@@ -97,18 +113,27 @@ pub fn at_tempo(a: &TrackAnalysis, tempo: f32) -> TrackAnalysis {
     }
 }
 
-pub fn bpm_compatible(a: f32, b: f32) -> bool {
+/// How many of `b`'s beats fit one of `a`'s once they lock: 1 at the same tempo, 2 or 1/2
+/// when one is in half time, as a slow ballad's beat falls on every other one of a fast
+/// track. None when no octave brings them within reach of a bend.
+pub fn octave_lock(a: f32, b: f32) -> Option<f32> {
     if a <= 1.0 || b <= 1.0 {
-        return false;
+        return None;
     }
-    let ratio = (a / b).max(b / a);
-    ratio <= 1.08
+    [1.0, 2.0, 0.5].into_iter().find(|&f| {
+        let ratio = b / (a * f);
+        ratio.max(1.0 / ratio) <= 1.08
+    })
+}
+
+pub fn bpm_compatible(a: f32, b: f32) -> bool {
+    octave_lock(a, b).is_some()
 }
 
 /// Only bend when the tempos are close enough to lock; a clashing pair is mixed unbent.
 pub fn tail_speed(current_bpm: Option<f32>, next_bpm: Option<f32>) -> f32 {
     match (current_bpm, next_bpm) {
-        (Some(a), Some(b)) if bpm_compatible(a, b) => b / a,
+        (Some(a), Some(b)) => octave_lock(a, b).map_or(1.0, |f| b / (a * f)),
         _ => 1.0,
     }
 }
@@ -124,15 +149,14 @@ pub fn pair_score(current: &TrackAnalysis, next: &TrackAnalysis) -> (f32, bool, 
     } else if current.camelot.is_none() || next.camelot.is_none() {
         score += 0.08;
     }
-    let bpm_ok = match (current.bpm, next.bpm) {
-        (Some(a), Some(b)) => bpm_compatible(a, b),
-        _ => false,
-    };
-    if bpm_ok {
+    let lock = current
+        .bpm
+        .zip(next.bpm)
+        .and_then(|(a, b)| Some((a * octave_lock(a, b)?, b)));
+    let bpm_ok = lock.is_some();
+    if let Some((a, b)) = lock {
         score += 0.25;
-        if let (Some(a), Some(b)) = (current.bpm, next.bpm) {
-            score += (1.0 - ((a - b).abs() / a).min(0.12)) * 0.08;
-        }
+        score += (1.0 - ((a - b).abs() / a).min(0.12)) * 0.08;
     }
     let energy_delta = (current.energy - next.energy).abs();
     score += (0.12 - energy_delta.min(0.12)).max(0.0);
@@ -347,16 +371,24 @@ pub fn place(
         let beats = (cue.mix_at as f64 / sr - first) / beat;
         beats - beats.round()
     });
-    let next_beat = next
-        .and_then(beat_grid)
-        .filter(|_| plan.bpm_ok)
-        .or(current.and_then(beat_grid))
-        .map_or(0.0, |(_, beat)| beat);
+    // One outgoing beat in incoming time, and the step that is a whole beat of both grids.
+    let lock = current
+        .and_then(|a| a.bpm)
+        .zip(next.and_then(|b| b.bpm))
+        .and_then(|(a, b)| octave_lock(a, b))
+        .filter(|_| plan.bpm_ok);
+    let (next_beat, step) = match (lock, next.and_then(beat_grid)) {
+        (Some(f), Some((_, beat))) => (beat * f as f64, beat * f.max(1.0) as f64),
+        _ => {
+            let beat = current.and_then(beat_grid).map_or(0.0, |(_, beat)| beat);
+            (beat, beat)
+        }
+    };
     let mix_in = plan.next_mix_in.map_or(0.0, |s| s.max(0.0) as f64);
     let mut offset = mix_in + phase * next_beat;
     if offset < -1.0 / sr {
         // Too close to the start to go back: come in on the same phase a beat later.
-        offset += next_beat;
+        offset += step;
     }
     let incoming_pos = ((offset.max(0.0) * sr).round() as usize).min(next_frames.saturating_sub(1));
     let fade = fade_frames(sample_rate, frames.min(next_frames), plan.fade_secs)
@@ -423,7 +455,43 @@ mod tests {
             mix_out: 180.0,
             first_beat: 0.0,
             duration: 200.0,
+            loudness: None,
+            peak: 0.0,
         }
+    }
+
+    #[test]
+    fn level_gain_meets_the_target_without_clipping() {
+        let db = |g: f32| 20.0 * g.log10();
+        let at = |lufs: f32, peak_db: f32| TrackAnalysis {
+            loudness: Some(lufs),
+            peak: 10f32.powf(peak_db / 20.0),
+            ..analysis(
+                120.0,
+                Camelot {
+                    number: 8,
+                    minor: false,
+                },
+                0.2,
+            )
+        };
+        // A loud master comes down to the target; a quiet one goes up while its peak fits.
+        assert!((db(level_gain(Some(&at(-6.0, 0.0)))) + 8.0).abs() < 1e-3);
+        assert!((db(level_gain(Some(&at(-20.0, -10.0)))) - 6.0).abs() < 1e-3);
+        // A quiet track whose peak is near full scale only goes up to the ceiling...
+        assert!((db(level_gain(Some(&at(-20.0, -4.0)))) - 3.0).abs() < 1e-3);
+        // ...and one whose peak would pass it comes down, loud or quiet.
+        assert!((db(level_gain(Some(&at(-20.0, 2.0)))) + 3.0).abs() < 1e-3);
+        assert!((db(level_gain(Some(&at(-10.0, 6.0)))) + 7.0).abs() < 1e-3);
+        // Unmeasured tracks play as they are.
+        assert_eq!(level_gain(None), 1.0);
+        assert_eq!(
+            level_gain(Some(&TrackAnalysis {
+                loudness: None,
+                ..at(-6.0, 0.0)
+            })),
+            1.0
+        );
     }
 
     fn track(name: &str) -> Track {
@@ -698,6 +766,62 @@ mod tests {
         let fit = analysis(126.0, key8(), 0.2);
         let crossfade = plan_pair(Some(&a), Some(&fit), 1, MixMode::Crossfade, false);
         assert_eq!(crossfade.speed, 1.0);
+    }
+
+    #[test]
+    fn half_time_locks_on_every_other_beat() {
+        // A 168 BPM track, and one read at half time: 85 BPM, beat for two at 170.
+        let slow = analysis(85.0, key8(), 0.2);
+        let fast = analysis(168.0, key8(), 0.2);
+        for (a, b, speed) in [(&slow, &fast, 168.0 / 170.0), (&fast, &slow, 170.0 / 168.0)] {
+            let plan = plan_pair(Some(a), Some(b), 1, MixMode::AutoMix, false);
+            assert!(plan.bpm_ok, "{:?} to {:?}", a.bpm, b.bpm);
+            assert_eq!(plan.style, MixStyle::BassSwap);
+            assert!((plan.speed - speed).abs() < 1e-6, "bends to {}", plan.speed);
+            let c = cue(Some(a), &plan, 100 * 48_000, 200 * 48_000, 48_000, false);
+            assert!(c.bend.is_some(), "the tail glides to the incoming tempo");
+        }
+        // As close a pair an octave apart scores as one at the same tempo. Off key and an
+        // energy jump apart, so the score is not clamped at 1.
+        let clash = Camelot {
+            number: 3,
+            minor: true,
+        };
+        let fast = analysis(168.0, clash, 0.6);
+        let near = analysis(84.0, clash, 0.6);
+        let (octave, _, octave_ok) = pair_score(&slow, &fast);
+        let (same, _, same_ok) = pair_score(&slow, &near);
+        assert!(octave_ok && same_ok);
+        assert!(
+            octave < 1.0 && (octave - same).abs() < 1e-4,
+            "{octave} vs {same}"
+        );
+    }
+
+    #[test]
+    fn half_time_comes_in_on_the_outgoing_beat() {
+        let a = analysis(120.0, key8(), 0.2);
+        let mut b = analysis(60.0, key8(), 0.2);
+        b.mix_in = 4.0;
+        let plan = plan_pair(Some(&a), Some(&b), 1, MixMode::AutoMix, false);
+        assert!(plan.bpm_ok && plan.speed == 1.0);
+        let sr = 48_000;
+        let frames = 20 * sr as usize;
+        // A quarter of a 120 BPM beat past a beat: an eighth of the 60 BPM one.
+        let pos = sr as usize * 9 / 8;
+        let c = cue(Some(&a), &plan, pos, frames, sr, true);
+        let p = place(&c, Some(&a), Some(&b), &plan, frames, frames, sr);
+        assert_eq!(p.incoming_pos, sr as usize * 33 / 8);
+
+        // The other way round, and too close to mix_in to go back: a beat of both later.
+        let a = analysis(60.0, key8(), 0.2);
+        let mut b = analysis(120.0, key8(), 0.2);
+        b.mix_in = 0.0;
+        let plan = plan_pair(Some(&a), Some(&b), 1, MixMode::AutoMix, false);
+        let pos = sr as usize * 7 / 8;
+        let c = cue(Some(&a), &plan, pos, frames, sr, true);
+        let p = place(&c, Some(&a), Some(&b), &plan, frames, frames, sr);
+        assert_eq!(p.incoming_pos, sr as usize * 7 / 8);
     }
 
     #[test]
