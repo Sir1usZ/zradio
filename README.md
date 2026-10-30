@@ -18,69 +18,149 @@
   </p>
 </div>
 
-Default library: `~/音乐`.
+ZRadio plays a folder of music files in the terminal. It can mix one track into the next on the beat, learns which tracks you finish and which you skip, and shows lyrics, cover art and a spectrum. It needs no account. What it sends over the network is listed under [Network use](#network-use).
 
-## Build
+## Build and run
+
+You need a Rust toolchain, a C compiler, `pkg-config`, and the ALSA and D-Bus headers:
+
+```sh
+# Arch
+sudo pacman -S --needed base-devel rust alsa-lib dbus
+# Debian / Ubuntu (Rust from rustup)
+sudo apt install build-essential pkg-config libasound2-dev libdbus-1-dev
+```
 
 ```sh
 cargo build --release
-./target/release/zradio
+./target/release/zradio            # the saved library, ~/音乐 until you pick one
+./target/release/zradio ~/Music    # another folder for this run
 ```
 
-Optional argument: a library directory.
+`:open DIR` (or `Ctrl+F`) opens a folder and saves it as the library. ZRadio scans the folder and its subfolders, skipping hidden ones, for `mp3`, `flac`, `ogg` (Vorbis), `wav`, `aiff`, `m4a` and `aac` files. `.opus` files are listed but do not play yet, because the decoder (symphonia) has no Opus codec.
 
 `cargo build --release --no-default-features` leaves out [Beat This!](#beat-this) and the [voice handoff](#voice-handoff); the binary drops from about 40 MB to 10 MB.
 
-## Keys
+Optional programs, used when found:
+
+| Program | Used for |
+|---|---|
+| `curl` | Everything ZRadio fetches: lyrics, covers, tag lookup, search, downloads, models |
+| `cava` | Spectrum data for the `bars` and `cnm` visualizers (otherwise ZRadio's own FFT) |
+| `yt-dlp` (and Node.js for YouTube) | Importing YouTube and Bilibili links; looked for in `~/.local/bin`, on `PATH`, and as the `yt_dlp` Python module |
+| SPlayer | Extra search and download sources, through its local API at `127.0.0.1:25884` |
+
+## Screens and keys
+
+ZRadio has three tabs, switched with `q` and `e`: 音乐 (the current list), 播放器 (cover, lyrics and visualizer of the track playing) and 我 (listening time, favourite tracks and artists). `Ctrl+K` shows the keys in the app.
 
 | Key | Action |
 |---|---|
-| `q` / `e` | Previous / next tab |
-| `p` / `Alt+P` | Toggle bottom playlist drawer |
-| `1`–`9` | Jump slot inside the drawer (empty slot refuses) |
-| `←` / `→` | Seek 5s (player tab) |
-| `x` | Context menu: highlighted track (music) / now playing (player) |
-| `y` | Large library window (whole library, not play range) |
 | `j` `k` or arrows | Move |
-| Space | Play / pause |
-| `n` / `b` | Next / previous (current list) |
-| `l` | Lyrics (player tab) |
-| `g` | EQ |
+| `Enter` | Play the selected track, or download the selected online search result |
+| `Space` | Play / pause |
+| `n` / `b` | Next / previous in the current list |
+| `←` / `→` | Seek 5 s (播放器 tab) |
+| `+` / `-` | Volume up / down 5% |
+| `m` | Mix mode: `CUT` / `FADE` / `AUTO` |
+| `s` | Shuffle: `off` / `random` / `norepeat` / `taste` |
+| `o` | Loop: `OFF` / `ONE` / `ALL` |
+| `r` | Remix: `RAW` / `CHILL` / `CLUB` / `NCORE` |
+| `l` | Lyrics on / off (播放器 tab) |
+| `g` | Equalizer (播放器 tab) |
 | `t` | Settings |
+| `y` | Library window: the whole library, not just the current list |
+| `p` | Playlist drawer |
+| `x` | Track menu for the selected track (音乐) or the one playing (播放器) |
+| `:` | Command line |
+| `/` | Find in the library by title, artist, album or path |
+| `?` | Search online |
+| `Ctrl+F` | Open a folder (`:open `) |
+| `Esc` | Close search results; it never quits |
+| `Ctrl+Q` | Quit, saving the track and position for resume |
+
+### Windows
+
+**Library** (`y`)
+
+| Key | Action |
+|---|---|
+| `Tab` / `Shift+Tab` | View: 全部 (all), 有标签 (has artist or album), 缺标签 (has neither), 歌手 (by artist), 专辑 (by album) |
+| `Enter` | Open an artist or album, or play a track |
+| `Backspace` | Back out of an artist or album |
+| `.` | Sort by path, title, artist or album |
 | `s` | Cycle shuffle |
-| `/` | Find local |
-| `?` | Search Netease/QQ via SPlayer |
-| `o` | Loop |
-| `m` | Mix mode |
-| `r` | Remix |
-| `:playlist 名字` | Create user list (max 8) |
-| `:playlist-rm` | Delete current user list |
-| `Ctrl+F` | Open folder |
-| `Ctrl+K` | Help |
-| `Esc` | Close search / overlay (does not quit) |
-| `Ctrl+Q` | Quit |
+| `u` / `U` | Look up the selected track / every track still missing something (see [Tags](#lyrics-covers-and-tags)) |
+| `x` | Track menu |
+| `Esc` / `y` | Close |
 
-Playlists live in `~/.local/share/zradio/playlists.json`. Slot `1` is the whole library; slots `2`–`9` are user lists. The music tab shows the current list only; `p` slides a 9-slot picker up from the bottom. The current list is the play range for `n` / shuffle / loop. Missing files stay in the JSON, render gray, and are skipped.
+**Playlist drawer** (`p`): `1`–`9`, or `j` `k` and `Enter`, switch to a list; an empty slot does not open. `Esc` or `p` closes it.
 
-Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume, [Beat This!](#beat-this), [voice handoff](#voice-handoff) (人声交接), [LAN remote](#remote-control-api) (局域网遥控).
+**Track menu** (`x`): 加到播放列表 (add to a user list), 补全这首 (look this track up online), 播放 (play), and 从当前列表移除 (remove from the current user list) when the track is in it.
 
-Missing tags / covers / lyrics fill from iTunes + lrclib, then Netease, QQ, and Kugou. Existing fields are kept. Lyrics land in a sidecar `lrc/` file; audio files are not rewritten. SPlayer is only for `?` search/download.
+**Equalizer** (`g`): five bands at 60, 250, 1k, 4k and 12k Hz. `j` `k` pick a band, `←` `→` move it 1 dB within ±12 dB, `r` resets, `Esc` or `g` closes. The bands are saved.
+
+**Settings** (`t`): `j` `k` move, `Enter` or `Space` changes the row, `Esc` or `t` closes. Every row is saved.
+
+| Row | Default | What it does |
+|---|---|---|
+| 主题 | `frappe` | `system`, or a Catppuccin flavor: `latte`, `frappe`, `macchiato`, `mocha`. `system` uses `latte` when `COLORFGBG` says the terminal is light, `frappe` otherwise |
+| 透明背景 | off | Reset the terminal's background colour to its default at start; takes effect on the next start |
+| 可视化 | `bars` | `off`, `bars`, `scope` or `cnm` (see [Visualizer](#visualizer)) |
+| 拉歌词 | off | Fetch missing lyrics online |
+| 拉封面 | off | Fetch missing covers online |
+| 续播 | on | At start, play the last track from where it stopped |
+| Beat This! | off | [Beat This!](#beat-this) beat and downbeat model for AutoMix |
+| 人声交接 | off | [Voice handoff](#voice-handoff) between the vocals of two tracks in AutoMix |
+| 局域网遥控 | off | Open the [remote control API](#remote-control-api) to other devices |
+
+### Command line
+
+`:` opens it; `Enter` runs it, `Esc` cancels.
+
+| Command | Action |
+|---|---|
+| `playlist NAME` | Create a user list (8 at most) |
+| `playlist-rm` | Delete the current user list |
+| `find TEXT` | Find in the library (what `/` opens) |
+| `search TEXT` | Search online (what `?` opens) |
+| `open DIR` | Open a folder and save it as the library (what `Ctrl+F` opens) |
+| a YouTube or Bilibili link | Import it with `yt-dlp` (see [Search and import](#search-and-import)) |
+| anything else | Find in the library |
+
+Pasting a link while the command line is closed opens it with the link in it; `Enter` imports.
+
+## Playlists
+
+Slot `1` of the drawer is the whole library; slots `2`–`9` are user lists, kept in `~/.local/share/zradio/playlists.json`. The 音乐 tab shows the current list, and the current list is the play range: `n`, `b`, shuffle, loop and AutoMix only pick tracks from it. Add tracks with `x` → 加到播放列表. A file that has gone missing stays in the list, shows in gray, and is skipped.
+
+## Playback
+
+- **Mix** (`m`): `CUT` starts the next track at once, `FADE` crossfades over 6 s (3.5 s when you skip), `AUTO` mixes with [AutoMix](#automix). Each run starts in `FADE`.
+- **Shuffle** (`s`): `random`; `norepeat`, which avoids the last 12 tracks played; `taste`, which leans toward tracks and artists you finish and replay. The mode is saved.
+- **Loop** (`o`): `ONE` repeats the track, `ALL` walks the list in order. Each run starts at `OFF`.
+- **Remix** (`r`): `CHILL` plays 8% slower and darker, `CLUB` adds soft saturation, `NCORE` plays 12% faster. Speed and pitch change together. Each run starts at `RAW`.
+- **Taste**: a track played to 80% counts as a listen, the same track finished twice in a row as a replay, and one skipped before 40% as a skip. A track scores listens + 1.6 × replays − 0.4 × skips, and an artist the sum of their tracks. The scores drive `taste` shuffle and add to AutoMix's choice; the 我 tab shows the top ones. They are kept in `~/.local/share/zradio/taste.json`.
+- **Resume** (续播): on by default; the last track starts from its saved position.
+- **Media keys**: ZRadio registers with MPRIS, so desktop media keys and `playerctl` can play, pause, stop, seek, and skip.
+
+## Visualizer
+
+- `bars`: packed spectrum columns
+- `scope`: oscilloscope of the PCM being played (rising-edge trigger, braille envelope)
+- `cnm`: gapped density bars with a baseline and vertical gradient (look inspired by CNMPlayer, independently implemented)
+
+When `cava` is on `PATH`, it supplies the spectrum; otherwise ZRadio runs its own FFT.
 
 ## AutoMix
 
-`m` cycles `CUT` / `FADE` / `AUTO`. In `AUTO` each track is analysed once, cached in `~/.cache/zradio/analysis.json`, for tempo and beat phase, key (Camelot), BS.1770 loudness, peak, and where the music starts and ends.
+Press `m` until the status shows `AUTO`. Each track is analysed once for tempo and beat phase, key (Camelot), BS.1770 loudness, peak, and where the music starts and ends. The results are cached in `~/.cache/zradio/analysis.json`.
 
-- Next track: with shuffle off and loop not `all`, the best scoring track in the play range by key, tempo and energy, plus taste. Tempos lock within 8%, or an octave apart (80 BPM beats with 160).
-- Level: every track plays at -14 LUFS, or lower if its peak through the crossover would pass -1 dBFS.
-- Transition: when the tempos lock, the outgoing tail glides to the incoming tempo. The incoming track starts on the outgoing beat phase and is never resampled. The style follows the pair: `bass-swap` (a 160 Hz Linkwitz-Riley crossover hands the low end over mid-overlap), `filter` when the keys clash or the energy jumps, a 4 s `quick` when both do, a 4 s `echo-out` when the tempos do not lock.
+- **Next track**: with shuffle and loop off, AutoMix picks the track in the play range that scores best against the one playing on key, tempo and energy, plus its taste score. Tempos lock within 8%, or an octave apart (80 BPM beats with 160).
+- **Level**: every track plays at -14 LUFS, or lower if its peak through the crossover would pass -1 dBFS.
+- **Transition**: when the tempos lock, the outgoing tail glides to the incoming tempo. The incoming track starts on the outgoing beat phase and is never resampled. The style follows the pair: `bass-swap` (a 160 Hz Linkwitz-Riley crossover hands the low end over mid-overlap), `filter` when the keys clash or the energy jumps, a 4 s `quick` when both do, a 4 s `echo-out` when the tempos do not lock.
 
-Render transitions offline through the same mixer:
-
-```sh
-cargo run --release --example automix_render -- -o /tmp/mix a.flac b.flac c.flac
-```
-
-Each neighbouring pair becomes `NN.wav`: 12 s before the overlap, the overlap, then 6 s after. The log line gives the style, bend, fade, score, peak, and clipped samples. `--analyze` prints the analysis only. `--skip SECS` mixes as a skip at that point. `--mode fade|cut`, `--before`, `--after` and `--rate` are also accepted. `--beat-this path/to/beat_this.onnx` mixes on the model's grid. `--stems path/to/htdemucs.onnx` hands the voices over as the [voice handoff](#voice-handoff) does, and logs how long each separation took and where the voices change hands.
+Two optional models improve the mix. Both are off by default and run on the CPU. Turning one on fetches its model with `curl` if it is not on disk yet, checked against a pinned sha256. In a build without them, their settings rows read 未编译.
 
 ### Beat This!
 
@@ -100,25 +180,63 @@ To leave time for the separation, the next track is fetched 45 s sooner. A mix t
 
 On 6 transitions between 7 library tracks, the voices clashed in 1, a 4 s `echo-out`, and changed hands 2 s in; the other 5 rendered to the same samples as without it.
 
-## Visualize
+### Offline render
 
-- `bars` — packed columns
-- `scope` — real PCM oscilloscope (rising-edge trigger, braille envelope)
-- `cnm` — gapped density bars with a baseline and vertical gradient (look inspired by CNMPlayer, independently implemented)
+The `automix_render` example runs files through the same mixer and writes each transition to a WAV file:
 
-If `cava` is on `PATH`, bars use it; otherwise internal FFT.
+```sh
+cargo run --release --example automix_render -- -o /tmp/mix a.flac b.flac c.flac
+```
 
-## Optional
+Each neighbouring pair becomes `NN.wav` (`01.wav`, `02.wav`, …): 12 s before the overlap, the overlap, then 6 s after. The log line gives the style, bend, fade, score, peak, and clipped samples.
 
-- `cava` for live spectrum
-- SPlayer at `127.0.0.1:25884` for search/download
-- `yt-dlp` for YouTube / Bilibili import (`:url`)
+| Option | Effect |
+|---|---|
+| `--analyze` | Print the analysis of each file and render nothing (one file is enough) |
+| `--mode auto\|fade\|cut` | Mix mode (default `auto`) |
+| `--skip SECS` | Mix as if you skipped at that point of the outgoing track |
+| `--before SECS` / `--after SECS` | Context kept before and after the overlap (default 12 / 6) |
+| `--rate HZ` | Output sample rate (default 48000) |
+| `-o DIR` | Output folder (default `automix-out`) |
+| `--beat-this MODEL` | Mix on the grid of a [Beat This!](#beat-this) model file |
+| `--stems MODEL` | Hand the voices over as the [voice handoff](#voice-handoff) does, and log how long each separation took and where the voices change hands |
 
-## Remote Control API
+## Lyrics, covers and tags
+
+ZRadio reads tags with lofty and never rewrites an audio file. What it finds online is kept beside the track or in its own folders.
+
+- **Lyrics** come from the track's embedded lyrics, then `NAME.lrc` beside it, then `lrc/NAME.lrc` or `LRC/NAME.lrc`. With 拉歌词 on, missing lyrics are looked up on lrclib, then Netease, QQ Music and Kugou, and saved to `lrc/NAME.lrc` beside the track.
+- **Covers** come from the track's embedded front cover, then `NAME.jpg` / `NAME.png`, `cover.jpg`, `cover.png`, `folder.jpg`, or the same names in `cover/` or `covers/`. An embedded cover, or one fetched with 拉封面 on, is cached in `~/.cache/zradio/` and copied to `cover/NAME.EXT` beside the track. Covers are drawn with half-block characters.
+- **Tags**: when a track has no artist or no album, ZRadio looks it up by title (the file name when untagged), artist and album on iTunes, Netease, QQ Music and Kugou (iTunes last when the title or artist has Chinese, Japanese or Korean characters). This happens as the library is scanned at start and when the track plays, whether or not 拉歌词 and 拉封面 are on. Only empty fields are filled, and only in memory, so the lookup runs again on the next start. `u`, `U` and 补全这首 queue lookups by hand.
+
+## Search and import
+
+`?` searches Netease through the public `apis.netstart.cn` mirror. When that returns fewer than 12 results and SPlayer is running, its local API adds Netease and QQ Music results. `Enter` on a result downloads it with `curl` as `ARTIST - TITLE.EXT`, from the mirror's link if it has one, otherwise through SPlayer.
+
+A YouTube or Bilibili link on the command line is imported with `yt-dlp` as an MP3 at its best quality, the single video only. When a Chrome or Firefox profile is found, `yt-dlp` gets its cookies (`--cookies-from-browser`).
+
+Downloads and imports always go to `~/音乐`, whatever folder the library is. ZRadio adds them to the session and plays them at once; if the library is another folder, they are gone from it after the next start.
+
+## Network use
+
+ZRadio has no account and sends no telemetry. These are all the requests it makes, each through `curl` unless noted:
+
+| When | What is sent | To |
+|---|---|---|
+| A track has no artist or no album (always on) | Title, artist, album | iTunes, the Netease mirror `apis.netstart.cn`, QQ Music, Kugou |
+| 拉歌词 is on and a track has no lyrics | Title, artist | lrclib, then the same services |
+| 拉封面 is on and a track has no cover | Title, artist, album | The same services, then the image host they link to |
+| `?` search and its downloads | The search text, the chosen song's ID | `apis.netstart.cn`; SPlayer on `127.0.0.1:25884`, which queries its own sources |
+| A link is imported | The link, and browser cookies when found | The site, through `yt-dlp` |
+| Beat This! or 人声交接 is turned on and its model is not on disk | A request for the pinned model file | `raw.githubusercontent.com` or `huggingface.co` |
+
+Kugou's lyrics are fetched over plain HTTP, and so are some of the cover images the services link to.
+
+## Remote control API
 
 HTTP API on port `18765`, listening on `127.0.0.1` only. Control, status, and lyrics are JSON. `GET /cover/:index` returns image bytes on success. `/status` and `/library/full` do not include cover bytes or LRC text.
 
-To control ZRadio from another device, turn on 局域网遥控 in settings (`t`). The API then listens on `0.0.0.0:18765` and other devices must send `Authorization: Bearer <token>`, where the token is in `~/.config/zradio/api-token` (mode `0600`). Requests from this machine need no token. Cross-origin browser requests get `403`.
+To control ZRadio from another device, turn on 局域网遥控 in settings (`t`). The API then listens on `0.0.0.0:18765` and other devices must send `Authorization: Bearer <token>`, where the token is in `~/.config/zradio/api-token` (mode `0600`, created the first time 局域网遥控 is turned on). Requests from this machine need no token. Cross-origin browser requests get `403`.
 
 ```bash
 # status (no cover bytes)
@@ -137,7 +255,42 @@ curl -s http://localhost:18765/track/3 | jq '.data.cover.mime'
 curl -X POST http://localhost:18765/control -d '{"action":"play"}'
 ```
 
-Full API: [docs/API.md](docs/API.md).
+Full API (in Chinese): [docs/API.md](docs/API.md).
+
+## Files
+
+| Path | Holds |
+|---|---|
+| `~/.config/zradio/prefs.json` | Settings, library folder, equalizer, sort and shuffle |
+| `~/.config/zradio/api-token` | Token for the LAN remote |
+| `~/.local/share/zradio/playlists.json` | User lists |
+| `~/.local/share/zradio/session.json` | Last track and position, for resume |
+| `~/.local/share/zradio/taste.json` | Listens, replays, skips and listening time per track |
+| `~/.local/share/zradio/models/` | Beat This! and htdemucs models |
+| `~/.local/share/zradio/alsa.log` | ZRadio's stderr, mostly ALSA messages, kept off the screen; stops growing at 8 MB |
+| `~/.cache/zradio/analysis.json` | AutoMix analysis |
+| `~/.cache/zradio/NAME-HASH.EXT` | Cached covers |
+| `lrc/`, `cover/` beside the tracks | Fetched lyrics; embedded and fetched covers |
+
+`XDG_CONFIG_HOME` moves `~/.config` and `XDG_CACHE_HOME` moves `~/.cache`. `XDG_DATA_HOME` moves `taste.json` and `models/`; `XDG_STATE_HOME` moves `playlists.json`, `session.json` and `alsa.log`.
+
+## Development
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo test --all-targets --no-default-features
+```
+
+Four tests are ignored by default. Three run the models and need their files; the fourth fetches the pinned Beat This! model (83 MB):
+
+```sh
+ZRADIO_BEAT_THIS_MODEL=$HOME/.local/share/zradio/models/beat_this.onnx \
+ZRADIO_STEMS_MODEL=$HOME/.local/share/zradio/models/htdemucs.onnx \
+  cargo test --release -- --ignored
+```
 
 ## License
 
