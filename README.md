@@ -62,7 +62,7 @@ Optional argument: a library directory.
 
 Playlists live in `~/.local/share/zradio/playlists.json`. Slot `1` is the whole library; slots `2`–`9` are user lists. The music tab shows the current list only; `p` slides a 9-slot picker up from the bottom. The current list is the play range for `n` / shuffle / loop. Missing files stay in the JSON, render gray, and are skipped.
 
-Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume, [Beat This!](#beat-this), [voice handoff](#voice-handoff) (人声交接).
+Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume, [Beat This!](#beat-this), [voice handoff](#voice-handoff) (人声交接), [LAN remote](#remote-control-api) (局域网遥控).
 
 Missing tags / covers / lyrics fill from iTunes + lrclib, then Netease, QQ, and Kugou. Existing fields are kept. Lyrics land in a sidecar `lrc/` file; audio files are not rewritten. SPlayer is only for `?` search/download.
 
@@ -116,7 +116,9 @@ If `cava` is on `PATH`, bars use it; otherwise internal FFT.
 
 ## Remote Control API
 
-HTTP API on port `18765`. Control, status, and lyrics are JSON. `GET /cover/:index` returns image bytes on success. `/status` and `/library/full` do not include cover bytes or LRC text.
+HTTP API on port `18765`, listening on `127.0.0.1` only. Control, status, and lyrics are JSON. `GET /cover/:index` returns image bytes on success. `/status` and `/library/full` do not include cover bytes or LRC text.
+
+To control ZRadio from another device, turn on 局域网遥控 in settings (`t`). The API then listens on `0.0.0.0:18765` and other devices must send `Authorization: Bearer <token>`, where the token is in `~/.config/zradio/api-token` (mode `0600`). Requests from this machine need no token. Cross-origin browser requests get `403`.
 
 ```bash
 # status (no cover bytes)

@@ -340,6 +340,7 @@ pub struct App {
     vocal_worker: Option<stems::Worker<VocalJob, Option<VocalOverlay>>>,
     /// 远程控制 API 共享状态
     api_state: api::SharedState,
+    api_server: api::ApiServer,
     playlists: PlaylistStore,
     lib_row: usize,
     lib_state: ListState,
@@ -448,10 +449,10 @@ impl App {
         let (control_tx, control_rx) = mpsc::channel();
         let mut login_poller = LoginPoller::new();
         login_poller.request();
-        // 新版 JSON API 替代旧 TCP 控制，监听 0.0.0.0:18765
-        let api_state = api::new_shared_state();
-        api::start(control_tx, Arc::clone(&api_state));
         let mut prefs = Prefs::load();
+        // 新版 JSON API 替代旧 TCP 控制：默认只听 127.0.0.1:18765，设置里可开局域网
+        let api_state = api::new_shared_state();
+        let api_server = api::start(prefs.api_lan, control_tx, Arc::clone(&api_state));
         if prefs.library.trim().is_empty() {
             prefs.set_library(&root);
         }
@@ -537,6 +538,7 @@ impl App {
             stems_fetch: None,
             vocal_worker: None,
             api_state,
+            api_server,
             playlists: PlaylistStore::load(),
             lib_row: 0,
             lib_state: ListState::default(),
@@ -2065,7 +2067,22 @@ impl App {
             5 => self.prefs.resume = !self.prefs.resume,
             6 => return self.toggle_beat_this(),
             7 => return self.toggle_stems(),
-            8 => self.overlay = Overlay::None,
+            8 => {
+                self.prefs.api_lan = !self.prefs.api_lan;
+                self.prefs.save();
+                self.api_server.set_lan(self.prefs.api_lan);
+                self.status = if self.prefs.api_lan {
+                    format!(
+                        "API 对局域网开放 :{}，token 在 {}",
+                        api::PORT,
+                        api::token_path().display()
+                    )
+                } else {
+                    format!("API 只听本机 127.0.0.1:{}", api::PORT)
+                };
+                return;
+            }
+            9 => self.overlay = Overlay::None,
             _ => {}
         }
         self.prefs.save();
@@ -3958,6 +3975,7 @@ impl App {
             format!("续播        {}", on_off(self.prefs.resume)),
             format!("Beat This!  {}", self.beat_this_label()),
             format!("人声交接    {}", self.stems_label()),
+            format!("局域网遥控  {}", on_off(self.prefs.api_lan)),
             "关闭".into(),
         ];
         let items: Vec<ListItem> = rows
@@ -4369,7 +4387,7 @@ fn context_target_for_tab(
 }
 
 /// Rows in the settings panel, the last of which closes it.
-const SETTINGS_ROWS: usize = 9;
+const SETTINGS_ROWS: usize = 10;
 
 fn on_off(v: bool) -> &'static str {
     if v {
