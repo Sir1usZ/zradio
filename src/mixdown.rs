@@ -288,6 +288,9 @@ mod tests {
             duration: secs,
             loudness: None,
             peak: 0.0,
+            music_start: 0.0,
+            music_end: secs,
+            beat_this: false,
         }
     }
 

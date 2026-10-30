@@ -932,6 +932,11 @@ impl Mixer {
         self.incoming.is_some() && self.fade_total > 0
     }
 
+    /// Whether a mix is armed or under way; its plan was made from the analyses as they were.
+    pub fn transition_pending(&self) -> bool {
+        self.incoming.is_some() || self.armed.is_some()
+    }
+
     pub fn should_prefetch(&self) -> bool {
         if self.loop_mode == LoopMode::One {
             return false;
@@ -1794,6 +1799,9 @@ mod tests {
             duration,
             loudness: None,
             peak: 0.0,
+            music_start: 0.0,
+            music_end: duration,
+            beat_this: false,
         }
     }
 
@@ -2057,6 +2065,30 @@ mod tests {
             start_at >= pos,
             "must not rewind current track, start={start_at} pos={pos}"
         );
+    }
+
+    #[test]
+    fn a_mix_is_pending_from_when_it_is_armed_until_it_is_done() {
+        let mut mixer = Mixer::new(48_000, 2);
+        mixer.set_tracks(two_tracks());
+        mixer.mix = MixMode::AutoMix;
+        mixer.play_decoded(0, const_deck(48_000 * 20, 0.8));
+        mixer.set_analysis(0, analysis_at(0.0, 16.0, 20.0));
+        mixer.set_analysis(1, analysis_at(4.0, 18.0, 20.0));
+        assert!(!mixer.transition_pending());
+        mixer.set_playhead(48_000 * 10);
+        mixer.start_transition(1, const_deck(48_000 * 20, 0.2), false);
+        assert!(mixer.armed.is_some() && mixer.transition_pending());
+        let mut out = vec![0.0f32; 4_800 * 2];
+        while mixer.armed.is_some() {
+            mixer.fill(&mut out);
+        }
+        assert!(mixer.fading() && mixer.transition_pending());
+        while mixer.fading() {
+            mixer.fill(&mut out);
+        }
+        assert_eq!(mixer.current_idx, Some(1));
+        assert!(!mixer.transition_pending());
     }
 
     fn clicks(frames: usize, bpm: f64) -> AudioBuf {

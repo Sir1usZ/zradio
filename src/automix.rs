@@ -109,6 +109,8 @@ pub fn at_tempo(a: &TrackAnalysis, tempo: f32) -> TrackAnalysis {
         mix_out: a.mix_out / tempo,
         first_beat: a.first_beat / tempo,
         duration: a.duration / tempo,
+        music_start: a.music_start / tempo,
+        music_end: a.music_end / tempo,
         ..a.clone()
     }
 }
@@ -457,6 +459,9 @@ mod tests {
             duration: 200.0,
             loudness: None,
             peak: 0.0,
+            music_start: 0.0,
+            music_end: 200.0,
+            beat_this: false,
         }
     }
 
