@@ -60,6 +60,8 @@ pub struct ApiSnapshot {
     pub lyrics_lrc: Vec<String>,
     /// 封面缓存路径，下标对齐曲目序号；按需读盘，不进 /library/full
     pub cover_paths: Vec<Option<PathBuf>>,
+    /// 网页遥控器插件。关着时 `/` 仍是 not found。
+    pub web_remote: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -377,8 +379,12 @@ fn handle_connection(
         String::new()
     };
 
+    // 页面外壳是静态的、不含数据，手机浏览器直接打开它时带不了 `Authorization`，
+    // 所以只有它不查 token；页面里的每个数据请求（/status、/control、/cover/…）照旧要。
+    let is_page =
+        method == "GET" && matches!(path, "/" | "/index.html") && web_remote_enabled(state);
     let bearer = authorization.as_deref().and_then(bearer_token);
-    if !authorized(peer, host.as_deref(), bearer, token) {
+    if !is_page && !authorized(peer, host.as_deref(), bearer, token) {
         return send_json(&mut stream, 401, &err("missing or wrong API token"));
     }
 
@@ -392,6 +398,15 @@ fn handle_connection(
 
     if method == "OPTIONS" {
         return send_options(&mut stream);
+    }
+
+    if is_page {
+        return send_bytes(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            include_str!("web/index.html").as_bytes(),
+        );
     }
 
     if method == "GET" && path.starts_with("/cover/") {
@@ -452,6 +467,7 @@ fn route(
             // 偏好设置
             "/prefs" => handle_prefs(state),
             "/eq" => handle_get_eq(state),
+            "/" | "/index.html" if web_remote_enabled(state) => web_page(),
             _ => err("not found"),
         };
     }
@@ -914,6 +930,7 @@ fn handle_control(body: &str, tx: &Sender<ControlCmd>, state: &SharedState) -> s
         "toggle_lyrics_fetch" => ControlCmd::ToggleLyricsFetch,
         "toggle_cover_fetch" => ControlCmd::ToggleCoverFetch,
         "toggle_resume" => ControlCmd::ToggleResume,
+        "toggle_web_remote" => ControlCmd::ToggleWebRemote,
 
         // ── 资料库 ──
         "meta_scan" => ControlCmd::MetaScan,
@@ -1083,6 +1100,14 @@ fn cover_bytes_for(path: &str, state: &SharedState) -> Option<(&'static str, Vec
     cover_bytes_at(idx, &snap)
 }
 
+fn web_remote_enabled(state: &SharedState) -> bool {
+    state.lock().map(|snap| snap.web_remote).unwrap_or(false)
+}
+
+fn web_page() -> serde_json::Value {
+    ok(serde_json::json!({ "html": include_str!("web/index.html") }))
+}
+
 fn ok(data: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"ok": true, "data": data})
 }
@@ -1209,13 +1234,22 @@ mod tests {
 
     /// 假装请求来自 `peer`、服务端 token 是 `token`，返回响应和排进控制队列的命令。
     fn serve_from(peer: IpAddr, token: Option<&str>, req: &[u8]) -> (String, Vec<ControlCmd>) {
+        serve_with_state(peer, token, new_shared_state(), req)
+    }
+
+    fn serve_with_state(
+        peer: IpAddr,
+        token: Option<&str>,
+        state: SharedState,
+        req: &[u8],
+    ) -> (String, Vec<ControlCmd>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let token = token.map(str::to_string);
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
-            let _ = handle_connection(stream, peer, token.as_deref(), &tx, &new_shared_state());
+            let _ = handle_connection(stream, peer, token.as_deref(), &tx, &state);
             rx.try_iter().collect::<Vec<_>>()
         });
         let mut client = TcpStream::connect(addr).unwrap();
@@ -1476,8 +1510,46 @@ mod tests {
             eventually(|| !answers(other)),
             "switching LAN off must rebind"
         );
-        assert!(answers(local));
+        // 0.0.0.0 已关、127.0.0.1 还没绑上的那一下谁都连不上，等它绑好。
+        assert!(eventually(|| answers(local)));
+        assert!(!answers(other));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_page_needs_no_token_but_the_data_behind_it_does() {
+        let lan = IpAddr::from(Ipv4Addr::new(192, 168, 1, 20));
+        let host = "Host: 192.168.1.5:18765\r\n";
+        let on = new_shared_state();
+        on.lock().unwrap().web_remote = true;
+        let get = |path: &str| format!("GET {path} HTTP/1.1\r\n{host}\r\n").into_bytes();
+
+        let (resp, _) = serve_with_state(lan, Some("secret"), on.clone(), &get("/"));
+        assert!(
+            resp.starts_with("HTTP/1.1 200 "),
+            "page must load without a token"
+        );
+        assert!(resp.contains("text/html"));
+        assert!(
+            resp.contains("Authorization"),
+            "page must send the token back"
+        );
+
+        let (resp, _) = serve_with_state(lan, Some("secret"), on.clone(), &get("/status"));
+        assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+        let (resp, _) = serve_with_state(lan, Some("secret"), on.clone(), &get("/cover/0"));
+        assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+
+        let post = post_next(host);
+        let (resp, queued) = serve_with_state(lan, Some("secret"), on, post.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+        assert!(queued.is_empty());
+
+        let (resp, _) = serve_with_state(lan, Some("secret"), new_shared_state(), &get("/"));
+        assert!(
+            resp.starts_with("HTTP/1.1 401 "),
+            "an off plugin has no page, got {resp:?}"
+        );
     }
 
     #[test]
@@ -1612,6 +1684,26 @@ mod tests {
         let resp = handle_get_shuffle(&Arc::new(Mutex::new(ApiSnapshot::default())));
         assert_eq!(resp["ok"], true);
         assert!(resp["data"]["modes"].is_array());
+    }
+
+    #[test]
+    fn web_page_is_absent_until_the_plugin_is_enabled() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let state = new_shared_state();
+        let off = route("GET", "/", "", &tx, &state);
+        assert_eq!(off["ok"], false);
+        assert_eq!(off["error"], "not found");
+
+        state.lock().unwrap().web_remote = true;
+        let on = route("GET", "/", "", &tx, &state);
+        assert_eq!(on["ok"], true);
+        let html = on["data"]["html"].as_str().unwrap();
+        assert!(html.contains("id=\"mini\""), "player shell missing: {html}");
+        assert!(html.contains("/status"), "page must read the existing API");
+        assert!(
+            html.contains("/control"),
+            "page must post to the existing API"
+        );
     }
 
     #[test]

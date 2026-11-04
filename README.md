@@ -62,7 +62,7 @@ Optional argument: a library directory.
 
 Playlists live in `~/.local/share/zradio/playlists.json`. Slot `1` is the whole library; slots `2`–`9` are user lists. The music tab shows the current list only; `p` slides a 9-slot picker up from the bottom. The current list is the play range for `n` / shuffle / loop. Missing files stay in the JSON, render gray, and are skipped.
 
-Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume, [Beat This!](#beat-this), [voice handoff](#voice-handoff) (人声交接), [LAN remote](#remote-control-api) (局域网遥控).
+Settings: theme, transparent background, visualize (`off` / `bars` / `scope` / `cnm`), fetch lyrics, fetch covers, resume, [Beat This!](#beat-this), [voice handoff](#voice-handoff) (人声交接), [LAN remote](#remote-control-api) (局域网遥控), [web remote](#remote-control-api) (网页遥控).
 
 Missing tags / covers / lyrics fill from iTunes + lrclib, then Netease, QQ, and Kugou. Existing fields are kept. Lyrics land in a sidecar `lrc/` file; audio files are not rewritten. SPlayer is only for `?` search/download.
 
@@ -119,6 +119,10 @@ If `cava` is on `PATH`, bars use it; otherwise internal FFT.
 HTTP API on port `18765`, listening on `127.0.0.1` only. Control, status, and lyrics are JSON. `GET /cover/:index` returns image bytes on success. `/status` and `/library/full` do not include cover bytes or LRC text.
 
 To control ZRadio from another device, turn on 局域网遥控 in settings (`t`). The API then listens on `0.0.0.0:18765` and other devices must send `Authorization: Bearer <token>`, where the token is in `~/.config/zradio/api-token` (mode `0600`). Requests from this machine need no token. Cross-origin browser requests get `403`.
+
+The browser remote is off until you turn on `网页遥控` in settings (`t`). Then open `http://<host>:18765/`. Audio stays on this machine; the page only drives the API. Turning it off omits `web_remote` from the prefs file again.
+
+On this machine the page works as is. From a phone or another device, also turn on 局域网遥控, read the token with `cat ~/.config/zradio/api-token`, and open `http://<host>:18765/#token=<token>`. The page shell is static and needs no token; every request the page makes sends `Authorization: Bearer <token>`. The part after `#` is never sent to the server. The page keeps the token in the browser's local storage and clears it from the address bar, so it shows a red bar asking for the link again if the token is missing or wrong.
 
 ```bash
 # status (no cover bytes)

@@ -41,6 +41,10 @@ curl -s http://localhost:18765/cover/3 -o cover.jpg
 
 需要 token 时带上 `Authorization: Bearer <token>`，没带或不对返回 `401`。
 
+例外：打开「网页遥控」后，`GET /` 和 `GET /index.html` 返回的是静态页面外壳，不含任何数据，浏览器直接打开页面时又带不了请求头，所以这两个路径不要 token；关着「网页遥控」时它们照旧走上面的规则。页面里发出的 `/status`、`/control`、`/library/full`、`/lyrics/:index`、`/cover/:index` 请求仍然要 token。
+
+手机用 `http://<本机局域网 IP>:18765/#token=<token>` 打开页面。`#` 后面的部分不会发给服务端；页面读出 token 存进浏览器本地存储，并把它从地址栏清掉，之后每个请求都带 `Authorization`。token 缺失或不对时页面顶部会提示重新用带 token 的链接打开。
+
 token 在第一次打开局域网遥控时生成，存在 `~/.config/zradio/api-token`（有 `XDG_CONFIG_HOME` 时是 `$XDG_CONFIG_HOME/zradio/api-token`），文件权限 `0600`，ZRadio 不会把它打印出来。也可以自己往这个文件里写一个，删掉它再打开局域网遥控会重新生成。
 
 ```bash

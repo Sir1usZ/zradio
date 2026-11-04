@@ -2082,7 +2082,8 @@ impl App {
                 };
                 return;
             }
-            9 => self.overlay = Overlay::None,
+            9 => self.prefs.web_remote = !self.prefs.web_remote,
+            10 => self.overlay = Overlay::None,
             _ => {}
         }
         self.prefs.save();
@@ -2835,6 +2836,7 @@ impl App {
         snap.total_listen_secs = self.taste.total_listen_secs();
         snap.lyrics = lyrics;
         snap.prefs = prefs;
+        snap.web_remote = self.prefs.web_remote;
         if let Some(library) = library {
             snap.library = library;
         }
@@ -3158,6 +3160,11 @@ impl App {
                     self.prefs.resume = !self.prefs.resume;
                     self.prefs.save();
                     self.status = format!("resume {}", self.prefs.resume);
+                }
+                ControlCmd::ToggleWebRemote => {
+                    self.prefs.web_remote = !self.prefs.web_remote;
+                    self.prefs.save();
+                    self.status = format!("web_remote {}", self.prefs.web_remote);
                 }
 
                 // ── 保留兼容 ──
@@ -3976,6 +3983,7 @@ impl App {
             format!("Beat This!  {}", self.beat_this_label()),
             format!("人声交接    {}", self.stems_label()),
             format!("局域网遥控  {}", on_off(self.prefs.api_lan)),
+            format!("网页遥控    {}", on_off(self.prefs.web_remote)),
             "关闭".into(),
         ];
         let items: Vec<ListItem> = rows
@@ -4387,7 +4395,7 @@ fn context_target_for_tab(
 }
 
 /// Rows in the settings panel, the last of which closes it.
-const SETTINGS_ROWS: usize = 10;
+const SETTINGS_ROWS: usize = 11;
 
 fn on_off(v: bool) -> &'static str {
     if v {

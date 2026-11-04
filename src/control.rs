@@ -67,6 +67,8 @@ pub enum ControlCmd {
     ToggleCoverFetch,
     /// 切换恢复播放
     ToggleResume,
+    /// 切换网页遥控器插件
+    ToggleWebRemote,
 }
 
 #[derive(Deserialize)]
