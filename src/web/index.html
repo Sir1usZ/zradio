@@ -217,6 +217,75 @@
 <script>
 const STATUS = "/status";
 const CONTROL = "/control";
+const TOKEN_KEY = "zradio-token";
+
+// 手机浏览器打开页面时带不了请求头，token 放在 #token=… 里：# 后面的部分不会发给服务端。
+// 读出来存好，再把地址栏清掉；之后每个请求都带 Authorization。
+function readToken() {
+  const m = /^#token=(.+)$/.exec(location.hash);
+  if (m) {
+    let t = m[1];
+    try { t = decodeURIComponent(t); } catch (_) {}
+    t = t.trim();
+    history.replaceState(null, "", location.pathname + location.search);
+    try { localStorage.setItem(TOKEN_KEY, t); } catch (_) {}
+    return t;
+  }
+  try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (_) { return ""; }
+}
+const token = readToken();
+
+function authBar(show) {
+  let bar = document.getElementById("auth");
+  if (!bar && !show) return;
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "auth";
+    bar.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:9;padding:10px 14px;background:#b3261e;color:#fff;font-size:14px";
+    bar.textContent = "需要 token：在电脑上运行 cat ~/.config/zradio/api-token，然后用 http://<地址>:18765/#token=<token> 重新打开本页。";
+    document.body.appendChild(bar);
+  }
+  bar.hidden = !show;
+}
+
+async function api(path, init = {}) {
+  const headers = { ...(init.headers || {}) };
+  if (token) headers.Authorization = "Bearer " + token;
+  const res = await fetch(path, { ...init, headers });
+  authBar(res.status === 401);
+  return res;
+}
+
+let coverFor = "";
+let coverBlob = "";
+
+// <img src> 是浏览器自己发的请求，带不了 Authorization，所以封面走 api() 取回来，再给 <img> 一个 blob: 地址。
+async function setCover(path) {
+  let url = "";
+  if (path) {
+    try {
+      const res = await api(path);
+      const type = res.headers.get("Content-Type") || "";
+      if (res.ok && type.startsWith("image/")) url = URL.createObjectURL(await res.blob());
+    } catch (_) {}
+  }
+  if (path !== coverFor) {
+    if (url) URL.revokeObjectURL(url);
+    return;
+  }
+  if (coverBlob) URL.revokeObjectURL(coverBlob);
+  coverBlob = url;
+  for (const id of ["mini-cover", "cover"]) {
+    const img = document.getElementById(id);
+    if (url) {
+      img.src = url;
+      img.hidden = false;
+    } else {
+      img.removeAttribute("src");
+      img.hidden = true;
+    }
+  }
+}
 const ROW = 56;
 const list = document.getElementById("list");
 const rows = document.getElementById("rows");
@@ -241,7 +310,7 @@ function clock(secs) {
 }
 
 async function post(body) {
-  const res = await fetch(CONTROL, {
+  const res = await api(CONTROL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -299,16 +368,9 @@ function paintPlayer() {
     document.getElementById("scrub").value = String(Math.min(1000, (pos / duration) * 1000));
   }
   const cover = current && current.has_cover ? "/cover/" + current.index : "";
-  for (const id of ["mini-cover", "cover"]) {
-    const img = document.getElementById(id);
-    if (cover && img.getAttribute("src") !== cover) {
-      img.hidden = false;
-      img.src = cover;
-    }
-    if (!cover) {
-      img.removeAttribute("src");
-      img.hidden = true;
-    }
+  if (cover !== coverFor) {
+    coverFor = cover;
+    setCover(cover);
   }
   paintLyrics(pos);
 }
@@ -345,7 +407,7 @@ function apply(data) {
 }
 
 async function loadLibrary() {
-  const res = await fetch("/library/full");
+  const res = await api("/library/full");
   const json = await res.json();
   if (!json.ok) return;
   tracks = json.data.tracks || [];
@@ -370,7 +432,7 @@ async function loadLyrics() {
   const box = document.getElementById("lyrics");
   box.innerHTML = "";
   if (!current || !current.has_lyrics) return;
-  const res = await fetch("/lyrics/" + current.index);
+  const res = await api("/lyrics/" + current.index);
   const json = await res.json();
   if (!json.ok) return;
   lyrics = parseLrc(json.data.lrc || "");
@@ -439,7 +501,7 @@ scrub.addEventListener("change", () => {
 
 async function poll() {
   try {
-    const res = await fetch(STATUS);
+    const res = await api(STATUS);
     const json = await res.json();
     if (json.ok) {
       apply(json.data);

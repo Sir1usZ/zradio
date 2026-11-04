@@ -379,8 +379,12 @@ fn handle_connection(
         String::new()
     };
 
+    // 页面外壳是静态的、不含数据，手机浏览器直接打开它时带不了 `Authorization`，
+    // 所以只有它不查 token；页面里的每个数据请求（/status、/control、/cover/…）照旧要。
+    let is_page =
+        method == "GET" && matches!(path, "/" | "/index.html") && web_remote_enabled(state);
     let bearer = authorization.as_deref().and_then(bearer_token);
-    if !authorized(peer, host.as_deref(), bearer, token) {
+    if !is_page && !authorized(peer, host.as_deref(), bearer, token) {
         return send_json(&mut stream, 401, &err("missing or wrong API token"));
     }
 
@@ -396,7 +400,7 @@ fn handle_connection(
         return send_options(&mut stream);
     }
 
-    if method == "GET" && (path == "/" || path == "/index.html") && web_remote_enabled(state) {
+    if is_page {
         return send_bytes(
             &mut stream,
             200,
@@ -1230,13 +1234,22 @@ mod tests {
 
     /// 假装请求来自 `peer`、服务端 token 是 `token`，返回响应和排进控制队列的命令。
     fn serve_from(peer: IpAddr, token: Option<&str>, req: &[u8]) -> (String, Vec<ControlCmd>) {
+        serve_with_state(peer, token, new_shared_state(), req)
+    }
+
+    fn serve_with_state(
+        peer: IpAddr,
+        token: Option<&str>,
+        state: SharedState,
+        req: &[u8],
+    ) -> (String, Vec<ControlCmd>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let token = token.map(str::to_string);
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
-            let _ = handle_connection(stream, peer, token.as_deref(), &tx, &new_shared_state());
+            let _ = handle_connection(stream, peer, token.as_deref(), &tx, &state);
             rx.try_iter().collect::<Vec<_>>()
         });
         let mut client = TcpStream::connect(addr).unwrap();
@@ -1501,6 +1514,42 @@ mod tests {
         assert!(eventually(|| answers(local)));
         assert!(!answers(other));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_page_needs_no_token_but_the_data_behind_it_does() {
+        let lan = IpAddr::from(Ipv4Addr::new(192, 168, 1, 20));
+        let host = "Host: 192.168.1.5:18765\r\n";
+        let on = new_shared_state();
+        on.lock().unwrap().web_remote = true;
+        let get = |path: &str| format!("GET {path} HTTP/1.1\r\n{host}\r\n").into_bytes();
+
+        let (resp, _) = serve_with_state(lan, Some("secret"), on.clone(), &get("/"));
+        assert!(
+            resp.starts_with("HTTP/1.1 200 "),
+            "page must load without a token"
+        );
+        assert!(resp.contains("text/html"));
+        assert!(
+            resp.contains("Authorization"),
+            "page must send the token back"
+        );
+
+        let (resp, _) = serve_with_state(lan, Some("secret"), on.clone(), &get("/status"));
+        assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+        let (resp, _) = serve_with_state(lan, Some("secret"), on.clone(), &get("/cover/0"));
+        assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+
+        let post = post_next(host);
+        let (resp, queued) = serve_with_state(lan, Some("secret"), on, post.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+        assert!(queued.is_empty());
+
+        let (resp, _) = serve_with_state(lan, Some("secret"), new_shared_state(), &get("/"));
+        assert!(
+            resp.starts_with("HTTP/1.1 401 "),
+            "an off plugin has no page, got {resp:?}"
+        );
     }
 
     #[test]
