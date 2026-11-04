@@ -1,15 +1,99 @@
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+type DownloadMeta = (Option<String>, Option<String>);
+
+const DOWNLOAD_IDLE_LIMIT: Duration = Duration::from_secs(120);
+const DOWNLOAD_TOTAL_LIMIT: Duration = Duration::from_secs(60 * 60);
+
+fn download_stalled(total: Duration, idle: Duration) -> bool {
+    idle > DOWNLOAD_IDLE_LIMIT || total > DOWNLOAD_TOTAL_LIMIT
+}
+
+fn collect_reader_metadata(
+    readers: Vec<JoinHandle<()>>,
+    meta_rx: Receiver<DownloadMeta>,
+) -> (String, String) {
+    for reader in readers {
+        let _ = reader.join();
+    }
+
+    let mut last_path = String::new();
+    let mut last_err = String::new();
+    for (path, err) in meta_rx.try_iter() {
+        if let Some(path) = path {
+            last_path = path;
+        }
+        if let Some(err) = err {
+            last_err = err;
+        }
+    }
+    (last_path, last_err)
+}
+
+fn finish_reader_metadata(
+    readers: Vec<JoinHandle<()>>,
+    meta_rx: Receiver<DownloadMeta>,
+    timed_out: bool,
+) -> Option<(String, String)> {
+    if timed_out {
+        return None;
+    }
+    Some(collect_reader_metadata(readers, meta_rx))
+}
+
+const MEDIA_HOSTS: [&str; 4] = ["youtube.com", "youtu.be", "bilibili.com", "b23.tv"];
 
 pub fn looks_like_media_url(raw: &str) -> bool {
+    url_host(raw).is_some_and(|host| {
+        MEDIA_HOSTS.iter().any(|known| {
+            host == *known
+                || host
+                    .strip_suffix(known)
+                    .is_some_and(|sub| sub.ends_with('.'))
+        })
+    })
+}
+
+pub fn find_media_url(text: &str) -> Option<&str> {
+    text.split_whitespace()
+        .find(|token| looks_like_media_url(token))
+}
+
+fn url_host(raw: &str) -> Option<String> {
     let s = raw.trim();
-    s.contains("youtube.com/")
-        || s.contains("youtu.be/")
-        || s.contains("bilibili.com/")
-        || s.contains("b23.tv/")
-        || s.contains("music.youtube.com/")
+    let rest = match s.split_once("://") {
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http") =>
+        {
+            rest
+        }
+        Some(_) => return None,
+        None => s,
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    if !tail.starts_with('/') || tail.len() < 2 || tail.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let host = match authority.split_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return None,
+        None => authority,
+    };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
 }
 
 pub fn library_dir() -> PathBuf {
@@ -98,70 +182,50 @@ pub fn download_audio(
             let _ = tx.send(format!("cookies {browser}"));
         }
     }
-    cmd.arg(&url);
+    cmd.arg("--").arg(&url);
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let (meta_tx, meta_rx) = std::sync::mpsc::channel::<(Option<String>, Option<String>)>();
+    let started = Instant::now();
+    let last_output = Arc::new(AtomicU64::new(0));
+    let (meta_tx, meta_rx) = std::sync::mpsc::channel::<DownloadMeta>();
+    let mut readers = Vec::with_capacity(2);
     if let Some(stderr) = child.stderr.take() {
-        let progress = progress.clone();
-        let meta_tx = meta_tx.clone();
-        std::thread::spawn(move || {
-            let mut last_path = None;
-            let mut last_err = None;
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                last_err = Some(line.clone());
-                if let Some(msg) = progress_line(&line) {
-                    if let Some(tx) = progress.as_ref() {
-                        let _ = tx.send(msg);
-                    }
-                } else if let Some(tx) = progress.as_ref() {
-                    if line.contains("ERROR") || line.contains("Sign in") || line.contains("cookie")
-                    {
-                        let _ = tx.send(short_err(&line));
-                    }
-                }
-                if let Some(path) = destination_line(&line) {
-                    last_path = Some(path);
-                }
-            }
-            let _ = meta_tx.send((last_path, last_err));
-        });
+        readers.push(spawn_output_reader(
+            stderr,
+            progress.clone(),
+            meta_tx.clone(),
+            true,
+            started,
+            Arc::clone(&last_output),
+        ));
     }
     if let Some(stdout) = child.stdout.take() {
-        let meta_tx = meta_tx.clone();
-        std::thread::spawn(move || {
-            let mut last_path = None;
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if looks_like_path(&line) {
-                    last_path = Some(line.trim().to_string());
-                }
-            }
-            let _ = meta_tx.send((last_path, None));
-        });
+        readers.push(spawn_output_reader(
+            stdout,
+            progress.clone(),
+            meta_tx.clone(),
+            false,
+            started,
+            Arc::clone(&last_output),
+        ));
     }
-    let started = std::time::Instant::now();
-    let status = loop {
+    drop(meta_tx);
+    let (status, timed_out) = loop {
         match child.try_wait()? {
-            Some(status) => break status,
+            Some(status) => break (status, false),
             None => {
-                if started.elapsed().as_secs() > 90 {
+                let total = started.elapsed();
+                let last = Duration::from_millis(last_output.load(Ordering::Relaxed));
+                if download_stalled(total, total.saturating_sub(last)) {
                     let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!("yt-dlp hung. login youtube.com in Chrome, then retry");
+                    break (child.wait()?, true);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(200));
             }
         }
     };
-    let mut last_path = String::new();
-    let mut last_err = String::new();
-    while let Ok((path, err)) = meta_rx.try_recv() {
-        if let Some(path) = path {
-            last_path = path;
-        }
-        if let Some(err) = err {
-            last_err = err;
-        }
-    }
+    let Some((last_path, last_err)) = finish_reader_metadata(readers, meta_rx, timed_out) else {
+        anyhow::bail!("yt-dlp hung. login youtube.com in Chrome, then retry");
+    };
     if !status.success() {
         anyhow::bail!("{}", short_err(&last_err));
     }
@@ -171,12 +235,68 @@ pub fn download_audio(
     Ok(last_path)
 }
 
+fn spawn_output_reader<R: Read + Send + 'static>(
+    stream: R,
+    progress: Option<Sender<String>>,
+    meta_tx: Sender<DownloadMeta>,
+    keep_err: bool,
+    started: Instant,
+    last_output: Arc<AtomicU64>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let lines = BufReader::new(stream)
+            .split(b'\n')
+            .map_while(Result::ok)
+            .inspect(|_| last_output.store(started.elapsed().as_millis() as u64, Ordering::Relaxed))
+            .map(|line| String::from_utf8_lossy(&line).into_owned());
+        let _ = meta_tx.send(scan_output(lines, progress.as_ref(), keep_err));
+    })
+}
+
+fn scan_output(
+    lines: impl Iterator<Item = String>,
+    progress: Option<&Sender<String>>,
+    keep_err: bool,
+) -> DownloadMeta {
+    let mut last_path = None;
+    let mut last_err = None;
+    for line in lines {
+        if let Some(msg) = progress_line(&line) {
+            if let Some(tx) = progress {
+                let _ = tx.send(msg);
+            }
+        } else if keep_err
+            && (line.contains("ERROR") || line.contains("Sign in") || line.contains("cookie"))
+        {
+            if let Some(tx) = progress {
+                let _ = tx.send(short_err(&line));
+            }
+        }
+        if let Some(path) = destination_line(&line) {
+            last_path = Some(path);
+        } else if looks_like_path(&line) {
+            last_path = Some(line.trim().to_string());
+        }
+        if keep_err {
+            last_err = Some(line);
+        }
+    }
+    (last_path, last_err)
+}
+
 pub fn clean_media_url(url: &str) -> String {
     let url = url.trim();
-    if let Some(id) = youtube_id(url) {
+    let youtube = url_host(url).is_some_and(|host| {
+        host == "youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com")
+    });
+    if let Some(id) = youtube.then(|| youtube_id(url)).flatten() {
         return format!("https://www.youtube.com/watch?v={id}");
     }
-    url.to_string()
+    if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{url}")
+    }
 }
 
 fn youtube_id(url: &str) -> Option<String> {
@@ -216,8 +336,7 @@ fn short_err(line: &str) -> String {
 }
 
 pub fn parse_percent(msg: &str) -> Option<f64> {
-    let msg = msg.trim();
-    let pct = msg.split('%').next()?;
+    let (pct, _) = msg.trim().split_once('%')?;
     let num = pct
         .rsplit(|c: char| !(c.is_ascii_digit() || c == '.'))
         .next()?;
@@ -278,6 +397,47 @@ mod tests {
     }
 
     #[test]
+    fn media_url_checks_the_real_host() {
+        assert!(looks_like_media_url("www.youtube.com/watch?v=tRsQsTMvPNg"));
+        assert!(looks_like_media_url(
+            "https://m.youtube.com/watch?v=tRsQsTMvPNg"
+        ));
+        assert!(looks_like_media_url(
+            "HTTPS://music.youtube.com/watch?v=tRsQsTMvPNg"
+        ));
+        assert!(!looks_like_media_url(
+            "https://evil.example/youtube.com/watch?v=x"
+        ));
+        assert!(!looks_like_media_url(
+            "https://youtube.com.evil.example/watch?v=x"
+        ));
+        assert!(!looks_like_media_url("https://evil.example#@youtube.com/x"));
+        assert!(!looks_like_media_url("https://notyoutube.com/watch?v=x"));
+        assert!(!looks_like_media_url("file:///home/me/youtube.com/a.mp3"));
+        assert!(!looks_like_media_url("--exec=sh youtube.com/x"));
+    }
+
+    #[test]
+    fn share_text_yields_its_media_link() {
+        assert_eq!(
+            find_media_url("【标题-哔哩哔哩】 https://b23.tv/AbCdEf"),
+            Some("https://b23.tv/AbCdEf")
+        );
+        assert_eq!(find_media_url("see https://example.com/x"), None);
+    }
+
+    #[test]
+    fn schemeless_media_url_gets_https() {
+        assert_eq!(clean_media_url("b23.tv/abcdef"), "https://b23.tv/abcdef");
+        assert_eq!(
+            clean_media_url("youtu.be/tRsQsTMvPNg"),
+            "https://www.youtube.com/watch?v=tRsQsTMvPNg"
+        );
+        let bili = "https://www.bilibili.com/video/BV1xx411c7mD?lv=12345678";
+        assert_eq!(clean_media_url(bili), bili);
+    }
+
+    #[test]
     fn strips_youtube_playlist() {
         let dirty = "https://www.youtube.com/watch?v=QW_NiuNJvhs&list=RDQW_NiuNJvhs&start_radio=1";
         assert_eq!(
@@ -299,6 +459,63 @@ mod tests {
         assert!((parse_percent("12.3% of 4.10MiB").unwrap() - 0.123).abs() < 0.001);
     }
 
+    fn lines(text: &str) -> impl Iterator<Item = String> + '_ {
+        text.lines().map(str::to_string)
+    }
+
+    #[test]
+    fn ytdlp_stdout_reports_progress_and_final_path() {
+        let stdout = "\
+[generic] Extracting URL: https://example.test/song
+[info] song: Downloading 1 format(s): webm
+[download] Destination: /music/song.webm
+[download]  43.4% of   16.14KiB at  Unknown B/s ETA Unknown
+[download] 100% of   16.14KiB in 00:00:00 at 9.14MiB/s
+[ExtractAudio] Destination: /music/song.mp3
+Deleting original file /music/song.webm (pass -k to keep)
+";
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (path, err) = scan_output(lines(stdout), Some(&tx), false);
+        assert_eq!(path.as_deref(), Some("/music/song.mp3"));
+        assert_eq!(err, None);
+        let sent: Vec<String> = rx.try_iter().collect();
+        assert!(sent.iter().any(|m| m.starts_with("43.4%")));
+        assert!(sent.iter().any(|m| m == "extract audio"));
+    }
+
+    #[test]
+    fn ytdlp_stdout_reuses_already_downloaded_file() {
+        let stdout = "\
+[download] /music/song.mp3 has already been downloaded
+[ExtractAudio] Not converting audio /music/song.mp3; file is already in target format mp3
+";
+        let (path, _) = scan_output(lines(stdout), None, false);
+        assert_eq!(path.as_deref(), Some("/music/song.mp3"));
+    }
+
+    #[test]
+    fn ytdlp_stderr_keeps_last_error_line() {
+        let stderr = "WARNING: [youtube] slow\nERROR: [youtube] abc: Sign in to confirm\n";
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (path, err) = scan_output(lines(stderr), Some(&tx), true);
+        assert_eq!(path, None);
+        assert_eq!(
+            err.as_deref(),
+            Some("ERROR: [youtube] abc: Sign in to confirm")
+        );
+        assert_eq!(
+            rx.try_iter().last().as_deref(),
+            Some("[youtube] abc: Sign in to confirm")
+        );
+    }
+
+    #[test]
+    fn percent_needs_a_percent_sign() {
+        assert_eq!(parse_percent("unable to download: HTTP Error 403"), None);
+        assert_eq!(parse_percent("cookies chrome"), None);
+        assert_eq!(parse_percent("100% of 16.14KiB in 00:00:00"), Some(1.0));
+    }
+
     #[test]
     fn finds_user_local_ytdlp_path() {
         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -307,5 +524,52 @@ mod tests {
         if bin.is_file() {
             assert!(ytdlp_ready());
         }
+    }
+
+    #[test]
+    fn metadata_collection_waits_for_delayed_reader_threads() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            tx.send((
+                Some("/tmp/delayed-song.mp3".to_string()),
+                Some("reader finished".to_string()),
+            ))
+            .unwrap();
+        });
+
+        let (path, err) = collect_reader_metadata(vec![reader], rx);
+
+        assert_eq!(path, "/tmp/delayed-song.mp3");
+        assert_eq!(err, "reader finished");
+    }
+
+    #[test]
+    fn download_timeout_tracks_silence_not_total_time() {
+        let secs = Duration::from_secs;
+        assert!(!download_stalled(secs(600), secs(5)));
+        assert!(download_stalled(secs(130), secs(121)));
+        assert!(download_stalled(secs(3601), secs(0)));
+    }
+
+    #[test]
+    fn timed_out_download_does_not_wait_for_reader_threads() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (meta_tx, meta_rx) = std::sync::mpsc::channel();
+        let (_release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let reader_finished = Arc::clone(&finished);
+        let reader = std::thread::spawn(move || {
+            let _ = release_rx.recv_timeout(std::time::Duration::from_millis(200));
+            reader_finished.store(true, Ordering::SeqCst);
+            let _ = meta_tx.send((None, None));
+        });
+
+        let metadata = finish_reader_metadata(vec![reader], meta_rx, true);
+
+        assert!(metadata.is_none());
+        assert!(!finished.load(Ordering::SeqCst));
     }
 }

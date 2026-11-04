@@ -1,4 +1,5 @@
 /target
+/automix-out
 *.rs.bk
 .env
 *.log

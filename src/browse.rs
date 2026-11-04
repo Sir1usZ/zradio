@@ -13,21 +13,11 @@ pub fn is_tagged(meta: Option<&TrackMeta>) -> bool {
     meta.is_some_and(|m| !m.artist.trim().is_empty() || !m.album.trim().is_empty())
 }
 
-pub fn tagged_indices(metas: &[Option<TrackMeta>]) -> Vec<usize> {
-    metas
+pub fn filter_tagged(order: &[usize], metas: &[Option<TrackMeta>], tagged: bool) -> Vec<usize> {
+    order
         .iter()
-        .enumerate()
-        .filter(|(_, m)| is_tagged(m.as_ref()))
-        .map(|(i, _)| i)
-        .collect()
-}
-
-pub fn untagged_indices(metas: &[Option<TrackMeta>]) -> Vec<usize> {
-    metas
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| !is_tagged(m.as_ref()))
-        .map(|(i, _)| i)
+        .copied()
+        .filter(|&i| is_tagged(metas.get(i).and_then(|m| m.as_ref())) == tagged)
         .collect()
 }
 
@@ -117,8 +107,9 @@ mod tests {
                 ..TrackMeta::default()
             }),
         ];
-        assert_eq!(tagged_indices(&metas), vec![0, 3]);
-        assert_eq!(untagged_indices(&metas), vec![1, 2]);
+        let order = [3, 2, 1, 0, 9];
+        assert_eq!(filter_tagged(&order, &metas, true), vec![3, 0]);
+        assert_eq!(filter_tagged(&order, &metas, false), vec![2, 1, 9]);
     }
 
     #[test]

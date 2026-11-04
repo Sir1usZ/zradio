@@ -1,14 +1,44 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::control::ControlCmd;
 use crate::engine::Snapshot;
+
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+
+const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
+
+fn request_body_size_allowed(content_length: usize) -> bool {
+    content_length <= MAX_REQUEST_BODY_BYTES
+}
+
+fn read_head_line<R: BufRead>(
+    reader: &mut R,
+    budget: &mut usize,
+) -> std::io::Result<Option<String>> {
+    let mut line = Vec::new();
+    let n = reader
+        .by_ref()
+        .take(*budget as u64 + 1)
+        .read_until(b'\n', &mut line)?;
+    if n > *budget {
+        return Ok(None);
+    }
+    *budget -= n;
+    Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+}
+
+fn request_read_timeout() -> Duration {
+    Duration::from_secs(5)
+}
 
 // ── 共享状态：App 每个 tick 更新，API 线程读取 ────────────────────
 
@@ -106,35 +136,204 @@ struct EqRequest {
 
 // ── HTTP 服务器 ────────────────────────────────────────────────────
 
-pub fn start(tx: Sender<ControlCmd>, state: SharedState) {
-    thread::spawn(move || {
-        let Ok(listener) = TcpListener::bind("0.0.0.0:18765") else {
-            eprintln!("[api] 绑定 18765 失败");
+pub const PORT: u16 = 18765;
+
+/// 正在运行的 API 服务。默认只听本机，`set_lan(true)` 后改听局域网。
+pub struct ApiServer {
+    port: u16,
+    lan: Arc<AtomicBool>,
+    thread: thread::Thread,
+}
+
+impl ApiServer {
+    pub fn set_lan(&self, lan: bool) {
+        if self.lan.swap(lan, Ordering::SeqCst) == lan {
             return;
+        }
+        // 叫醒服务线程：绑定失败时它在 park，正常时它卡在 accept。
+        self.thread.unpark();
+        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, self.port));
+        let _ = TcpStream::connect_timeout(&local, Duration::from_millis(200));
+    }
+}
+
+pub fn start(lan: bool, tx: Sender<ControlCmd>, state: SharedState) -> ApiServer {
+    start_on(PORT, lan, token_path(), tx, state)
+}
+
+fn start_on(
+    port: u16,
+    lan: bool,
+    token_path: PathBuf,
+    tx: Sender<ControlCmd>,
+    state: SharedState,
+) -> ApiServer {
+    let lan = Arc::new(AtomicBool::new(lan));
+    let flag = Arc::clone(&lan);
+    let handle = thread::spawn(move || serve(port, &flag, &token_path, &tx, &state));
+    ApiServer {
+        port,
+        lan,
+        thread: handle.thread().clone(),
+    }
+}
+
+fn listen_addr(lan: bool, port: u16) -> SocketAddr {
+    let ip = if lan {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        Ipv4Addr::LOCALHOST
+    };
+    SocketAddr::from((ip, port))
+}
+
+fn serve(
+    port: u16,
+    lan: &AtomicBool,
+    token_path: &Path,
+    tx: &Sender<ControlCmd>,
+    state: &SharedState,
+) {
+    loop {
+        let want = lan.load(Ordering::SeqCst);
+        let addr = listen_addr(want, port);
+        let listener = match TcpListener::bind(addr) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("[api] 绑定 {addr} 失败: {e}");
+                while lan.load(Ordering::SeqCst) == want {
+                    thread::park();
+                }
+                continue;
+            }
         };
-        eprintln!("[api] 远程控制监听 0.0.0.0:18765");
+        eprintln!("[api] 远程控制监听 {addr}");
+        let token: Option<Arc<str>> = load_token(token_path, want).map(Arc::from);
+        if want && token.is_none() {
+            eprintln!("[api] 没有可用的 token，局域网请求会被拒绝");
+        }
         for stream in listener.incoming().flatten() {
+            if lan.load(Ordering::SeqCst) != want {
+                break;
+            }
+            let Ok(peer) = stream.peer_addr() else {
+                continue;
+            };
             let tx = tx.clone();
-            let state = Arc::clone(&state);
+            let state = Arc::clone(state);
+            let token = token.clone();
             thread::spawn(move || {
-                if let Err(e) = handle_connection(stream, &tx, &state) {
+                if let Err(e) = handle_connection(stream, peer.ip(), token.as_deref(), &tx, &state)
+                {
                     eprintln!("[api] 连接错误: {e}");
                 }
             });
         }
-    });
+    }
+}
+
+/// 局域网客户端要带的 token 存在这里，权限 0600。
+pub fn token_path() -> PathBuf {
+    crate::prefs::config_dir().join("api-token")
+}
+
+/// 读出 token；文件不存在或为空且 `create` 时生成一个新的写进去。
+fn load_token(path: &Path, create: bool) -> Option<String> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let existing = existing.trim();
+    if !existing.is_empty() {
+        return Some(existing.to_string());
+    }
+    if !create {
+        return None;
+    }
+    let token = random_token()?;
+    match write_private(path, &format!("{token}\n")) {
+        Ok(()) => Some(token),
+        Err(e) => {
+            eprintln!("[api] 写 {} 失败: {e}", path.display());
+            None
+        }
+    }
+}
+
+fn random_token() -> Option<String> {
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    // 文件已存在时 mode() 不生效，先收紧权限再写内容
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    file.write_all(contents.as_bytes())
+}
+
+/// 本机来、且 `Host` 也是本机名字的请求直接放行；其余必须带 `Authorization: Bearer <token>`。
+/// 只看连接来源不够：DNS rebinding 能让别的网站的页面从本机连进来，那时 `Host` 是它的域名。
+fn authorized(peer: IpAddr, host: Option<&str>, bearer: Option<&str>, token: Option<&str>) -> bool {
+    if peer.to_canonical().is_loopback() && host.is_none_or(host_is_loopback) {
+        return true;
+    }
+    match (bearer, token) {
+        (Some(bearer), Some(token)) if !token.is_empty() => {
+            constant_time_eq(bearer.as_bytes(), token.as_bytes())
+        }
+        _ => false,
+    }
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name == "localhost"
+        || name.ends_with(".localhost")
+        || name
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn bearer_token(authorization: &str) -> Option<&str> {
+    let (scheme, token) = authorization.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim())
+        .filter(|t| !t.is_empty())
 }
 
 fn handle_connection(
     mut stream: TcpStream,
+    peer: IpAddr,
+    token: Option<&str>,
     tx: &Sender<ControlCmd>,
     state: &SharedState,
 ) -> std::io::Result<()> {
     let reader = stream.try_clone()?;
+    reader.set_read_timeout(Some(request_read_timeout()))?;
     let mut buf_reader = BufReader::new(reader);
 
-    let mut request_line = String::new();
-    buf_reader.read_line(&mut request_line)?;
+    let mut budget = MAX_REQUEST_HEAD_BYTES;
+    let Some(request_line) = read_head_line(&mut buf_reader, &mut budget)? else {
+        return send_json(&mut stream, 431, &err("request head too large"));
+    };
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         return send_json(&mut stream, 400, &err("bad request"));
@@ -144,16 +343,32 @@ fn handle_connection(
     let path = parts[1];
 
     let mut content_length: usize = 0;
+    let mut host = None;
+    let mut origin = None;
+    let mut authorization = None;
     loop {
-        let mut line = String::new();
-        buf_reader.read_line(&mut line)?;
-        let trimmed = line.trim().to_lowercase();
+        let Some(line) = read_head_line(&mut buf_reader, &mut budget)? else {
+            return send_json(&mut stream, 431, &err("request head too large"));
+        };
+        let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
         }
-        if let Some(val) = trimmed.strip_prefix("content-length:") {
-            content_length = val.trim().parse().unwrap_or(0);
+        let Some((name, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-length" => content_length = value.parse().unwrap_or(0),
+            "host" => host = Some(value.to_string()),
+            "origin" => origin = Some(value.to_string()),
+            "authorization" => authorization = Some(value.to_string()),
+            _ => {}
         }
+    }
+
+    if !request_body_size_allowed(content_length) {
+        return send_json(&mut stream, 413, &err("request body too large"));
     }
 
     let body = if content_length > 0 {
@@ -164,8 +379,21 @@ fn handle_connection(
         String::new()
     };
 
+    let bearer = authorization.as_deref().and_then(bearer_token);
+    if !authorized(peer, host.as_deref(), bearer, token) {
+        return send_json(&mut stream, 401, &err("missing or wrong API token"));
+    }
+
+    if !origin_allowed(origin.as_deref(), host.as_deref()) {
+        return send_json(
+            &mut stream,
+            403,
+            &err("cross-origin requests are not allowed"),
+        );
+    }
+
     if method == "OPTIONS" {
-        return send_cors_preflight(&mut stream);
+        return send_options(&mut stream);
     }
 
     if method == "GET" && (path == "/" || path == "/index.html") && web_remote_enabled(state) {
@@ -186,6 +414,22 @@ fn handle_connection(
 
     let response = route(method, path, &body, tx, state);
     send_json(&mut stream, 200, &response)
+}
+
+/// 浏览器给跨站请求带 `Origin`。只放行和 `Host` 同源的页面，
+/// 这样别的网站既读不到资料库，也不能用表单 POST 控制播放。
+/// curl、MCP 这类非浏览器客户端不带 `Origin`，照常放行。
+fn origin_allowed(origin: Option<&str>, host: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    let authority = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"));
+    match (authority, host) {
+        (Some(authority), Some(host)) => authority.eq_ignore_ascii_case(host),
+        _ => false,
+    }
 }
 
 fn route(
@@ -655,6 +899,9 @@ fn handle_control(body: &str, tx: &Sender<ControlCmd>, state: &SharedState) -> s
         // ── EQ ──
         "eq" => {
             let band = req.index.unwrap_or(0);
+            if band >= crate::eq::BANDS {
+                return err("band must be 0-4");
+            }
             let db = req.value.unwrap_or(0.0);
             ControlCmd::SetEq(band, db)
         }
@@ -698,6 +945,9 @@ fn handle_import(body: &str, tx: &Sender<ControlCmd>) -> serde_json::Value {
         Ok(r) => r,
         Err(e) => return err(format!("bad json: {e}")),
     };
+    if !crate::fetch::looks_like_media_url(&req.url) {
+        return err("need a youtube or bilibili url");
+    }
     if let Err(response) = enqueue_control(tx, ControlCmd::Import(req.url.clone())) {
         return response;
     }
@@ -723,6 +973,9 @@ fn handle_eq(body: &str, tx: &Sender<ControlCmd>) -> serde_json::Value {
         Ok(r) => r,
         Err(e) => return err(format!("bad json: {e}")),
     };
+    if req.band >= crate::eq::BANDS {
+        return err("band must be 0-4");
+    }
     if let Err(response) = enqueue_control(tx, ControlCmd::SetEq(req.band, req.db)) {
         return response;
     }
@@ -863,20 +1116,25 @@ fn enqueue_control(tx: &Sender<ControlCmd>, cmd: ControlCmd) -> Result<(), serde
     tx.send(cmd).map_err(|_| err("control unavailable"))
 }
 
-fn send_bytes(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> std::io::Result<()> {
-    let status_text = match status {
+fn http_status_text(status: u16) -> &'static str {
+    match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
         _ => "Error",
-    };
+    }
+}
+
+fn send_bytes(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> std::io::Result<()> {
+    let status_text = http_status_text(status);
     let header = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: {mime}\r\n\
          Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
          Connection: close\r\n\r\n",
         body.len()
     );
@@ -887,19 +1145,11 @@ fn send_bytes(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> s
 
 fn send_json(stream: &mut TcpStream, status: u16, body: &serde_json::Value) -> std::io::Result<()> {
     let json = serde_json::to_vec(body).unwrap_or_default();
-    let status_text = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        _ => "Error",
-    };
+    let status_text = http_status_text(status);
     let header = format!(
         "HTTP/1.1 {status} {status_text}\r\n\
          Content-Type: application/json; charset=utf-8\r\n\
          Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
          Connection: close\r\n\r\n",
         json.len()
     );
@@ -908,11 +1158,9 @@ fn send_json(stream: &mut TcpStream, status: u16, body: &serde_json::Value) -> s
     Ok(())
 }
 
-fn send_cors_preflight(stream: &mut TcpStream) -> std::io::Result<()> {
+fn send_options(stream: &mut TcpStream) -> std::io::Result<()> {
     let header = "HTTP/1.1 204 No Content\r\n\
-                  Access-Control-Allow-Origin: *\r\n\
-                  Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-                  Access-Control-Allow-Headers: Content-Type\r\n\
+                  Allow: GET, POST, OPTIONS\r\n\
                   Content-Length: 0\r\n\
                   Connection: close\r\n\r\n";
     stream.write_all(header.as_bytes())
@@ -925,6 +1173,338 @@ fn send_cors_preflight(stream: &mut TcpStream) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_body_limit_allows_64_kib_and_rejects_more() {
+        assert!(request_body_size_allowed(65_536));
+        assert!(!request_body_size_allowed(65_537));
+        assert_eq!(http_status_text(413), "Payload Too Large");
+    }
+
+    #[test]
+    fn request_head_reads_stop_at_the_byte_budget() {
+        let mut budget = MAX_REQUEST_HEAD_BYTES;
+        let mut endless = BufReader::new(std::io::repeat(b'a'));
+        assert!(read_head_line(&mut endless, &mut budget).unwrap().is_none());
+
+        let mut budget = MAX_REQUEST_HEAD_BYTES;
+        let mut flood = std::io::Cursor::new(b"X-Pad: 1\r\n".repeat(4000));
+        let mut lines = 0;
+        while read_head_line(&mut flood, &mut budget).unwrap().is_some() {
+            lines += 1;
+        }
+        assert!(lines < 4000, "header count must be bounded, read {lines}");
+
+        let mut budget = MAX_REQUEST_HEAD_BYTES;
+        let mut req = std::io::Cursor::new(b"GET /status HTTP/1.1\r\n\r\n".to_vec());
+        let line = read_head_line(&mut req, &mut budget).unwrap().unwrap();
+        assert_eq!(line, "GET /status HTTP/1.1\r\n");
+        assert_eq!(budget, MAX_REQUEST_HEAD_BYTES - line.len());
+        assert_eq!(http_status_text(431), "Request Header Fields Too Large");
+    }
+
+    #[test]
+    fn oversized_header_line_gets_431_instead_of_buffering() {
+        let mut req = b"GET /status HTTP/1.1\r\nX-Pad: ".to_vec();
+        req.resize(MAX_REQUEST_HEAD_BYTES + 1, b'a');
+        let resp = serve_once(&req);
+        assert!(resp.starts_with("HTTP/1.1 431 "), "got {resp:?}");
+
+        let body = r#"{"url":"https://youtu.be/tRsQsTMvPNg"}"#;
+        let req = format!(
+            "POST /import HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let resp = serve_once(req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 200 "), "got {resp:?}");
+        assert!(resp.contains(r#""ok":true"#), "got {resp:?}");
+    }
+
+    fn serve_once(req: &[u8]) -> String {
+        serve_queued(req).0
+    }
+
+    fn serve_queued(req: &[u8]) -> (String, Vec<ControlCmd>) {
+        serve_from(IpAddr::from(Ipv4Addr::LOCALHOST), None, req)
+    }
+
+    /// 假装请求来自 `peer`、服务端 token 是 `token`，返回响应和排进控制队列的命令。
+    fn serve_from(peer: IpAddr, token: Option<&str>, req: &[u8]) -> (String, Vec<ControlCmd>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = token.map(str::to_string);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = handle_connection(stream, peer, token.as_deref(), &tx, &new_shared_state());
+            rx.try_iter().collect::<Vec<_>>()
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        client.write_all(req).unwrap();
+        let mut resp = String::new();
+        let _ = client.read_to_string(&mut resp);
+        let queued = server.join().unwrap();
+        (resp, queued)
+    }
+
+    fn post_next(headers: &str) -> String {
+        let body = r#"{"action":"next"}"#;
+        format!(
+            "POST /control HTTP/1.1\r\n{headers}Content-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn cross_origin_pages_can_neither_read_nor_control() {
+        let (resp, queued) =
+            serve_queued(b"GET /library/full HTTP/1.1\r\nHost: localhost:18765\r\nOrigin: https://evil.example\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 403 "), "got {resp:?}");
+        assert!(!resp.contains("tracks"), "got {resp:?}");
+        assert!(queued.is_empty());
+
+        let req = post_next("Host: 127.0.0.1:18765\r\nOrigin: http://evil.example\r\n");
+        let (resp, queued) = serve_queued(req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 403 "), "got {resp:?}");
+        assert!(
+            queued.is_empty(),
+            "a cross-site form post must not queue {queued:?}"
+        );
+
+        let req = post_next("Host: 127.0.0.1:18765\r\nOrigin: null\r\n");
+        let (resp, queued) = serve_queued(req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 403 "), "got {resp:?}");
+        assert!(queued.is_empty());
+
+        let resp = serve_once(
+            b"OPTIONS /control HTTP/1.1\r\nHost: localhost:18765\r\nOrigin: https://evil.example\r\nAccess-Control-Request-Method: POST\r\n\r\n",
+        );
+        assert!(
+            !resp
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "got {resp:?}"
+        );
+    }
+
+    #[test]
+    fn lan_clients_need_the_token() {
+        let phone = IpAddr::from([192, 168, 1, 23]);
+        let (resp, _) = serve_from(
+            phone,
+            Some("s3cret"),
+            b"GET /library/full HTTP/1.1\r\nHost: 192.168.1.5:18765\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+        assert!(!resp.contains("tracks"), "got {resp:?}");
+
+        for auth in [
+            "",
+            "Authorization: Bearer wrong\r\n",
+            "Authorization: s3cret\r\n",
+        ] {
+            let req = post_next(&format!("Host: 192.168.1.5:18765\r\n{auth}"));
+            let (resp, queued) = serve_from(phone, Some("s3cret"), req.as_bytes());
+            assert!(resp.starts_with("HTTP/1.1 401 "), "{auth:?} got {resp:?}");
+            assert!(queued.is_empty(), "{auth:?} queued {queued:?}");
+        }
+
+        for auth in [
+            "Authorization: Bearer s3cret\r\n",
+            "authorization: bearer s3cret\r\n",
+        ] {
+            let req = post_next(&format!("Host: 192.168.1.5:18765\r\n{auth}"));
+            let (resp, queued) = serve_from(phone, Some("s3cret"), req.as_bytes());
+            assert!(resp.starts_with("HTTP/1.1 200 "), "{auth:?} got {resp:?}");
+            assert!(matches!(queued[..], [ControlCmd::Next]), "got {queued:?}");
+        }
+
+        // 没有 token（文件写不出来）时局域网一律拒绝，空 Bearer 也不算数
+        let req = post_next("Host: 192.168.1.5:18765\r\nAuthorization: Bearer \r\n");
+        let (resp, queued) = serve_from(phone, None, req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn loopback_clients_need_no_token() {
+        for peer in [
+            IpAddr::from(Ipv4Addr::LOCALHOST),
+            IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+        ] {
+            let req = post_next("Host: localhost:18765\r\n");
+            let (resp, queued) = serve_from(peer, Some("s3cret"), req.as_bytes());
+            assert!(resp.starts_with("HTTP/1.1 200 "), "{peer} got {resp:?}");
+            assert!(matches!(queued[..], [ControlCmd::Next]), "got {queued:?}");
+        }
+    }
+
+    #[test]
+    fn dns_rebinding_pages_are_treated_as_remote() {
+        let me = IpAddr::from(Ipv4Addr::LOCALHOST);
+        // evil.example 的 DNS 被换成 127.0.0.1：连接来自本机，Host 和 Origin 却是攻击者的域名
+        let req = b"GET /library/full HTTP/1.1\r\nHost: evil.example:18765\r\nOrigin: http://evil.example:18765\r\n\r\n";
+        for token in [Some("s3cret"), None] {
+            let (resp, _) = serve_from(me, token, req);
+            assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+            assert!(!resp.contains("tracks"), "got {resp:?}");
+        }
+        let req = post_next("Host: evil.example:18765\r\nOrigin: http://evil.example:18765\r\n");
+        let (resp, queued) = serve_from(me, None, req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 401 "), "got {resp:?}");
+        assert!(queued.is_empty(), "queued {queued:?}");
+
+        for host in [
+            "localhost:18765",
+            "LOCALHOST",
+            "localhost.:18765",
+            "zradio.localhost:18765",
+            "127.0.0.1:18765",
+            "127.0.0.2",
+            "[::1]:18765",
+        ] {
+            let req = format!("GET /health HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            let (resp, _) = serve_from(me, None, req.as_bytes());
+            assert!(resp.starts_with("HTTP/1.1 200 "), "{host} got {resp:?}");
+        }
+
+        let req =
+            b"GET /health HTTP/1.1\r\nHost: myhost:18765\r\nAuthorization: Bearer s3cret\r\n\r\n";
+        let (resp, _) = serve_from(me, Some("s3cret"), req);
+        assert!(resp.starts_with("HTTP/1.1 200 "), "got {resp:?}");
+    }
+
+    #[test]
+    fn api_token_is_created_private_and_kept() {
+        let dir = std::env::temp_dir().join(format!("zradio-api-token-{}", std::process::id()));
+        let path = dir.join("api-token");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(load_token(&path, false), None);
+        assert!(!path.exists(), "only switching LAN on may create the token");
+
+        let token = load_token(&path, true).unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(load_token(&path, true).as_deref(), Some(token.as_str()));
+        assert_eq!(load_token(&path, false).as_deref(), Some(token.as_str()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "token file mode {mode:o}");
+        }
+
+        std::fs::write(&path, "  my-phone-key \n").unwrap();
+        assert_eq!(load_token(&path, true).as_deref(), Some("my-phone-key"));
+        std::fs::write(&path, "\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let fresh = load_token(&path, true).unwrap();
+        assert_ne!(fresh, token);
+        assert_eq!(fresh.len(), 64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "rewritten token file mode {mode:o}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_origin_and_non_browser_clients_still_work() {
+        let req = post_next("Host: localhost:18765\r\nOrigin: http://localhost:18765\r\n");
+        let (resp, queued) = serve_queued(req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 200 "), "got {resp:?}");
+        assert!(matches!(queued[..], [ControlCmd::Next]), "got {queued:?}");
+
+        let req = post_next("Host: 127.0.0.1:18765\r\n");
+        let (resp, queued) = serve_queued(req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 200 "), "got {resp:?}");
+        assert!(matches!(queued[..], [ControlCmd::Next]), "got {queued:?}");
+        assert!(
+            !resp
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "got {resp:?}"
+        );
+    }
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn answers(addr: SocketAddr) -> bool {
+        let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
+            return false;
+        };
+        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+        if s.write_all(b"GET /health HTTP/1.1\r\n\r\n").is_err() {
+            return false;
+        }
+        let mut resp = String::new();
+        let _ = s.read_to_string(&mut resp);
+        resp.contains(r#""ok":true"#)
+    }
+
+    fn eventually(mut check: impl FnMut() -> bool) -> bool {
+        (0..100).any(|_| {
+            check() || {
+                thread::sleep(Duration::from_millis(20));
+                false
+            }
+        })
+    }
+
+    // Linux 上整个 127.0.0.0/8 都是本机：绑 0.0.0.0 时 127.0.0.2 连得上，
+    // 只绑 127.0.0.1 时连不上，借此看出服务有没有对外开放。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn api_listens_on_loopback_until_lan_is_switched_on() {
+        let port = free_port();
+        let dir = std::env::temp_dir().join(format!("zradio-api-bind-{}", std::process::id()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let server = start_on(port, false, dir.join("api-token"), tx, new_shared_state());
+        let local = SocketAddr::from(([127, 0, 0, 1], port));
+        let other = SocketAddr::from(([127, 0, 0, 2], port));
+        assert!(eventually(|| answers(local)));
+        assert!(
+            !answers(other),
+            "the API must not listen beyond loopback by default"
+        );
+
+        server.set_lan(true);
+        assert!(
+            eventually(|| answers(other)),
+            "switching LAN on must rebind"
+        );
+        assert!(answers(local));
+
+        server.set_lan(false);
+        assert!(
+            eventually(|| !answers(other)),
+            "switching LAN off must rebind"
+        );
+        assert!(answers(local));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn request_reads_have_a_five_second_inactivity_timeout() {
+        assert_eq!(request_read_timeout(), std::time::Duration::from_secs(5));
+    }
 
     #[test]
     fn ok_response_structure() {
@@ -941,13 +1521,38 @@ mod tests {
     }
 
     #[test]
+    fn eq_rejects_unknown_bands_before_queueing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state = new_shared_state();
+        assert_eq!(handle_eq(r#"{"band":5,"db":3.0}"#, &tx)["ok"], false);
+        let resp = handle_control(r#"{"action":"eq","index":7,"value":3.0}"#, &tx, &state);
+        assert_eq!(resp["ok"], false);
+        assert!(rx.try_recv().is_err());
+
+        assert_eq!(handle_eq(r#"{"band":4,"db":3.0}"#, &tx)["ok"], true);
+        assert!(matches!(rx.try_recv(), Ok(ControlCmd::SetEq(4, db)) if db == 3.0));
+    }
+
+    #[test]
+    fn import_rejects_non_media_urls_before_queueing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let resp = handle_import(r#"{"url":"https://evil.example/youtube.com/x"}"#, &tx);
+        assert_eq!(resp["ok"], false);
+        assert!(rx.try_recv().is_err());
+
+        let resp = handle_import(r#"{"url":"https://youtu.be/tRsQsTMvPNg"}"#, &tx);
+        assert_eq!(resp["ok"], true);
+        assert!(matches!(rx.try_recv(), Ok(ControlCmd::Import(_))));
+    }
+
+    #[test]
     fn disconnected_control_handlers_report_unavailable() {
         let (tx, rx) = std::sync::mpsc::channel();
         drop(rx);
         let state = new_shared_state();
         let responses = [
             handle_control(r#"{"action":"play"}"#, &tx, &state),
-            handle_import(r#"{"url":"https://example.com/song"}"#, &tx),
+            handle_import(r#"{"url":"https://youtu.be/tRsQsTMvPNg"}"#, &tx),
             handle_library_scan(&tx),
             handle_meta_scan(&tx),
             handle_eq(r#"{"band":2,"db":4.5}"#, &tx),
@@ -1137,10 +1742,11 @@ mod tests {
         info.has_cover = true;
         let state = Arc::new(Mutex::new(ApiSnapshot {
             library: vec![sample_track(0, "A"), info],
-            cover_paths: vec![None, Some(path)],
+            cover_paths: vec![None, Some(path.clone())],
             ..Default::default()
         }));
         let resp = handle_track("/track/1", &state);
+        let _ = std::fs::remove_file(&path);
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["data"]["info"]["title"], "B");
         assert_eq!(resp["data"]["cover"]["mime"], "image/jpeg");
@@ -1163,10 +1769,11 @@ mod tests {
         info.has_cover = true;
         let state = Arc::new(Mutex::new(ApiSnapshot {
             library: vec![info],
-            cover_paths: vec![Some(path)],
+            cover_paths: vec![Some(path.clone())],
             ..Default::default()
         }));
         let resp = handle_library_full(&state);
+        let _ = std::fs::remove_file(&path);
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("secret"));
         assert!(!json.contains("image/jpeg"));
@@ -1179,10 +1786,12 @@ mod tests {
         let path = temp_cover(jpeg, "jpg");
         let state = Arc::new(Mutex::new(ApiSnapshot {
             library: vec![sample_track(2, "C")],
-            cover_paths: vec![None, None, Some(path)],
+            cover_paths: vec![None, None, Some(path.clone())],
             ..Default::default()
         }));
-        let (mime, bytes) = cover_bytes_for("/cover/2", &state).expect("cover");
+        let found = cover_bytes_for("/cover/2", &state);
+        let _ = std::fs::remove_file(&path);
+        let (mime, bytes) = found.expect("cover");
         assert_eq!(mime, "image/jpeg");
         assert_eq!(bytes, jpeg);
         assert!(cover_bytes_for("/cover/0", &state).is_none());

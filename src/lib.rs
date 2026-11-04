@@ -1,6 +1,9 @@
+#[cfg(unix)]
+pub(crate) mod alsa_log;
 pub mod analysis;
 pub mod api;
 pub mod automix;
+pub mod beat_this;
 pub mod browse;
 pub mod cava;
 pub mod control;
@@ -11,12 +14,15 @@ pub mod dsp;
 pub mod engine;
 pub mod eq;
 pub mod fetch;
+pub mod greeting;
 pub mod library;
 pub mod meta;
+pub mod mixdown;
 pub mod mpris;
 pub mod playlist;
 pub mod prefs;
 pub mod progress;
+pub mod regrid;
 pub mod remix;
 pub mod remote_meta;
 pub mod scope;
@@ -25,7 +31,9 @@ pub mod session_store;
 pub mod shell;
 pub mod spectrum;
 pub mod splayer;
+pub mod stems;
 pub(crate) mod storage;
+pub mod stretch;
 pub mod taste;
 pub mod ui;
 

@@ -38,9 +38,9 @@ impl RemixMode {
     }
 }
 
-pub fn apply_remix(buf: &AudioBuf, mode: RemixMode) -> AudioBuf {
+pub fn apply_remix(buf: AudioBuf, mode: RemixMode) -> AudioBuf {
     if mode == RemixMode::Off || buf.samples.is_empty() {
-        return buf.clone();
+        return buf;
     }
     let mut samples = if (mode.rate() - 1.0).abs() > 0.001 {
         let in_rate = ((buf.sample_rate as f32) * mode.rate()).round() as u32;
@@ -52,7 +52,7 @@ pub fn apply_remix(buf: &AudioBuf, mode: RemixMode) -> AudioBuf {
             buf.sample_rate,
         )
     } else {
-        buf.samples.clone()
+        buf.samples
     };
     match mode {
         RemixMode::Chill => {
@@ -131,9 +131,9 @@ mod tests {
             sample_rate: 48_000,
             channels: 2,
         };
-        let night = apply_remix(&buf, RemixMode::Nightcore);
+        let night = apply_remix(buf.clone(), RemixMode::Nightcore);
         assert!(night.frames() < buf.frames());
-        let off = apply_remix(&buf, RemixMode::Off);
+        let off = apply_remix(buf.clone(), RemixMode::Off);
         assert_eq!(off.frames(), buf.frames());
     }
 }

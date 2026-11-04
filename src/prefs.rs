@@ -162,6 +162,16 @@ pub struct Prefs {
     pub sort_mode: SortMode,
     #[serde(default)]
     pub shuffle_mode: ShuffleMode,
+    /// Rescore tracks with Beat This! for AutoMix; on only once its model has been fetched.
+    #[serde(default)]
+    pub beat_this: bool,
+    /// Separate the singers' voices in AutoMix overlaps, so only one is heard at a time; on
+    /// only once the htdemucs model has been fetched.
+    #[serde(default)]
+    pub stems: bool,
+    /// API 是否对局域网开放；关着时只有本机能连。
+    #[serde(default)]
+    pub api_lan: bool,
     /// Optional browser remote. Off keeps the prefs file unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     pub web_remote: bool,
@@ -184,6 +194,9 @@ impl Default for Prefs {
             eq_db: [0.0; 5],
             sort_mode: SortMode::Path,
             shuffle_mode: ShuffleMode::Off,
+            beat_this: false,
+            stems: false,
+            api_lan: false,
             web_remote: false,
         }
     }
@@ -223,12 +236,16 @@ impl Prefs {
     }
 }
 
-fn prefs_path() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("zradio").join("prefs.json")
+    base.join("zradio")
+}
+
+fn prefs_path() -> PathBuf {
+    config_dir().join("prefs.json")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -368,6 +385,39 @@ mod tests {
             t = t.next();
         }
         assert_eq!(t.next(), ThemeName::System);
+    }
+
+    #[test]
+    fn prefs_saved_before_the_lan_switch_still_load_with_lan_off() {
+        let mut old = serde_json::to_value(Prefs::default()).unwrap();
+        old.as_object_mut().unwrap().remove("api_lan");
+        let prefs: Prefs = serde_json::from_value(old).unwrap();
+        assert!(!prefs.api_lan);
+        assert!(!Prefs::default().api_lan);
+    }
+
+    #[test]
+    fn prefs_saved_before_beat_this_still_load() {
+        let mut saved = serde_json::to_value(Prefs {
+            resume: false,
+            ..Prefs::default()
+        })
+        .unwrap();
+        saved.as_object_mut().unwrap().remove("beat_this");
+        let loaded: Prefs = serde_json::from_value(saved).expect("an older prefs file loads");
+        assert!(!loaded.resume && !loaded.beat_this);
+    }
+
+    #[test]
+    fn prefs_saved_before_stems_still_load() {
+        let mut saved = serde_json::to_value(Prefs {
+            beat_this: true,
+            ..Prefs::default()
+        })
+        .unwrap();
+        saved.as_object_mut().unwrap().remove("stems");
+        let loaded: Prefs = serde_json::from_value(saved).expect("an older prefs file loads");
+        assert!(loaded.beat_this && !loaded.stems);
     }
 
     #[test]

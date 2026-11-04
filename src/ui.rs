@@ -1,8 +1,8 @@
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, stdout};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -33,22 +33,28 @@ use crate::drawer::{
     drawer_open_height, drawer_rect, drawer_rows, list_title, wrap_idx, DrawerAnim, DRAWER_SLOTS,
 };
 use crate::dsp::MixMode;
-use crate::engine::{load_track, Player, Snapshot};
+use crate::engine::{load_track, Mixer, Player, PreparedBend, Snapshot, VocalJob, VocalOverlay};
 use crate::eq::Equalizer;
-use crate::fetch::{self, looks_like_media_url};
+use crate::fetch::{self, find_media_url};
+use crate::greeting::{
+    greeting_line, greeting_origin, greeting_overlay, local_hour, music_split, overlay_escape,
+    system_name, GreetingAnim, GREET_SCALE,
+};
 use crate::library::{scan_library, sort_indices, track_from_path, Track};
 use crate::meta::{
     apply_peek, load_meta, lyric_fill, lyric_progress, lyric_window, needs_fetch, peek_tags,
-    TrackMeta,
+    sort_key_changed, TrackMeta,
 };
 use crate::mpris::{MediaCmd, Mpris};
 use crate::playlist::{store_path, PlaylistStore};
 use crate::prefs::{Palette, Prefs, ShuffleMode};
 use crate::progress::{self, TransferBar};
+use crate::regrid;
 use crate::remix::{apply_remix, RemixMode};
 use crate::session_store::SessionState;
 use crate::shell::{format_listen_time, Tab};
 use crate::splayer;
+use crate::stems;
 use crate::taste::TasteStore;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -82,6 +88,17 @@ fn decode_request_is_current(
     inflight == Some(completed) && completed.track.matches(generation, tracks)
 }
 
+/// Renders the outgoing tail on the decode worker; the mixer is locked only to snapshot it.
+fn prepare_bend(
+    mixer: &Mutex<Mixer>,
+    index: usize,
+    next: &TrackAnalysis,
+    skip: bool,
+) -> Option<PreparedBend> {
+    let job = mixer.lock().ok()?.bend_job(index, next, skip)?;
+    Some(job.render())
+}
+
 fn receive_batch<T>(rx: &Receiver<T>, limit: usize) -> Vec<T> {
     let mut items = Vec::with_capacity(limit);
     while items.len() < limit {
@@ -93,17 +110,109 @@ fn receive_batch<T>(rx: &Receiver<T>, limit: usize) -> Vec<T> {
     items
 }
 
+fn advance_animations(drawer: &mut DrawerAnim, greeting: &mut GreetingAnim, elapsed: Duration) {
+    let dt_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    drawer.tick(dt_ms);
+    greeting.tick(dt_ms);
+}
+
+struct CleanupGuard<F: FnOnce()> {
+    cleanup: Option<F>,
+}
+
+impl<F: FnOnce()> CleanupGuard<F> {
+    fn new(cleanup: F) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for CleanupGuard<F> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+fn restore_terminal() -> io::Result<()> {
+    let raw_result = disable_raw_mode();
+    let screen_result = execute!(
+        io::stdout(),
+        crossterm::event::DisableBracketedPaste,
+        DisableFocusChange,
+        LeaveAlternateScreen
+    );
+    raw_result?;
+    screen_result
+}
+
 struct DecodeJob {
     id: DecodeRequestId,
     transition: bool,
     skip: bool,
     buf: AudioBuf,
     analysis: TrackAnalysis,
+    bend: Option<PreparedBend>,
 }
 
 struct DecodeFailure {
     id: DecodeRequestId,
     error: String,
+}
+
+/// A model being fetched.
+struct ModelFetch {
+    progress: Receiver<String>,
+    done: Receiver<Result<PathBuf, String>>,
+    percent: String,
+}
+
+impl ModelFetch {
+    /// Runs `fetch` on its own thread, which reports progress as "42%".
+    fn spawn(
+        fetch: impl FnOnce(Option<Sender<String>>) -> anyhow::Result<PathBuf> + Send + 'static,
+    ) -> Self {
+        let (progress_tx, progress) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        thread::spawn(move || {
+            let fetched = fetch(Some(progress_tx));
+            let _ = done_tx.send(fetched.map_err(|e| e.to_string()));
+        });
+        Self {
+            progress,
+            done,
+            percent: "0%".into(),
+        }
+    }
+
+    /// The fetch's result once it is done; until then None, keeping `percent` current.
+    fn poll(&mut self) -> Option<Result<PathBuf, String>> {
+        while let Ok(p) = self.progress.try_recv() {
+            self.percent = p;
+        }
+        match self.done.try_recv() {
+            Ok(r) => Some(r),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err("the download thread died".into())),
+        }
+    }
+}
+
+/// A model setting's row: whether the build has it, how far its fetch is, or on/off.
+fn model_label(built: bool, fetch: Option<&ModelFetch>, on: bool) -> String {
+    if !built {
+        return "未编译".into();
+    }
+    match fetch {
+        Some(fetch) => format!("下载模型 {}", fetch.percent),
+        None => on_off(on).into(),
+    }
 }
 
 struct PeekJob {
@@ -219,8 +328,19 @@ pub struct App {
     browse_kind: BrowseKind,
     meta_queue: VecDeque<usize>,
     meta_inflight: HashSet<TrackJobId>,
+    /// Beat This! rescoring: started on first use, one track at a time.
+    regrid: Option<regrid::Worker<TrackJobId>>,
+    regrid_queue: regrid::Queue<TrackJobId>,
+    /// Rescored analyses the mixer gets once no mix planned on the old ones is pending.
+    regrid_ready: Vec<(TrackJobId, TrackAnalysis)>,
+    /// The track playing when the tracks around it were last queued.
+    regrid_around: Option<TrackJobId>,
+    model_fetch: Option<ModelFetch>,
+    stems_fetch: Option<ModelFetch>,
+    vocal_worker: Option<stems::Worker<VocalJob, Option<VocalOverlay>>>,
     /// 远程控制 API 共享状态
     api_state: api::SharedState,
+    api_server: api::ApiServer,
     playlists: PlaylistStore,
     lib_row: usize,
     lib_state: ListState,
@@ -230,10 +350,15 @@ pub struct App {
     context_from: Overlay,
     drawer: DrawerAnim,
     drawer_idx: usize,
+    greeting: GreetingAnim,
+    greeting_text: String,
+    greeting_overlay: Option<crate::greeting::GreetingOverlay>,
+    greeting_overlay_sent: Option<crate::greeting::GreetingOverlay>,
     range_cache: Vec<RangeRow>,
     sorted_idx: Vec<usize>,
     api_dirty: bool,
     taste_dirty: bool,
+    peek_sort_dirty: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,10 +449,10 @@ impl App {
         let (control_tx, control_rx) = mpsc::channel();
         let mut login_poller = LoginPoller::new();
         login_poller.request();
-        // 新版 JSON API 替代旧 TCP 控制，监听 0.0.0.0:18765
-        let api_state = api::new_shared_state();
-        api::start(control_tx, Arc::clone(&api_state));
         let mut prefs = Prefs::load();
+        // 新版 JSON API 替代旧 TCP 控制：默认只听 127.0.0.1:18765，设置里可开局域网
+        let api_state = api::new_shared_state();
+        let api_server = api::start(prefs.api_lan, control_tx, Arc::clone(&api_state));
         if prefs.library.trim().is_empty() {
             prefs.set_library(&root);
         }
@@ -405,7 +530,15 @@ impl App {
             browse_kind: BrowseKind::All,
             meta_queue: VecDeque::new(),
             meta_inflight: HashSet::new(),
+            regrid: None,
+            regrid_queue: regrid::Queue::default(),
+            regrid_ready: Vec::new(),
+            regrid_around: None,
+            model_fetch: None,
+            stems_fetch: None,
+            vocal_worker: None,
             api_state,
+            api_server,
             playlists: PlaylistStore::load(),
             lib_row: 0,
             lib_state: ListState::default(),
@@ -415,10 +548,15 @@ impl App {
             context_from: Overlay::None,
             drawer: DrawerAnim::closed(),
             drawer_idx: 0,
+            greeting: GreetingAnim::new(),
+            greeting_text: greeting_line(local_hour(), &system_name()),
+            greeting_overlay: None,
+            greeting_overlay_sent: None,
             range_cache: Vec::new(),
             sorted_idx: Vec::new(),
             api_dirty: true,
             taste_dirty: false,
+            peek_sort_dirty: false,
         };
         app.rebuild_range_cache();
         app.push_taste();
@@ -452,6 +590,9 @@ impl App {
         self.pending_seek = None;
         self.meta_queue.clear();
         self.meta_inflight.clear();
+        self.regrid_queue.clear();
+        self.regrid_ready.clear();
+        self.regrid_around = None;
     }
 
     fn persist_playlists(&mut self) -> bool {
@@ -600,14 +741,7 @@ impl App {
                 .collect()
         } else {
             match self.playlists.current_list() {
-                Some(list) => list
-                    .paths
-                    .iter()
-                    .map(|p| match self.tracks.iter().position(|t| &t.path == p) {
-                        Some(i) => RangeRow::Present(i),
-                        None => RangeRow::Missing(p.clone()),
-                    })
-                    .collect(),
+                Some(list) => playlist_rows(&list.paths, &self.tracks),
                 None => Vec::new(),
             }
         };
@@ -626,21 +760,10 @@ impl App {
         }
         match self.browse_kind {
             BrowseKind::All => self.sorted_idx.iter().copied().map(LibRow::Track).collect(),
-            BrowseKind::Tagged => {
-                let tagged = browse::tagged_indices(&self.metas);
-                self.sorted_idx
-                    .iter()
-                    .copied()
-                    .filter(|i| tagged.contains(i))
-                    .map(LibRow::Track)
-                    .collect()
-            }
-            BrowseKind::Untagged => {
-                let untagged = browse::untagged_indices(&self.metas);
-                self.sorted_idx
-                    .iter()
-                    .copied()
-                    .filter(|i| untagged.contains(i))
+            BrowseKind::Tagged | BrowseKind::Untagged => {
+                let tagged = self.browse_kind == BrowseKind::Tagged;
+                browse::filter_tagged(&self.sorted_idx, &self.metas, tagged)
+                    .into_iter()
                     .map(LibRow::Track)
                     .collect()
             }
@@ -770,11 +893,11 @@ impl App {
         list_title(slot, &name, n)
     }
 
-    fn drawer_names(&self) -> Vec<String> {
+    fn drawer_lists(&self) -> Vec<(String, bool)> {
         self.playlists
             .lists
             .iter()
-            .map(|list| list.name.clone())
+            .map(|list| (list.name.clone(), list.paths.is_empty()))
             .collect()
     }
 
@@ -951,17 +1074,24 @@ impl App {
         self.status = format!("decode {}", track.title);
         let rate = self.player.sample_rate;
         let ch = self.player.channels;
-        let cached = self.analysis.get(&track.path);
+        let cached = regrid::reusable(self.analysis.get(&track.path), self.prefs.beat_this);
         let tx = self.decode_tx.clone();
+        let mixer = Arc::clone(&self.player.mixer);
         thread::spawn(move || {
             let result = load_track(&track.path, rate, ch).map(|buf| {
                 let analysis = cached.unwrap_or_else(|| analyze_buffer(&buf));
+                let bend = if transition {
+                    prepare_bend(&mixer, index, &analysis, skip)
+                } else {
+                    None
+                };
                 DecodeJob {
                     id: id.clone(),
                     transition,
                     skip,
                     buf,
                     analysis,
+                    bend,
                 }
             });
             let _ = tx.send(result.map_err(|err| DecodeFailure {
@@ -1014,11 +1144,14 @@ impl App {
                 .unwrap_or(0);
             job.analysis.size = meta.len();
         }
-        self.analysis.insert(path, job.analysis.clone());
-        let remix = self.player.mixer.lock().expect("mixer").remix();
-        let buf = apply_remix(&job.buf, remix);
-        let mut mixer = self.player.mixer.lock().expect("mixer");
-        mixer.set_analysis(index, job.analysis);
+        // The decode may have read the cache before Beat This! rescored the track; the mix
+        // planned on what it read keeps it, and the rescored one follows once it is done.
+        let stored = self.analysis.get(path);
+        let rescored = regrid::rescored_since(stored, &job.analysis, self.prefs.beat_this);
+        match rescored {
+            Some(a) => self.regrid_ready.push((job.id.track.clone(), a)),
+            None => self.analysis.insert(path, job.analysis.clone()),
+        }
         let meta = load_meta(
             path,
             &self
@@ -1027,7 +1160,14 @@ impl App {
                 .map(|t| t.title.clone())
                 .unwrap_or_default(),
         );
+        let mut mixer = self.player.mixer.lock().expect("mixer");
+        mixer.set_analysis(index, job.analysis);
         mixer.set_track_title(index, meta.title.clone());
+        let remix = mixer.remix();
+        let fade = job.transition && mixer.mix().uses_fade();
+        drop(mixer);
+        let buf = apply_remix(job.buf, remix);
+        let tempo = remix.rate();
         if let Some(track) = self.tracks.get_mut(index) {
             track.title = meta.title.clone();
         }
@@ -1035,17 +1175,15 @@ impl App {
             self.metas.resize(index + 1, None);
         }
         self.metas[index] = Some(meta.clone());
-        let queue_remote = self.wants_remote(&meta);
-        drop(mixer);
-        if queue_remote {
+        if self.wants_remote(&meta) {
             self.queue_meta(index);
         }
         self.mark_meta_changed();
         let mut mixer = self.player.mixer.lock().expect("mixer");
-        if job.transition && mixer.mix().uses_fade() {
-            mixer.start_transition(index, buf, job.skip);
+        if fade {
+            mixer.start_prepared_transition(index, buf, tempo, job.skip, job.bend);
         } else {
-            mixer.play_decoded(index, buf);
+            mixer.play_remixed(index, buf, tempo);
         }
         if let Some(secs) = self.pending_seek.take() {
             let snap = mixer.snapshot(index);
@@ -1110,6 +1248,7 @@ impl App {
 
     fn drain_remote_meta(&mut self) {
         let mut changed = false;
+        let mut titles = Vec::new();
         while let Ok(job) = self.remote_rx.try_recv() {
             if !job.id.matches(self.library_generation, &self.tracks)
                 || !self.meta_inflight.remove(&job.id)
@@ -1126,6 +1265,12 @@ impl App {
             let Some(slot) = self.metas[index].as_mut() else {
                 continue;
             };
+            let before = TrackMeta {
+                artist: slot.artist.clone(),
+                album: slot.album.clone(),
+                title: slot.title.clone(),
+                ..TrackMeta::default()
+            };
             if slot.artist.trim().is_empty() {
                 if let Some(artist) = job.artist.filter(|s| !s.trim().is_empty()) {
                     slot.artist = artist;
@@ -1136,7 +1281,8 @@ impl App {
                 if let Some(title) = job.title.filter(|s| !s.trim().is_empty()) {
                     slot.title = title.clone();
                     if let Some(track) = self.tracks.get_mut(index) {
-                        track.title = title;
+                        track.title = title.clone();
+                        titles.push((index, title));
                     }
                     changed = true;
                 }
@@ -1159,9 +1305,13 @@ impl App {
                     changed = true;
                 }
             }
+            if sort_key_changed(&self.metas[index], &before) {
+                self.peek_sort_dirty = true;
+            }
         }
+        self.push_mixer_titles(titles);
         if changed {
-            self.mark_meta_changed();
+            self.api_dirty = true;
         }
     }
 
@@ -1195,6 +1345,7 @@ impl App {
     fn drain_peek(&mut self) {
         const PEEK_PER_TICK: usize = 24;
         let mut changed = 0;
+        let mut titles = Vec::new();
         for job in receive_batch(&self.peek_rx, PEEK_PER_TICK) {
             if !job.id.matches(self.library_generation, &self.tracks) {
                 continue;
@@ -1203,6 +1354,7 @@ impl App {
             if index >= self.metas.len() {
                 continue;
             }
+            let before = self.metas[index].clone().unwrap_or_default();
             if apply_peek(&mut self.metas[index], job.meta) {
                 if let Some(title) = self.metas[index]
                     .as_ref()
@@ -1210,10 +1362,14 @@ impl App {
                     .filter(|t| !t.is_empty())
                 {
                     if let Some(track) = self.tracks.get_mut(index) {
-                        track.title = title;
+                        track.title = title.clone();
+                        titles.push((index, title));
                     }
                 }
                 changed += 1;
+                if sort_key_changed(&self.metas[index], &before) {
+                    self.peek_sort_dirty = true;
+                }
                 if self
                     .metas
                     .get(index)
@@ -1224,8 +1380,20 @@ impl App {
                 }
             }
         }
+        self.push_mixer_titles(titles);
         if changed > 0 {
-            self.mark_meta_changed();
+            self.api_dirty = true;
+        }
+    }
+
+    fn push_mixer_titles(&self, titles: Vec<(usize, String)>) {
+        if titles.is_empty() {
+            return;
+        }
+        if let Ok(mut mixer) = self.player.mixer.lock() {
+            for (index, title) in titles {
+                mixer.set_track_title(index, title);
+            }
         }
     }
 
@@ -1268,35 +1436,39 @@ impl App {
         if self.inflight.is_some() {
             return;
         }
-        let (need, index, mix) = {
-            let mixer = self.player.mixer.lock().expect("mixer");
-            (mixer.should_prefetch(), mixer.next_index(), mixer.mix())
+        let (advance, prefetch) = {
+            let mut mixer = self.player.mixer.lock().expect("mixer");
+            let advance = mixer.take_auto_advance();
+            let prefetch =
+                if advance.is_none() && mixer.mix().uses_fade() && mixer.should_prefetch() {
+                    mixer.next_index()
+                } else {
+                    None
+                };
+            (advance, prefetch)
         };
-        if !need {
+        if let Some(index) = advance {
+            self.note_leave(false);
+            self.sync_list_cursor(index);
+            self.spawn_decode(index, false, false);
             return;
         }
-        let Some(index) = index else {
+        let Some(index) = prefetch else {
             return;
         };
         if self.prefetch_attempt == Some(index) {
             return;
         }
         self.prefetch_attempt = Some(index);
-        if !mix.uses_fade() {
-            let finished = self.player.mixer.lock().expect("mixer").take_finished();
-            if finished {
-                self.note_leave(false);
-                self.sync_list_cursor(index);
-                self.spawn_decode(index, false, false);
-            }
-            return;
-        }
         self.note_leave(false);
         self.spawn_decode(index, true, false);
     }
 
     pub fn run(mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
+        let mut cleanup = CleanupGuard::new(|| {
+            let _ = restore_terminal();
+        });
         let mut stdout = stdout();
         if self.prefs.transparent {
             execute!(
@@ -1314,7 +1486,8 @@ impl App {
                 EnableFocusChange
             )?;
         }
-        redirect_stderr_to_log();
+        #[cfg(unix)]
+        crate::alsa_log::redirect_stderr_to_log();
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         let tick = Duration::from_millis(33);
         let mut last = Instant::now();
@@ -1329,6 +1502,7 @@ impl App {
                 terminal.clear()?;
             }
             terminal.draw(|frame| self.draw(frame))?;
+            self.write_greeting_overlay()?;
             last_wall = SystemTime::now();
             let timeout = tick.saturating_sub(last.elapsed());
             if event::poll(timeout)? {
@@ -1343,17 +1517,31 @@ impl App {
                     _ => {}
                 }
             }
-            if last.elapsed() >= tick {
+            let elapsed = last.elapsed();
+            if elapsed >= tick {
+                last = Instant::now();
                 self.tick = self.tick.wrapping_add(1);
                 self.drain_decode();
                 self.drain_peek();
                 self.drain_remote_meta();
+                if self.peek_sort_dirty {
+                    self.mark_meta_changed();
+                    self.peek_sort_dirty = false;
+                }
                 self.pump_meta_queue();
+                self.drain_model_fetch();
+                self.drain_stems_fetch();
+                self.pump_vocals();
+                self.drain_vocals();
+                self.drain_regrid();
+                self.apply_regrid();
+                self.want_regrid();
+                self.pump_regrid();
                 self.drain_progress();
                 self.drain_import();
                 self.drain_search();
                 self.drain_control();
-                self.drawer.tick(tick.as_millis() as u64);
+                advance_animations(&mut self.drawer, &mut self.greeting, elapsed);
                 if let Some(login) = self.login_poller.drain() {
                     self.login = login;
                 }
@@ -1368,30 +1556,27 @@ impl App {
                 self.publish_mpris();
                 self.update_api_state();
                 self.maybe_prefetch();
-                if let Ok(mut mixer) = self.player.mixer.lock() {
-                    if let Some(cava) = self.cava.as_ref() {
-                        let bars = cava.latest();
-                        if !bars.is_empty() {
-                            mixer.ingest_cava(&bars);
+                self.player.recover_if_needed();
+                if needs_spectrum_refresh(self.prefs.visualize, self.cava.is_some()) {
+                    if let Ok(mut mixer) = self.player.mixer.lock() {
+                        if let Some(cava) = self.cava.as_ref() {
+                            let bars = cava.latest();
+                            if !bars.is_empty() {
+                                mixer.ingest_cava(&bars);
+                            } else {
+                                mixer.refresh_spectrum();
+                            }
                         } else {
                             mixer.refresh_spectrum();
                         }
-                    } else {
-                        mixer.refresh_spectrum();
                     }
                 }
-                last = Instant::now();
             }
         };
         self.save_session();
         self.taste.flush();
-        disable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            crossterm::event::DisableBracketedPaste,
-            DisableFocusChange,
-            LeaveAlternateScreen
-        )?;
+        restore_terminal()?;
+        cleanup.disarm();
         result
     }
 
@@ -1633,10 +1818,10 @@ impl App {
                     self.overlay = Overlay::None;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.settings_idx = (self.settings_idx + 1) % 8;
+                    self.settings_idx = (self.settings_idx + 1) % SETTINGS_ROWS;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.settings_idx = (self.settings_idx + 7) % 8;
+                    self.settings_idx = (self.settings_idx + SETTINGS_ROWS - 1) % SETTINGS_ROWS;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => self.toggle_setting(),
                 _ => {}
@@ -1709,7 +1894,7 @@ impl App {
     }
 
     fn drawer_rows_empty(&self, slot: usize) -> bool {
-        drawer_rows(self.playlists.active, &self.drawer_names())
+        drawer_rows(self.playlists.active, &self.drawer_lists())
             .get(slot.saturating_sub(1))
             .is_some_and(|row| row.empty)
     }
@@ -1880,8 +2065,25 @@ impl App {
             3 => self.prefs.lyrics_fetch = !self.prefs.lyrics_fetch,
             4 => self.prefs.cover_fetch = !self.prefs.cover_fetch,
             5 => self.prefs.resume = !self.prefs.resume,
-            6 => self.prefs.web_remote = !self.prefs.web_remote,
-            7 => self.overlay = Overlay::None,
+            6 => return self.toggle_beat_this(),
+            7 => return self.toggle_stems(),
+            8 => {
+                self.prefs.api_lan = !self.prefs.api_lan;
+                self.prefs.save();
+                self.api_server.set_lan(self.prefs.api_lan);
+                self.status = if self.prefs.api_lan {
+                    format!(
+                        "API 对局域网开放 :{}，token 在 {}",
+                        api::PORT,
+                        api::token_path().display()
+                    )
+                } else {
+                    format!("API 只听本机 127.0.0.1:{}", api::PORT)
+                };
+                return;
+            }
+            9 => self.prefs.web_remote = !self.prefs.web_remote,
+            10 => self.overlay = Overlay::None,
             _ => {}
         }
         self.prefs.save();
@@ -1960,6 +2162,272 @@ impl App {
         }
     }
 
+    /// Queues the track playing and the one predicted next for Beat This!, once a track has
+    /// taken over.
+    fn want_regrid(&mut self) {
+        if !self.prefs.beat_this || self.model_fetch.is_some() {
+            return;
+        }
+        let current = {
+            let mixer = self.player.mixer.lock().expect("mixer");
+            if mixer.transition_pending() {
+                return;
+            }
+            mixer.current_index()
+        };
+        let Some(id) = current.and_then(|i| self.track_job_id(i)) else {
+            return;
+        };
+        if self.regrid_around.as_ref() == Some(&id) {
+            return;
+        }
+        self.regrid_around = Some(id.clone());
+        if !crate::beat_this::model_ready() {
+            self.prefs.beat_this = false;
+            self.prefs.save();
+            self.status = "Beat This! off: its model is gone; turn it on again to fetch it".into();
+            return;
+        }
+        // AutoMix weighs the whole library to predict it, so only once a track.
+        let next = self.player.mixer.lock().expect("mixer").next_index();
+        let next = next
+            .filter(|&i| i != id.index)
+            .and_then(|i| self.track_job_id(i));
+        for (id, front) in [(Some(id), true), (next, false)] {
+            let Some(id) = id else {
+                continue;
+            };
+            let path = id.path.clone();
+            if self.analysis.get(&path).is_some_and(|a| a.beat_this) {
+                continue;
+            }
+            if front {
+                self.regrid_queue.push_front(id, &path);
+            } else {
+                self.regrid_queue.push_back(id, &path);
+            }
+        }
+    }
+
+    fn pump_regrid(&mut self) {
+        if !self.prefs.beat_this {
+            return;
+        }
+        let Some(id) = self.regrid_queue.take() else {
+            return;
+        };
+        let base = self.analysis.get(&id.path);
+        let current = id.matches(self.library_generation, &self.tracks);
+        if !current || base.as_ref().is_some_and(|a| a.beat_this) {
+            self.regrid_queue.finish(&id.path);
+            return;
+        }
+        if self.regrid.is_none() {
+            let (rate, channels) = (self.player.sample_rate, self.player.channels);
+            self.regrid = regrid::scorer(rate, channels).map(regrid::Worker::spawn);
+        }
+        let path = id.path.clone();
+        let sent = self.regrid.as_ref().is_some_and(|w| {
+            w.send(regrid::Job {
+                id,
+                path: path.clone(),
+                base,
+            })
+        });
+        if !sent {
+            self.regrid = None;
+            self.regrid_queue.finish(&path);
+        }
+    }
+
+    fn drain_regrid(&mut self) {
+        let Some(worker) = self.regrid.as_ref() else {
+            return;
+        };
+        let mut done = Vec::new();
+        while let Some(d) = worker.try_recv() {
+            done.push(d);
+        }
+        for d in done {
+            self.regrid_queue.finish(&d.path);
+            match d.analysis {
+                // Turned off meanwhile: the track keeps the onset tracker's grid.
+                Ok(_) if !self.prefs.beat_this => {}
+                Ok(a) => {
+                    self.analysis.insert(&d.path, a.clone());
+                    self.regrid_ready.push((d.id, a));
+                }
+                Err(e) => self.status = format!("fail Beat This! {e}"),
+            }
+        }
+    }
+
+    /// Hands rescored analyses to the mixer, unless a mix planned on the old ones is pending.
+    fn apply_regrid(&mut self) {
+        if !self.prefs.beat_this {
+            self.regrid_ready.clear();
+            return;
+        }
+        if self.regrid_ready.is_empty() || self.inflight.is_some() {
+            return;
+        }
+        let mut mixer = self.player.mixer.lock().expect("mixer");
+        if mixer.transition_pending() {
+            return;
+        }
+        for (id, analysis) in self.regrid_ready.drain(..) {
+            // Only tracks the mixer already knows: a new one would change what AutoMix picks.
+            let known = mixer.analysis_at(id.index).is_some();
+            if known && id.matches(self.library_generation, &self.tracks) {
+                mixer.set_analysis(id.index, analysis);
+            }
+        }
+    }
+
+    fn toggle_beat_this(&mut self) {
+        if self.model_fetch.is_some() {
+            return;
+        }
+        if self.prefs.beat_this {
+            self.prefs.beat_this = false;
+            self.prefs.save();
+            self.regrid_queue = regrid::Queue::default();
+            self.status = "Beat This! off: tracks go back to the onset grid as they play".into();
+        } else if !regrid::AVAILABLE {
+            self.status =
+                "this build has no Beat This! (built without the beat-this feature)".into();
+        } else if crate::beat_this::model_ready() {
+            self.enable_beat_this();
+        } else {
+            self.model_fetch = Some(ModelFetch::spawn(regrid::fetch_model));
+            let mb = crate::beat_this::MODEL_BYTES / 1_000_000;
+            self.status = format!("fetching the Beat This! model ({mb} MB) from GitHub");
+        }
+    }
+
+    fn enable_beat_this(&mut self) {
+        self.prefs.beat_this = true;
+        self.prefs.save();
+        // A track cut short when it was turned off is tried again.
+        self.regrid_queue = regrid::Queue::default();
+        self.regrid_around = None;
+        self.status = "Beat This! on: the track playing and the next are rescored".into();
+    }
+
+    fn drain_model_fetch(&mut self) {
+        let Some(result) = self.model_fetch.as_mut().and_then(ModelFetch::poll) else {
+            return;
+        };
+        self.model_fetch = None;
+        match result {
+            Ok(_) => self.enable_beat_this(),
+            Err(e) => self.status = format!("fail Beat This! model: {e}"),
+        }
+    }
+
+    fn beat_this_label(&self) -> String {
+        model_label(
+            regrid::AVAILABLE,
+            self.model_fetch.as_ref(),
+            self.prefs.beat_this,
+        )
+    }
+
+    fn toggle_stems(&mut self) {
+        if self.stems_fetch.is_some() {
+            return;
+        }
+        if self.prefs.stems {
+            self.prefs.stems = false;
+            self.prefs.save();
+            // A mix being separated finishes on the old thread and is let go.
+            self.vocal_worker = None;
+            self.status = "voice handoff off: AutoMix overlaps keep both voices".into();
+        } else if !stems::AVAILABLE {
+            self.status = "this build has no voice separation (built without stems)".into();
+        } else if stems::model_ready() {
+            self.enable_stems();
+        } else {
+            self.stems_fetch = Some(ModelFetch::spawn(stems::download_model));
+            let mb = stems::MODEL_BYTES / 1_000_000;
+            self.status = format!("fetching the htdemucs model ({mb} MB) from Hugging Face");
+        }
+    }
+
+    fn enable_stems(&mut self) {
+        self.prefs.stems = true;
+        self.prefs.save();
+        self.status =
+            "voice handoff on: each AutoMix takes ~30 s and ~1 GB to separate, ahead of time"
+                .into();
+    }
+
+    fn drain_stems_fetch(&mut self) {
+        let Some(result) = self.stems_fetch.as_mut().and_then(ModelFetch::poll) else {
+            return;
+        };
+        self.stems_fetch = None;
+        match result {
+            Ok(_) => self.enable_stems(),
+            Err(e) => self.status = format!("fail htdemucs model: {e}"),
+        }
+    }
+
+    fn stems_label(&self) -> String {
+        model_label(
+            stems::AVAILABLE,
+            self.stems_fetch.as_ref(),
+            self.prefs.stems,
+        )
+    }
+
+    /// Tells the mixer whether to separate voices, and hands an armed mix's to the worker.
+    fn pump_vocals(&mut self) {
+        let on = self.prefs.stems && stems::AVAILABLE;
+        let job = {
+            let mut mixer = self.player.mixer.lock().expect("mixer");
+            mixer.set_stems(on);
+            mixer.take_vocal_job()
+        };
+        let Some(job) = job else {
+            return;
+        };
+        if !stems::model_ready() {
+            self.prefs.stems = false;
+            self.prefs.save();
+            self.status =
+                "voice handoff off: its model is gone; turn it on again to fetch it".into();
+            return;
+        }
+        if self.vocal_worker.is_none() {
+            self.vocal_worker = stems::separator().map(stems::Worker::spawn);
+        }
+        if !self.vocal_worker.as_ref().is_some_and(|w| w.send(job)) {
+            self.vocal_worker = None;
+        }
+    }
+
+    fn drain_vocals(&mut self) {
+        let Some(done) = self.vocal_worker.as_ref().and_then(stems::Worker::try_recv) else {
+            return;
+        };
+        match done {
+            Ok(Some(overlay)) => {
+                let attached = self
+                    .player
+                    .mixer
+                    .lock()
+                    .expect("mixer")
+                    .attach_vocals(overlay);
+                if !attached {
+                    self.status = "voices separated too late for this mix".into();
+                }
+            }
+            Ok(None) => {}
+            Err(e) => self.status = format!("fail voice separation: {e}"),
+        }
+    }
+
     fn bump_eq(&mut self, delta: f32) {
         if let Ok(mut mixer) = self.player.mixer.lock() {
             mixer.bump_eq(self.eq_band, delta);
@@ -2005,8 +2473,8 @@ impl App {
             buf.push_str(text);
             return;
         }
-        if looks_like_media_url(text) {
-            self.command = Some(text.to_string());
+        if let Some(url) = find_media_url(text) {
+            self.command = Some(url.to_string());
             self.status = "enter to import pasted url".into();
         }
     }
@@ -2016,8 +2484,8 @@ impl App {
         if raw.is_empty() {
             return;
         }
-        if looks_like_media_url(raw) {
-            self.start_import(raw);
+        if let Some(url) = find_media_url(raw) {
+            self.start_import(url);
             return;
         }
         if let Some(rest) = raw.strip_prefix("search ") {
@@ -2046,23 +2514,9 @@ impl App {
     fn open_folder(&mut self, root: PathBuf) {
         match scan_library(&root) {
             Ok(tracks) => {
-                self.invalidate_library_jobs();
                 self.prefs.set_library(&root);
                 self.prefs.save();
-                self.tracks = tracks;
-                self.metas = vec![None; self.tracks.len()];
-                if let Ok(mut mixer) = self.player.mixer.lock() {
-                    mixer.set_tracks(self.tracks.clone());
-                    mixer.set_shuffle_mode(self.prefs.shuffle_mode);
-                }
-                self.sync_playable();
-                self.spawn_peek();
-                self.mark_meta_changed();
-                self.list_state.select(if self.tracks.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                });
+                self.replace_tracks(tracks);
                 self.status = format!("open {} · {} tracks", root.display(), self.tracks.len());
             }
             Err(err) => self.status = format!("open fail {err}"),
@@ -2073,25 +2527,51 @@ impl App {
         let root = self.prefs.library_path();
         match scan_library(&root) {
             Ok(tracks) => {
-                self.invalidate_library_jobs();
-                self.tracks = tracks;
-                self.metas = vec![None; self.tracks.len()];
-                if let Ok(mut mixer) = self.player.mixer.lock() {
-                    mixer.set_tracks(self.tracks.clone());
-                    mixer.set_shuffle_mode(self.prefs.shuffle_mode);
-                }
-                self.sync_playable();
-                self.spawn_peek();
-                self.mark_meta_changed();
-                self.list_state.select(if self.tracks.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                });
+                self.replace_tracks(tracks);
                 self.status = format!("rescan {} · {} tracks", root.display(), self.tracks.len());
             }
             Err(err) => self.status = format!("rescan fail {err}"),
         }
+    }
+
+    fn replace_tracks(&mut self, tracks: Vec<Track>) {
+        self.invalidate_library_jobs();
+        let moved = remap_track_indices(&self.tracks, &tracks);
+        let mut metas = vec![None; tracks.len()];
+        let playing = self
+            .player
+            .mixer
+            .lock()
+            .ok()
+            .and_then(|m| m.playback_view(0).current);
+        if let Some(old) = playing {
+            if let Some(new) = moved.get(old).copied().flatten() {
+                metas[new] = self.metas.get_mut(old).and_then(Option::take);
+            }
+        }
+        self.local_hits = self
+            .local_hits
+            .iter()
+            .filter_map(|&i| moved.get(i).copied().flatten())
+            .collect();
+        if self.local_hits.is_empty() {
+            self.local_filter.clear();
+        }
+        self.local_idx = 0;
+        self.tracks = tracks;
+        self.metas = metas;
+        if let Ok(mut mixer) = self.player.mixer.lock() {
+            mixer.set_tracks(self.tracks.clone());
+            mixer.set_shuffle_mode(self.prefs.shuffle_mode);
+        }
+        self.sync_playable();
+        self.spawn_peek();
+        self.mark_meta_changed();
+        self.list_state.select(if self.tracks.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
     }
 
     fn search_local(&mut self, query: &str) {
@@ -2236,7 +2716,7 @@ impl App {
     /// 将当前播放状态同步到 API 共享状态，供远程客户端读取
     fn update_api_state(&mut self) {
         let (snapshot, eq) = match self.player.mixer.lock() {
-            Ok(mixer) => (Some(mixer.snapshot(0)), mixer.eq_db()),
+            Ok(mixer) => (Some(mixer.playback_view(0)), mixer.eq_db()),
             Err(_) => (None, [0.0; 5]),
         };
 
@@ -2594,10 +3074,11 @@ impl App {
                 // ── EQ ──
                 ControlCmd::SetEq(band, db) => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
-                        mixer.bump_eq(band, db);
+                        mixer.set_eq_band(band, db);
                         self.prefs.eq_db = mixer.eq_db();
                         self.status = mixer.snapshot(self.selected()).status;
                     }
+                    self.prefs.save();
                 }
                 ControlCmd::ResetEq => {
                     if let Ok(mut mixer) = self.player.mixer.lock() {
@@ -2605,6 +3086,7 @@ impl App {
                         self.prefs.eq_db = mixer.eq_db();
                         self.status = mixer.snapshot(self.selected()).status;
                     }
+                    self.prefs.save();
                 }
 
                 // ── 排序 ──
@@ -2748,7 +3230,7 @@ impl App {
             .mixer
             .lock()
             .expect("mixer")
-            .snapshot(self.selected());
+            .playback_view(self.selected());
         let meta = snap
             .current
             .and_then(|i| self.metas.get(i).and_then(|m| m.as_ref()));
@@ -2826,7 +3308,7 @@ impl App {
             );
         }
         frame.render_widget(Clear, area);
-        let rows = drawer_rows(self.playlists.active, &self.drawer_names());
+        let rows = drawer_rows(self.playlists.active, &self.drawer_lists());
         let lines: Vec<Line> = rows
             .iter()
             .enumerate()
@@ -2859,10 +3341,80 @@ impl App {
             self.draw_search(frame, area);
             return;
         }
+        let list_area = if self.greeting.is_visible() && self.music_mode == MusicMode::Library {
+            let (greet_area, list_area) = music_split(area, self.greeting.visual());
+            if greet_area.height > 0 {
+                self.draw_greeting(frame, greet_area);
+            } else {
+                self.greeting_overlay = None;
+            }
+            list_area
+        } else {
+            self.greeting_overlay = None;
+            area
+        };
         match self.music_mode {
-            MusicMode::Library => self.draw_list(frame, area, snap),
+            MusicMode::Library => self.draw_list(frame, list_area, snap),
             MusicMode::Artists => self.draw_artists(frame, area),
         }
+    }
+
+    fn draw_greeting(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let pal = self.palette();
+        let t = self.greeting.opacity();
+        let fg = if t >= 0.85 {
+            pal.text_style().add_modifier(Modifier::BOLD)
+        } else if t >= 0.35 {
+            pal.accent_style().add_modifier(Modifier::BOLD)
+        } else {
+            pal.dim_style()
+        };
+        let scale = if area.height >= GREET_SCALE as u16 {
+            GREET_SCALE
+        } else {
+            1
+        };
+        let (x, y) = greeting_origin(area, scale);
+        let kitty = std::env::var_os("KITTY_WINDOW_ID").is_some();
+        let text = if scale > 1 && kitty {
+            String::new()
+        } else {
+            format!("  {}", self.greeting_text)
+        };
+        let dest = Rect {
+            x,
+            y,
+            width: area.width.saturating_sub(x.saturating_sub(area.x)),
+            height: (scale as u16).max(1),
+        }
+        .intersection(area);
+        if dest.width == 0 || dest.height == 0 {
+            self.greeting_overlay = None;
+            return;
+        }
+        frame.render_widget(Paragraph::new(Line::from(Span::styled(text, fg))), dest);
+        self.greeting_overlay = greeting_overlay(area, &self.greeting_text, scale);
+    }
+
+    fn write_greeting_overlay(&mut self) -> io::Result<()> {
+        if std::env::var_os("KITTY_WINDOW_ID").is_none() {
+            self.greeting_overlay_sent = None;
+            return Ok(());
+        }
+        if self.greeting_overlay == self.greeting_overlay_sent {
+            return Ok(());
+        }
+        let Some(overlay) = self.greeting_overlay.clone() else {
+            self.greeting_overlay_sent = None;
+            return Ok(());
+        };
+        let mut stdout = stdout();
+        execute!(stdout, crossterm::cursor::Hide)?;
+        use std::io::Write;
+        stdout.write_all(overlay_escape(&overlay).as_bytes())?;
+        stdout.flush()?;
+        self.greeting_overlay_sent = Some(overlay);
+        Ok(())
     }
 
     fn draw_artists(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -3131,7 +3683,7 @@ impl App {
             let mixer = self.player.mixer.lock().expect("mixer");
             visible_idx
                 .iter()
-                .map(|&i| (i, analysis_label(mixer.analysis_at(i))))
+                .filter_map(|&i| mixer.analysis_at(i).map(|a| (i, analysis_label(Some(a)))))
                 .collect()
         };
         let extra_at = |i: usize| -> String {
@@ -3421,13 +3973,16 @@ impl App {
     }
 
     fn draw_settings(&self, frame: &mut ratatui::Frame<'_>) {
-        let rows = [
+        let rows: [String; SETTINGS_ROWS] = [
             format!("主题        {}", self.prefs.theme.label()),
             format!("透明背景    {}", on_off(self.prefs.transparent)),
             format!("可视化      {}", self.prefs.visualize.label()),
             format!("拉歌词      {}", on_off(self.prefs.lyrics_fetch)),
             format!("拉封面      {}", on_off(self.prefs.cover_fetch)),
             format!("续播        {}", on_off(self.prefs.resume)),
+            format!("Beat This!  {}", self.beat_this_label()),
+            format!("人声交接    {}", self.stems_label()),
+            format!("局域网遥控  {}", on_off(self.prefs.api_lan)),
             format!("网页遥控    {}", on_off(self.prefs.web_remote)),
             "关闭".into(),
         ];
@@ -3754,6 +4309,32 @@ fn esc_outcome(search_open: bool, local_open: bool) -> EscOutcome {
     }
 }
 
+fn remap_track_indices(old: &[Track], new: &[Track]) -> Vec<Option<usize>> {
+    let by_path: std::collections::HashMap<&std::path::Path, usize> = new
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.path.as_path(), i))
+        .collect();
+    old.iter()
+        .map(|t| by_path.get(t.path.as_path()).copied())
+        .collect()
+}
+
+fn playlist_rows(paths: &[PathBuf], tracks: &[Track]) -> Vec<RangeRow> {
+    let mut by_path: std::collections::HashMap<&std::path::Path, usize> =
+        std::collections::HashMap::with_capacity(tracks.len());
+    for (i, t) in tracks.iter().enumerate() {
+        by_path.entry(t.path.as_path()).or_insert(i);
+    }
+    paths
+        .iter()
+        .map(|p| match by_path.get(p.as_path()) {
+            Some(&i) => RangeRow::Present(i),
+            None => RangeRow::Missing(p.clone()),
+        })
+        .collect()
+}
+
 fn visible_row(visible: &[usize], track_index: usize) -> Option<usize> {
     visible.iter().position(|&i| i == track_index)
 }
@@ -3777,6 +4358,14 @@ fn visible_window(
         }
     }
     (start, start + height)
+}
+
+fn needs_spectrum_refresh(mode: crate::prefs::VisualizeMode, has_cava: bool) -> bool {
+    match mode {
+        crate::prefs::VisualizeMode::Off => false,
+        crate::prefs::VisualizeMode::Oscilloscope => has_cava,
+        crate::prefs::VisualizeMode::Bars | crate::prefs::VisualizeMode::Cnm => true,
+    }
 }
 
 fn analysis_label(analysis: Option<&TrackAnalysis>) -> String {
@@ -3804,6 +4393,9 @@ fn context_target_for_tab(
         Tab::Me => None,
     }
 }
+
+/// Rows in the settings panel, the last of which closes it.
+const SETTINGS_ROWS: usize = 11;
 
 fn on_off(v: bool) -> &'static str {
     if v {
@@ -3891,35 +4483,6 @@ fn event_needs_redraw(event: &Event) -> bool {
     matches!(event, Event::Resize(_, _) | Event::FocusGained)
 }
 
-fn redirect_stderr_to_log() {
-    let path = stderr_log_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    else {
-        return;
-    };
-    dup2_stderr(&file);
-}
-
-#[cfg(unix)]
-fn dup2_stderr(file: &std::fs::File) {
-    use std::os::unix::io::AsRawFd;
-    extern "C" {
-        fn dup2(oldfd: i32, newfd: i32) -> i32;
-    }
-    // SAFETY: fd 2 is stderr; replacing it with an opened log file keeps
-    // ALSA xrun text off the alternate screen.
-    let _ = unsafe { dup2(file.as_raw_fd(), 2) };
-}
-
-#[cfg(not(unix))]
-fn dup2_stderr(_file: &std::fs::File) {}
-
 fn visualize_rows(
     mode: crate::prefs::VisualizeMode,
     spec: &crate::spectrum::Spectrum,
@@ -3934,23 +4497,134 @@ fn visualize_rows(
     }
 }
 
-fn stderr_log_path() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("zradio").join("alsa.log")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_guard_runs_on_early_return_and_can_be_disarmed() {
+        let cleanup_count = std::cell::Cell::new(0);
+        {
+            let _guard = CleanupGuard::new(|| cleanup_count.set(cleanup_count.get() + 1));
+        }
+        assert_eq!(cleanup_count.get(), 1);
+
+        {
+            let mut guard = CleanupGuard::new(|| cleanup_count.set(cleanup_count.get() + 1));
+            guard.disarm();
+        }
+        assert_eq!(cleanup_count.get(), 1);
+    }
+
+    fn finish(fetch: &mut ModelFetch) -> Result<PathBuf, String> {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(done) = fetch.poll() {
+                return done;
+            }
+            assert!(Instant::now() < until, "the fetch never finished");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_model_fetch_reports_progress_then_its_result() {
+        let (go, wait) = mpsc::channel::<()>();
+        let mut fetch = ModelFetch::spawn(move |progress| {
+            progress.expect("asked for progress").send("42%".into())?;
+            wait.recv()?;
+            Ok(PathBuf::from("/models/m.onnx"))
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while fetch.percent != "42%" {
+            assert!(fetch.poll().is_none(), "done before it was let go");
+            assert!(Instant::now() < until, "no progress");
+            thread::sleep(Duration::from_millis(2));
+        }
+        go.send(()).unwrap();
+        assert_eq!(finish(&mut fetch), Ok(PathBuf::from("/models/m.onnx")));
+    }
+
+    #[test]
+    fn a_model_fetch_that_fails_or_dies_says_so() {
+        let mut failed = ModelFetch::spawn(|_| Err(anyhow::anyhow!("offline")));
+        assert_eq!(finish(&mut failed), Err("offline".into()));
+        let mut died = ModelFetch::spawn(|_| panic!("the fetch thread panics"));
+        assert_eq!(finish(&mut died), Err("the download thread died".into()));
+    }
+
+    #[test]
+    fn model_rows_say_if_the_build_has_them_and_how_far_the_fetch_is() {
+        assert_eq!(model_label(false, None, true), "未编译");
+        assert_eq!(model_label(true, None, true), "on");
+        assert_eq!(model_label(true, None, false), "off");
+        let (_progress, progress) = mpsc::channel();
+        let (_done, done) = mpsc::channel();
+        let fetch = ModelFetch {
+            progress,
+            done,
+            percent: "42%".into(),
+        };
+        assert_eq!(model_label(true, Some(&fetch), false), "下载模型 42%");
+        assert_eq!(model_label(false, Some(&fetch), false), "未编译");
+    }
+
+    #[test]
+    fn animations_advance_by_the_full_elapsed_duration() {
+        let mut drawer = DrawerAnim::closed();
+        drawer.open();
+        let mut greeting = GreetingAnim::new();
+
+        advance_animations(&mut drawer, &mut greeting, Duration::from_secs(8));
+
+        assert_eq!(drawer.phase(), crate::drawer::DrawerPhase::Open);
+        assert!(!greeting.is_visible());
+    }
 
     fn job_track(path: &str) -> Track {
         Track {
             path: PathBuf::from(path),
             title: path.into(),
         }
+    }
+
+    #[test]
+    fn playlist_rows_resolve_paths_to_first_library_index() {
+        let tracks = vec![
+            job_track("/m/a.mp3"),
+            job_track("/m/b.mp3"),
+            job_track("/m/a.mp3"),
+        ];
+        let paths = vec![
+            PathBuf::from("/m/b.mp3"),
+            PathBuf::from("/gone.mp3"),
+            PathBuf::from("/m/a.mp3"),
+            PathBuf::from("/m/b.mp3"),
+        ];
+        let rows = playlist_rows(&paths, &tracks);
+        assert!(matches!(rows[0], RangeRow::Present(1)));
+        assert!(matches!(&rows[1], RangeRow::Missing(p) if p == std::path::Path::new("/gone.mp3")));
+        assert!(matches!(rows[2], RangeRow::Present(0)));
+        assert!(matches!(rows[3], RangeRow::Present(1)));
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn rescan_moves_indices_with_their_files() {
+        let old = vec![
+            job_track("/m/a.mp3"),
+            job_track("/m/b.mp3"),
+            job_track("/m/c.mp3"),
+        ];
+        let new = vec![
+            job_track("/m/c.mp3"),
+            job_track("/m/new.mp3"),
+            job_track("/m/a.mp3"),
+        ];
+        assert_eq!(
+            remap_track_indices(&old, &new),
+            vec![Some(2), None, Some(0)]
+        );
     }
 
     #[test]
@@ -4056,6 +4730,26 @@ mod tests {
         assert_eq!(visible_window(20, Some(19), 0, 8), (12, 20));
         assert_eq!(visible_window(20, Some(10), 0, 8), (3, 11));
         assert_eq!(visible_window(20, Some(4), 2, 8), (2, 10));
+    }
+
+    #[test]
+    fn tick_work_skips_spectrum_when_visualizer_is_off() {
+        assert!(!needs_spectrum_refresh(
+            crate::prefs::VisualizeMode::Off,
+            false
+        ));
+        assert!(needs_spectrum_refresh(
+            crate::prefs::VisualizeMode::Bars,
+            false
+        ));
+        assert!(needs_spectrum_refresh(
+            crate::prefs::VisualizeMode::Oscilloscope,
+            true
+        ));
+        assert!(!needs_spectrum_refresh(
+            crate::prefs::VisualizeMode::Oscilloscope,
+            false
+        ));
     }
 
     #[test]
