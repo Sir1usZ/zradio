@@ -1476,7 +1476,9 @@ mod tests {
             eventually(|| !answers(other)),
             "switching LAN off must rebind"
         );
-        assert!(answers(local));
+        // 0.0.0.0 已关、127.0.0.1 还没绑上的那一下谁都连不上，等它绑好。
+        assert!(eventually(|| answers(local)));
+        assert!(!answers(other));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
